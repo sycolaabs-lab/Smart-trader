@@ -169,6 +169,25 @@ rather keep the secret out of the URL.
 
 ---
 
+## Deploying
+
+The Vercel project `xauusd-smc-assistant` is linked to this repository, so a
+push to the **production branch** deploys automatically.
+
+Check which branch that is under **Vercel → Settings → Git → Production
+Branch**. If it is not `main`, either change it to `main` or keep pushing to
+whichever branch is set — a push to any other branch produces a *preview*
+deployment, which will not update the live `xauusd-smc-assistant.vercel.app`
+URL. A preview that looks correct while production still serves the old build
+is almost always this.
+
+Preview URLs sit behind Vercel Authentication, so opening one in a browser
+bounces through an SSO redirect. Production is public. That means `/api/health`
+and `/api/tick` are only reachable from an external scheduler once the build is
+on **production**, not on a preview URL.
+
+---
+
 ## API quota
 
 Twelve Data's free tier allows ~8 requests/minute and 800/day. Refetching every
