@@ -104,6 +104,23 @@ ok('learning state recorded the outcome', JSON.parse(db._docs.worker.learningSta
 ok('meta examples grew', (JSON.parse(db._docs.worker.learningState).metaExamples||[]).length>=1);
 ok('resolvedBy marked as worker', forced && forced.resolvedBy==='worker');
 
+// --- a change to the instrument set must invalidate the cached macro score ---
+// Regression: after swapping oil/S&P out of the basket, the six-hour cache kept
+// serving a score computed from the OLD instruments with no sign it was stale.
+const fredBefore = fredCalls;
+await runTick({ db, tdKey:'TD', fredKey:'FRED', avKey:'AV' });
+ok('cached macro is reused while config is unchanged', fredCalls === fredBefore, `made ${fredCalls-fredBefore} FRED calls, want 0`);
+
+const sigBefore = JSON.parse(JSON.stringify(db._docs.worker.cacheSig || {}));
+ok('cache records the config signature', typeof sigBefore.correlation === 'string' && sigBefore.correlation.length > 0, true);
+
+// simulate an instrument swap by corrupting the stored signature
+db._docs.worker.cacheSig = Object.assign({}, sigBefore, { correlation: 'different-instrument-set' });
+const fredBefore2 = fredCalls;
+await runTick({ db, tdKey:'TD', fredKey:'FRED', avKey:'AV' });
+ok('a changed instrument set refetches immediately', fredCalls > fredBefore2, `made ${fredCalls-fredBefore2} FRED calls, want >0`);
+ok('signature is restored after the refetch', db._docs.worker.cacheSig.correlation, sigBefore.correlation);
+
 console.log(`\nnetwork: twelvedata=${tdCalls} fred=${fredCalls} alphavantage=${avCalls}`);
 console.log(`${pass} passed, ${fail} failed`);
 process.exit(fail?1:0);

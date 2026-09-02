@@ -190,20 +190,36 @@ async function computeNews(avKey) {
   }
 }
 
-// Refetch a cached input only when its own refresh window has elapsed.
-async function cached(state, key, maxAgeMs, fetcher) {
+// Refetch a cached input when its refresh window has elapsed OR when the
+// configuration that produced it has changed.
+//
+// The second condition is not theoretical: correlation caches for six hours, so
+// after swapping oil and the S&P out of the basket the worker kept serving a
+// score computed from the OLD instruments — and from the old, buggy yield
+// handling — for hours, with no sign anything was stale. A cached value is only
+// valid for the config that produced it, so the signature is part of its identity.
+async function cached(state, key, maxAgeMs, fetcher, signature) {
   const meta = state.cacheMeta || (state.cacheMeta = {});
+  const sigs = state.cacheSig || (state.cacheSig = {});
   const now = Date.now();
+  const sigMatches = signature == null || sigs[key] === signature;
   const fresh = meta[key] && (now - meta[key]) < maxAgeMs;
-  if (fresh && state.cache && state.cache[key] != null) {
+  if (fresh && sigMatches && state.cache && state.cache[key] != null) {
     return { value: state.cache[key], refreshed: false };
   }
   const value = await fetcher();
   state.cache = state.cache || {};
   state.cache[key] = value;
   meta[key] = now;
+  if (signature != null) sigs[key] = signature;
   return { value, refreshed: true };
 }
+
+// Identifies the instrument set a cached macro score was computed from. Change
+// an instrument, its polarity or its kind and the signature changes with it.
+const describe = list => list.map(i => [i.key, i.seriesId || i.symbol, i.polarity, i.kind].join(':')).join('|');
+const CORRELATION_SIG = describe(FRED_INSTRUMENTS) + '||' + describe(CORRELATION_INSTRUMENTS);
+const FUNDAMENTAL_SIG = describe(FUNDAMENTAL_INSTRUMENTS);
 
 // The whole tick, with its two external dependencies — Firestore and the API
 // keys — passed in rather than reached for. handler() below wires up the real
@@ -225,6 +241,7 @@ export async function runTick({ db, tdKey, fredKey, avKey }) {
       weights: stored.weights ? JSON.parse(stored.weights) : Object.assign({}, DEFAULT_WEIGHTS),
       cache: stored.cache ? JSON.parse(stored.cache) : {},
       cacheMeta: stored.cacheMeta || {},
+      cacheSig: stored.cacheSig || {},
       lastSignalAt: stored.lastSignalAt || null
     };
     setMetaModel(state.learningState.metaModel);
@@ -238,8 +255,8 @@ export async function runTick({ db, tdKey, fredKey, avKey }) {
 
     // ---- macro inputs (all optional, all failure-tolerant) ---------------
     let corr = { score: 0, available: false }, fund = { score: 0, available: false }, news = { score: 0, available: false };
-    try { corr = (await cached(state, 'correlation', REFRESH_MS.correlation, () => computeCorrelation(tdKey, fredKey))).value; } catch (e) { /* optional */ }
-    try { fund = (await cached(state, 'fundamental', REFRESH_MS.fundamental, () => computeFundamentals(fredKey))).value; } catch (e) { /* optional */ }
+    try { corr = (await cached(state, 'correlation', REFRESH_MS.correlation, () => computeCorrelation(tdKey, fredKey), CORRELATION_SIG)).value; } catch (e) { /* optional */ }
+    try { fund = (await cached(state, 'fundamental', REFRESH_MS.fundamental, () => computeFundamentals(fredKey), FUNDAMENTAL_SIG)).value; } catch (e) { /* optional */ }
     try { news = (await cached(state, 'news', REFRESH_MS.news, () => computeNews(avKey))).value; } catch (e) { /* optional */ }
 
     // ---- 1. grade what the market already decided ------------------------
@@ -333,6 +350,7 @@ export async function runTick({ db, tdKey, fredKey, avKey }) {
       weights: JSON.stringify(state.weights),
       cache: JSON.stringify(state.cache),
       cacheMeta: state.cacheMeta,
+      cacheSig: state.cacheSig || {},
       lastSignalAt: state.lastSignalAt,
       updatedAt: Date.now()
     }, { merge: true });
