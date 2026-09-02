@@ -285,6 +285,40 @@ when correlation cannot be computed yet.
 
 ---
 
+## Partial take-profit
+
+A 1:4 target on 15-minute structure can sit open for days, and an unrealised
+target is not a profit — the trade is exposed the whole time it waits. So a
+setup banks at **50% of the distance to target** by default, unless its own
+analysis says otherwise.
+
+**The exception is conviction.** Grade A/A+, or a meta-labeler score at or above
+`holdIfMetaScore` (0.35), runs to the full target. Clipping every winner would
+cut short exactly the trades that pay for the losers.
+
+Three details that matter:
+
+**The nearer level fills first.** When one candle spans both the partial and the
+full target, the partial books it. Price had to travel through the halfway mark
+to reach the target, so a resting partial order is already gone by then. Booking
+the full target would credit reward a real exit never collected.
+
+**The stop still wins an ambiguous bar.** Unchanged — if a candle covers the
+stop and a profit level, it resolves as a loss, since OHLC cannot say which came
+first.
+
+**It changes what the engine learns, not just P&L.** Signals resolve at the
+level they actually exited, so a banked half-target records as a ~2R win, not
+4R. That is deliberate: `signalRMultiple` uses the real exit price rather than
+assuming the target, so expectancy, the gate audit and the calibration table all
+measure the strategy you are actually running. A simulator that books unearned
+reward trains the meta-labeler on a strategy that does not exist.
+
+Configurable in the Paper Trading panel: the fraction, the conviction threshold,
+and a switch to turn it off entirely and restore full-target-only behaviour.
+
+---
+
 ## Data Collected — how much it actually knows
 
 Most of the learning machinery sits dormant below a threshold, and none of that

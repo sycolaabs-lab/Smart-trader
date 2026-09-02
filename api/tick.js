@@ -322,6 +322,7 @@ export async function runTick({ db, tdKey, fredKey, avKey }) {
         sig.resolvedAt = new Date().toISOString();
         sig.resolvedBy = 'worker';
         sig.exitPrice = verdict.exitPrice;
+        if (verdict.partial) sig.partial = true;
         resolvedThisTick++;
         // Same learning updates the browser applies on a resolved signal.
         const ls = state.learningState;

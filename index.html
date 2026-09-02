@@ -424,8 +424,25 @@ canvas { width:100%; background:#12151c; border-radius:12px; border:1px solid #1
         <div class="field"><label>Spread (pips)</label><input type="number" id="pSpread" value="3" step="0.5" min="0"></div>
         <div class="field"><label>Stop slippage (pips)</label><input type="number" id="pSlippage" value="1" step="0.5" min="0"></div>
         <div class="field"><label>Max open positions</label><input type="number" id="pMaxPos" value="3" step="1" min="1" max="10"></div>
+        <div class="field"><label>Take partial profit at (% of target)</label><input type="number" id="pPartialPct" value="50" step="5" min="10" max="95"></div>
+        <div class="field"><label>Hold full target if meta ≥</label><input type="number" id="pHoldMeta" value="0.35" step="0.05"></div>
       </div>
+      <label style="display:flex;align-items:center;gap:8px;font-size:11px;color:#c9cedb;cursor:pointer;margin-top:8px;">
+        <input type="checkbox" id="pPartialEnabled" checked style="accent-color:#3ecf8e;">
+        <span>Bank profit part-way to target instead of waiting for the full run</span>
+      </label>
       <div class="conn-note" style="margin-top:6px;">
+        <strong style="color:#e8c37a;">Partial take-profit.</strong> A 1:4 target on 15-minute structure can
+        sit open for days, and an unrealised target is not a profit — the trade is exposed the whole time it
+        waits. Banking at the halfway mark closes more trades, which is also what feeds the learning loop.
+        Setups the engine is confident in (grade A/A+, or a meta-labeler score above the threshold) are left
+        to run for the full target instead of clipping the winners that pay for the losers.
+        <br><br>
+        <strong>This changes what the engine learns, not just the P&amp;L.</strong> Signals resolve at the
+        level they actually exited, so a banked half-target is recorded as a ~2R win rather than 4R. That is
+        deliberate: the record should reflect how the system actually trades, or every statistic built on it
+        measures a strategy you are not running.
+        <br><br>
         Fills are deliberately pessimistic: entries pay the spread and stops take slippage, so a
         nominal 1:4 winner returns slightly under 4R. A simulator that assumes perfect execution
         produces training data that teaches the wrong lesson.

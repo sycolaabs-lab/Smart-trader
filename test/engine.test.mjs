@@ -302,5 +302,66 @@ ok('nominal 10Y dropped (= real + breakeven)', ids.includes('DGS10'), false);
 ok('2Y kept as a separate policy signal', ids.includes('DGS2'), true);
 ok('no duplicate series ids', ids.length, new Set(ids).size);
 
+
+// ---------------- partial take-profit ----------------
+import { PARTIAL_TP_DEFAULTS, partialTakeProfitLevel, shouldHoldForFullTarget } from '../lib/engine.js';
+console.log('\n-- partial take-profit --');
+const C2=(t,o,h,l,c)=>({time:t,open:o,high:h,low:l,close:c});
+const pBuy = {dir:'BUY', entry:2000, sl:1990, tp:2040, time:1000, entryType:'market', grade:'C', metaScore:0};
+const pSell= {dir:'SELL',entry:2000, sl:2010, tp:1960, time:1000, entryType:'market', grade:'C', metaScore:0};
+
+ok('half level for a BUY', partialTakeProfitLevel(pBuy, 0.5), 2020);
+ok('half level for a SELL', partialTakeProfitLevel(pSell, 0.5), 1980);
+ok('quarter level', partialTakeProfitLevel(pBuy, 0.25), 2010);
+ok('rejects a nonsense fraction', partialTakeProfitLevel(pBuy, 1.5), null);
+
+// banks at half instead of waiting for the full target
+const halfBar = resolveSignal(pBuy, [C2(2000,2000,2025,1998,2020)]);
+ok('BUY banks at the half level', halfBar.status, 'won');
+ok('exit is the half level, not the target', halfBar.exitPrice, 2020);
+ok('flagged as partial', halfBar.partial, true);
+ok('SELL banks at its half level', resolveSignal(pSell,[C2(2000,2000,2002,1975,1980)]).exitPrice, 1980);
+
+// A bar spanning both levels fills the NEARER one — price had to pass through
+// the partial to reach the target, so a resting partial order is already gone.
+const fullBar = resolveSignal(pBuy, [C2(2000,2000,2045,1998,2040)]);
+ok('a bar spanning both banks the partial', fullBar.exitPrice, 2020);
+ok('and flags it partial', fullBar.partial, true);
+// with partials off, the same bar books the full target
+const noPartial = resolveSignal(pBuy, [C2(2000,2000,2045,1998,2040)], {partialTP:{enabled:false}});
+ok('target booked when partials are off', noPartial.exitPrice, 2040);
+ok('and is not flagged partial', !!noPartial.partial, false);
+// a conviction hold reaches the real target
+const held = resolveSignal({...pBuy, grade:'A'}, [C2(2000,2000,2045,1998,2040)]);
+ok('conviction hold books the full target', held.exitPrice, 2040);
+
+// conviction earns a full run
+const conviction = {...pBuy, grade:'A'};
+ok('grade A holds for the full target', shouldHoldForFullTarget(conviction, PARTIAL_TP_DEFAULTS), true);
+ok('grade A ignores the half level', resolveSignal(conviction,[C2(2000,2000,2025,1998,2020)]).status, 'open');
+const metaConviction = {...pBuy, metaScore:0.5};
+ok('high meta score holds too', shouldHoldForFullTarget(metaConviction, PARTIAL_TP_DEFAULTS), true);
+ok('low meta score does not', shouldHoldForFullTarget(pBuy, PARTIAL_TP_DEFAULTS), false);
+ok('disabling restores full-target behaviour', resolveSignal(pBuy,[C2(2000,2000,2025,1998,2020)],{partialTP:{enabled:false}}).status, 'open');
+
+// the stop still wins an ambiguous bar
+ok('stop beats a partial in the same bar', resolveSignal(pBuy,[C2(2000,2000,2025,1985,2000)]).status, 'lost');
+
+// R must reflect the actual exit, not the assumed target
+ok('partial win is ~2R, not 4R', signalRMultiple({status:'won',entry:2000,sl:1990,tp:2040,exitPrice:2020}), 2);
+ok('full win is 4R', signalRMultiple({status:'won',entry:2000,sl:1990,tp:2040,exitPrice:2040}), 4);
+ok('missing exit falls back to the target', signalRMultiple({status:'won',entry:2000,sl:1990,tp:2040}), 4);
+ok('a loss is still -1R', signalRMultiple({status:'lost',entry:2000,sl:1990,tp:2040,exitPrice:1990}), -1);
+
+// paper account books the price it actually exited at
+const acct2={balance:10000,positions:[]};
+const pp = openPaperPosition({id:'x',...pBuy}, acct2, PCFG);
+const partialClose = closePaperPosition(pp,'won',null,PCFG,2020);
+const fullClose = closePaperPosition(pp,'won',null,PCFG,2040);
+ok('paper books the partial exit price', partialClose.exitPrice, 2020);
+ok('partial pays less than the full target', partialClose.pnl < fullClose.pnl, true);
+ok('paper flags the partial', partialClose.partial, true);
+ok('full target is not flagged', !!fullClose.partial, false);
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail?1:0);

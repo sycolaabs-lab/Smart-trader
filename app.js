@@ -18,7 +18,7 @@ import {
   computeConditionBreakdown, computeGateAudit, dataInventory, utcDayKey, rollQuota,
   canSpend, spendQuota, quotaSummary, criticalReserveFor, PAPER_DEFAULTS,
   openPaperPosition, closePaperPosition, unrealisedPnl, paperAccountSummary,
-  GATE_LABELS
+  GATE_LABELS, PARTIAL_TP_DEFAULTS
 } from './lib/engine.js';
 
 const LEARNING_KEY = 'smc-factor-stats-v1';
@@ -222,9 +222,10 @@ function applySignalOutcome(sig, won, opts) {
   sig.resolvedBy = opts.auto ? 'auto' : 'manual';
   if (opts.exitPrice != null) sig.exitPrice = opts.exitPrice;
   if (opts.ambiguousBar) sig.ambiguousBar = true;
+  if (opts.partial) sig.partial = true;
   if (opts.mistakeNote) sig.mistake = opts.mistakeNote;
   recordOutcome(sig.dir, sig.factors, won);
-  paperCloseForSignal(sig.id, won ? 'won' : 'lost');
+  paperCloseForSignal(sig.id, won ? 'won' : 'lost', opts.exitPrice);
   // Feed the meta-labeler's training set too — retraining itself happens on the next backtest cycle,
   // consistent with the rest of the self-learning loop, rather than retraining on every single resolution.
   if (sig.qualityFeatures) {
@@ -287,7 +288,7 @@ function renderSignalLog() {
       const colour = sig.status === 'won' ? '#3ecf8e' : sig.status === 'expired' ? '#9298a5' : '#ef4d5f';
       tag.style.cssText = 'font-size:10px;margin-left:6px;color:' + colour + ';';
       const auto = sig.resolvedBy === 'auto' ? ' (auto)' : '';
-      if (sig.status === 'won') tag.textContent = '✓ won' + auto;
+      if (sig.status === 'won') tag.textContent = '✓ won' + (sig.partial ? ' (partial)' : '') + auto;
       else if (sig.status === 'expired') tag.textContent = '– expired' + (sig.expiryReason ? ' · ' + sig.expiryReason : '');
       else tag.textContent = '✗ lost' + auto + (sig.mistake ? ' — ' + sig.mistake : '');
       wrap.appendChild(tag);
@@ -1624,6 +1625,22 @@ function paperConfig() {
     maxConcurrent: num('pMaxPos', PAPER_DEFAULTS.maxConcurrent)
   });
 }
+// Partial take-profit config, read from the same panel. Lives on the resolver
+// rather than the account because it decides when a SIGNAL is closed, which is
+// what both the P&L and the learning record derive from.
+function partialTPConfig() {
+  const el = document.getElementById('pPartialPct');
+  const meta = document.getElementById('pHoldMeta');
+  const on = document.getElementById('pPartialEnabled');
+  const pctVal = el ? parseFloat(el.value) : NaN;
+  const metaVal = meta ? parseFloat(meta.value) : NaN;
+  return {
+    enabled: on ? !!on.checked : PARTIAL_TP_DEFAULTS.enabled,
+    fraction: isFinite(pctVal) ? pctVal / 100 : PARTIAL_TP_DEFAULTS.fraction,
+    holdIfMetaScore: isFinite(metaVal) ? metaVal : PARTIAL_TP_DEFAULTS.holdIfMetaScore,
+    holdIfGrades: PARTIAL_TP_DEFAULTS.holdIfGrades
+  };
+}
 async function loadPaper() {
   try {
     const raw = localStorage.getItem(PAPER_KEY);
@@ -1656,11 +1673,11 @@ function paperOpenForSignal(sig) {
   savePaper();
   renderPaper();
 }
-function paperCloseForSignal(signalId, outcome) {
+function paperCloseForSignal(signalId, outcome, atPrice) {
   if (!paper.positions.length) return;
   const idx = paper.positions.findIndex(p => p.signalId === signalId && p.status === 'open');
   if (idx === -1) return;
-  paper.positions[idx] = closePaperPosition(paper.positions[idx], outcome, currentMarkPrice(), paperConfig());
+  paper.positions[idx] = closePaperPosition(paper.positions[idx], outcome, currentMarkPrice(), paperConfig(), atPrice);
   savePaper();
   renderPaper();
 }
@@ -1705,7 +1722,7 @@ function renderPaper() {
   if (closed.length) {
     html += '<div style="font-size:10px;color:#454a56;margin:10px 0 6px;">Recent closed</div>';
     html += closed.map(p =>
-      '<div class="zone-item"><span><span class="dirtag ' + p.dir + '">' + p.dir + '</span> ' + (p.outcome === 'won' ? '✓' : p.outcome === 'lost' ? '✗' : '–')
+      '<div class="zone-item"><span><span class="dirtag ' + p.dir + '">' + p.dir + '</span> ' + (p.outcome === 'won' ? (p.partial ? '◐' : '✓') : p.outcome === 'lost' ? '✗' : '–')
       + ' <span style="color:#454a56;">exit $' + fmt(p.exitPrice) + '</span></span>'
       + '<span class="mono ' + pnlCls(p.pnl) + '">' + money(p.pnl) + (p.rMultiple != null ? ' <span style="color:#454a56;">' + (p.rMultiple >= 0 ? '+' : '') + fmt(p.rMultiple) + 'R</span>' : '') + '</span></div>'
     ).join('');
@@ -1729,7 +1746,7 @@ document.getElementById('paperEnabled').addEventListener('change', function () {
 document.getElementById('paperAdvancedToggle').addEventListener('click', () => {
   document.getElementById('paperAdvanced').classList.toggle('hidden');
 });
-['pStartBalance', 'pRiskPct', 'pSpread', 'pSlippage', 'pMaxPos'].forEach(id => {
+['pStartBalance', 'pRiskPct', 'pSpread', 'pSlippage', 'pMaxPos', 'pPartialPct', 'pHoldMeta', 'pPartialEnabled'].forEach(id => {
   const el = document.getElementById(id);
   if (el) el.addEventListener('change', () => { paper.startingBalance = paperConfig().startingBalance; savePaper(); renderPaper(); });
 });
@@ -1863,6 +1880,7 @@ function autonomyConfig() {
     analysisIntervalMinutes: num('aInterval', AUTONOMY_DEFAULTS.analysisIntervalMinutes),
     backtestIntervalHours: num('aBtHours', AUTONOMY_DEFAULTS.backtestIntervalHours),
     minMetaScore: num('aMinMeta', AUTONOMY_DEFAULTS.minMetaScore),
+    partialTP: partialTPConfig(),
     gradeFloor: (document.getElementById('aMinGrade') || {}).value || AUTONOMY_DEFAULTS.gradeFloor
   });
 }
@@ -1961,7 +1979,7 @@ function resolveOpenSignals(candles, cfg) {
     const verdict = resolveSignal(sig, candles, cfg);
     if (verdict.status === 'won' || verdict.status === 'lost') {
       if (applySignalOutcome(sig, verdict.status === 'won', {
-        auto: true, exitPrice: verdict.exitPrice, ambiguousBar: verdict.ambiguousBar
+        auto: true, exitPrice: verdict.exitPrice, ambiguousBar: verdict.ambiguousBar, partial: verdict.partial
       })) { resolved++; changed = true; }
     } else if (verdict.status === 'expired') {
       sig.status = 'expired';
