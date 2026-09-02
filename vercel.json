@@ -10,8 +10,5 @@
       "path": "/api/tick",
       "schedule": "0 6 * * *"
     }
-  ],
-  "env": {
-    "TICK_GRADE_FLOOR": "C"
-  }
+  ]
 }
