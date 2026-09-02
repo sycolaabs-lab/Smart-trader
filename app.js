@@ -14,7 +14,7 @@ import {
   trainAdaBoostStumps, buildTradePlan, reasoningText, FACTOR_LABELS,
   patternSignature, computeTunedWeights, runSmcBacktest, setMetaModel,
   AUTONOMY_DEFAULTS, resolveSignal, autonomyGate, macroContribution,
-  aggregateMacroScore, pctChangeOf, computeCalibration,
+  aggregateMacroScore, pctChangeOf, seriesDeltas, latestChangeOf, computeCalibration,
   computeConditionBreakdown, computeGateAudit, dataInventory, utcDayKey, rollQuota,
   canSpend, spendQuota, quotaSummary, criticalReserveFor, PAPER_DEFAULTS,
   openPaperPosition, closePaperPosition, unrealisedPnl, paperAccountSummary,
@@ -734,14 +734,16 @@ async function refreshCorrelation(providerId, tdKey, fredKey) {
     for (const inst of FRED_INSTRUMENTS) {
       try {
         const obs = await fetchFredSeries(inst.seriesId, fredKey, 60);
-        const rets = toDailyReturns(obs);
+        // Yields move in basis points, not percentages of their own level —
+        // seriesDeltas picks the right transform per instrument.
+        const rets = seriesDeltas(obs, inst.kind);
         const corr = xauRets ? pearsonCorrelation(xauRets, rets) : null;
-        const pctChange = pctChangeOf(obs);
+        const pctChange = latestChangeOf(obs, inst.kind);
         // Weight by the ACTUAL measured correlation strength/sign, not the assumed polarity — a genuinely
         // weak or unstable relationship (like oil's has historically been) shrinks toward zero influence on
         // its own instead of me having to guess the right number. Falls back to the assumed polarity only
         // when correlation can't be measured yet (no gold daily history available to compare against).
-        results.push({ key: inst.key, label: inst.label, source: 'FRED', available: true, pctChange, corr, contribution: macroContribution(pctChange, corr, inst.polarity), polarity: inst.polarity });
+        results.push({ key: inst.key, label: inst.label, source: 'FRED', available: true, pctChange, corr, contribution: macroContribution(pctChange, corr, inst.polarity), polarity: inst.polarity, kind: inst.kind });
       } catch (e) {
         results.push({ key: inst.key, label: inst.label, source: 'FRED', available: false, reason: e.message });
       }
@@ -759,10 +761,10 @@ async function refreshCorrelation(providerId, tdKey, fredKey) {
         try {
           if (!spendCredit('low')) throw new Error('Skipped to stay inside the daily API budget.');
           const candles = await PROVIDERS.twelvedata.timeSeries(tdKey, '1day', 60, inst.symbol);
-          const rets = toDailyReturns(candles);
+          const rets = seriesDeltas(candles, inst.kind);
           const corr = pearsonCorrelation(xauRets, rets);
-          const pctChange = pctChangeOf(candles);
-          results.push({ key: inst.key, label: inst.label, source: 'Twelve Data', available: true, pctChange, corr, contribution: macroContribution(pctChange, corr, inst.polarity), polarity: inst.polarity });
+          const pctChange = latestChangeOf(candles, inst.kind);
+          results.push({ key: inst.key, label: inst.label, source: 'Twelve Data', available: true, pctChange, corr, contribution: macroContribution(pctChange, corr, inst.polarity), polarity: inst.polarity, kind: inst.kind });
         } catch (e) {
           results.push({ key: inst.key, label: inst.label, source: 'Twelve Data', available: false, reason: e.message });
         }
@@ -796,7 +798,7 @@ async function refreshFundamentals(fredKey) {
       const pctChange = pctChangeOf(obs);
       // No measured correlation for fundamentals — these are low-frequency prints,
       // so the assumed polarity is the weight.
-      results.push({ key: inst.key, label: inst.label, available: true, pctChange, contribution: macroContribution(pctChange, null, inst.polarity), polarity: inst.polarity, latestDate: obs[obs.length - 1].time });
+      results.push({ key: inst.key, label: inst.label, available: true, pctChange, contribution: macroContribution(pctChange, null, inst.polarity), polarity: inst.polarity, kind: inst.kind, latestDate: obs[obs.length - 1].time });
     } catch (e) {
       results.push({ key: inst.key, label: inst.label, available: false, reason: e.message });
     }
@@ -1181,7 +1183,7 @@ function refreshAll() {
         const corrTxt = d.corr == null ? 'n/a' : (d.corr >= 0.4 ? 'strong +' : d.corr <= -0.4 ? 'strong −' : Math.abs(d.corr) >= 0.15 ? (d.corr > 0 ? 'weak +' : 'weak −') : 'flat') + (d.corr != null ? ' (' + fmt(d.corr) + ')' : '');
         const confirms = d.contribution !== 0 && lastComposite && lastComposite.direction !== 'HOLD' && Math.sign(d.contribution) === (lastComposite.direction === 'BUY' ? 1 : -1);
         const flagTxt = lastComposite && lastComposite.direction !== 'HOLD' ? (confirms ? ' <span class="fpos">✓ confirms</span>' : ' <span class="fneg">✗ contradicts</span>') : '';
-        return '<div class="zone-item ' + (d.pctChange < 0 ? 'bearish' : '') + '"><span>' + d.label + srcTag + ' <span style="color:#454a56;">(' + corrTxt + ')</span></span><span class="mono ' + changeCls + '">' + (d.pctChange >= 0 ? '+' : '') + fmt(d.pctChange) + '%' + flagTxt + '</span></div>';
+        return '<div class="zone-item ' + (d.pctChange < 0 ? 'bearish' : '') + '"><span>' + d.label + srcTag + ' <span style="color:#454a56;">(' + corrTxt + ')</span></span><span class="mono ' + changeCls + '">' + (d.pctChange >= 0 ? '+' : '') + fmt(d.pctChange) + (d.kind === 'yield' ? ' pp' : '%') + flagTxt + '</span></div>';
       }).join('');
     }
   }
@@ -1198,7 +1200,7 @@ function refreshAll() {
         const confirms = d.contribution !== 0 && lastComposite && lastComposite.direction !== 'HOLD' && Math.sign(d.contribution) === (lastComposite.direction === 'BUY' ? 1 : -1);
         const flagTxt = lastComposite && lastComposite.direction !== 'HOLD' ? (confirms ? ' <span class="fpos">✓ confirms</span>' : ' <span class="fneg">✗ contradicts</span>') : '';
         const dateTxt = d.latestDate ? new Date(d.latestDate).toLocaleDateString([], { month: 'short', year: 'numeric' }) : '';
-        return '<div class="zone-item ' + (d.pctChange < 0 ? 'bearish' : '') + '"><span>' + d.label + ' <span style="color:#454a56;font-size:9px;">(' + dateTxt + ')</span></span><span class="mono ' + changeCls + '">' + (d.pctChange >= 0 ? '+' : '') + fmt(d.pctChange) + '%' + flagTxt + '</span></div>';
+        return '<div class="zone-item ' + (d.pctChange < 0 ? 'bearish' : '') + '"><span>' + d.label + ' <span style="color:#454a56;font-size:9px;">(' + dateTxt + ')</span></span><span class="mono ' + changeCls + '">' + (d.pctChange >= 0 ? '+' : '') + fmt(d.pctChange) + (d.kind === 'yield' ? ' pp' : '%') + flagTxt + '</span></div>';
       }).join('');
     }
   }

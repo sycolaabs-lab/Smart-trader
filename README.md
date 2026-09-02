@@ -240,6 +240,51 @@ Server-side, `/api/tick` takes the same thresholds from `TICK_GRADE_FLOOR` and
 
 ---
 
+## Correlation basket
+
+| Instrument | Source | Series | Type |
+|---|---|---|---|
+| Broad Dollar Index | FRED | DTWEXBGS | price |
+| **10Y Real Yield (TIPS)** | FRED | **DFII10** | yield |
+| **10Y Breakeven Inflation** | FRED | **T10YIE** | yield |
+| Volatility (VIX) | FRED | VIXCLS | price |
+| US 2Y Treasury Yield | FRED | DGS2 | yield |
+| Silver | Twelve Data | XAG/USD | price |
+| Bitcoin | Twelve Data | BTC/USD | price |
+
+Oil (DCOILWTICO) and the S&P (SP500) were removed. Oil's relationship with gold
+has historically been unstable, and the S&P's is indirect risk sentiment that
+VIX already covers. Real yields are the cleanest single driver — gold pays no
+coupon, so when the inflation-adjusted return on a risk-free bond rises, the
+opportunity cost of holding metal rises with it. Breakeven inflation is the
+other half of that decomposition and carries the inflation-hedge channel.
+
+The nominal 10Y (DGS10) is deliberately **not** here: nominal = real +
+breakeven by construction. A live check gave 4.75 against 2.44 + 2.35, so
+carrying all three would count the rates channel twice and let redundancy
+decide the weighting. The 2Y stays because the short end is policy
+expectations, which is separate information from duration.
+
+### Yields are not prices
+
+A yield moving 0.05 → 0.10 is a **5 basis point** rise, not a 100% one. Worse,
+DFII10 traded *below zero* through 2020–2022, and a percentage change with a
+negative denominator flips the sign of a rise: −0.02 → 0.03 computes as −250%.
+
+So every instrument declares `kind`. Yield series use absolute differences,
+price series use percentage returns (`seriesDeltas` / `latestChangeOf`).
+Correlation is scale-invariant, so comparing gold *returns* against yield
+*changes* is sound — each side just has to be the right transform of itself.
+This also fixed a latent bug in the pre-existing DGS10/DGS2 handling, dormant
+only because those yields happen to be positive today.
+
+Each instrument's influence is weighted by its **measured** correlation with
+gold, not the assumed polarity, so a relationship that turns out weak shrinks
+its own contribution toward zero. The `polarity` field is only a fallback for
+when correlation cannot be computed yet.
+
+---
+
 ## Data Collected — how much it actually knows
 
 Most of the learning machinery sits dormant below a threshold, and none of that

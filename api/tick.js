@@ -26,7 +26,8 @@ import {
   computeComposite, buildTradePlan, resolveSignal, autonomyGate, setMetaModel,
   trainAdaBoostStumps, parseUtcDatetime, pearsonCorrelation, toDailyReturns,
   CORRELATION_INSTRUMENTS, FUNDAMENTAL_INSTRUMENTS, FRED_INSTRUMENTS,
-  AUTONOMY_DEFAULTS, macroContribution, aggregateMacroScore, pctChangeOf
+  AUTONOMY_DEFAULTS, macroContribution, aggregateMacroScore, pctChangeOf,
+  seriesDeltas, latestChangeOf
 } from '../lib/engine.js';
 
 const SYMBOL = 'XAU/USD';
@@ -115,6 +116,11 @@ async function fredSeries(seriesId, fredKey, limit) {
 // each instrument is weighted by its measured correlation via macroContribution.
 async function computeCorrelation(tdKey, fredKey) {
   const contributions = [];
+  // Which instruments actually contributed, and which failed. Without this a
+  // dead or renamed FRED series just silently drops out of the average and the
+  // score quietly reflects fewer inputs than you think it does.
+  const contributors = [];
+  const failures = [];
   let xauDaily = null;
   try { xauDaily = await twelveSeries(tdKey, '1day', 60); await sleep(1200); }
   catch (e) { xauDaily = null; }
@@ -124,22 +130,29 @@ async function computeCorrelation(tdKey, fredKey) {
     for (const inst of FRED_INSTRUMENTS) {
       try {
         const obs = await fredSeries(inst.seriesId, fredKey, 60);
-        const corr = xauRets ? pearsonCorrelation(xauRets, toDailyReturns(obs)) : null;
-        contributions.push(macroContribution(pctChangeOf(obs), corr, inst.polarity));
-      } catch (e) { /* one series failing must not sink the rest */ }
+        // Yields use absolute (basis-point) changes; prices use returns.
+        const corr = xauRets ? pearsonCorrelation(xauRets, seriesDeltas(obs, inst.kind)) : null;
+        contributions.push(macroContribution(latestChangeOf(obs, inst.kind), corr, inst.polarity));
+        contributors.push(inst.key);
+      } catch (e) {
+        failures.push(inst.key + ': ' + ((e && e.message) || 'failed'));
+      }
     }
   }
   if (xauRets) {
     for (const inst of CORRELATION_INSTRUMENTS) {
       try {
         const candles = await twelveSeries(tdKey, '1day', 60, inst.symbol);
-        const corr = pearsonCorrelation(xauRets, toDailyReturns(candles));
-        contributions.push(macroContribution(pctChangeOf(candles), corr, inst.polarity));
-      } catch (e) { /* ditto */ }
+        const corr = pearsonCorrelation(xauRets, seriesDeltas(candles, inst.kind));
+        contributions.push(macroContribution(latestChangeOf(candles, inst.kind), corr, inst.polarity));
+        contributors.push(inst.key);
+      } catch (e) {
+        failures.push(inst.key + ': ' + ((e && e.message) || 'failed'));
+      }
       await sleep(1200); // stay under Twelve Data's free-tier 8 requests/minute cap
     }
   }
-  return { score: aggregateMacroScore(contributions), available: contributions.length > 0 };
+  return { score: aggregateMacroScore(contributions), available: contributions.length > 0, contributors, failures };
 }
 
 // Macro fundamentals from FRED. These are low-frequency prints with no usable
@@ -346,6 +359,8 @@ export async function runTick({ db, tdKey, fredKey, avKey }) {
       regime: result.regimeInfo ? result.regimeInfo.regime : null,
       macro: {
         correlationAvailable: !!corr.available, correlationScore: corr.score || 0,
+        correlationContributors: corr.contributors || [],
+        correlationFailures: corr.failures || [],
         fundamentalAvailable: !!fund.available, fundamentalScore: fund.score || 0,
         newsAvailable: !!news.available, newsScore: news.score || 0
       },

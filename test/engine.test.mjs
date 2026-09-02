@@ -266,5 +266,41 @@ ok('NaN does not throw', fmt(NaN), '—');
 ok('Infinity does not throw', fmt(Infinity), '—');
 ok('a numeric string is not silently coerced', fmt('12'), '—');
 
+
+// ---------------- yield vs price series ----------------
+import { toDailyChanges, absChangeOf, seriesDeltas, latestChangeOf, toDailyReturns, pctChangeOf, FRED_INSTRUMENTS as FI } from '../lib/engine.js';
+console.log('\n-- yield handling --');
+const ser = a => a.map(c => ({ close: c }));
+
+ok('yield deltas are absolute', toDailyChanges(ser([2.30,2.35,2.40])).map(v=>+v.toFixed(4)).join(','), '0.05,0.05');
+ok('price deltas are returns', toDailyReturns(ser([100,110])).map(v=>+v.toFixed(4)).join(','), '0.1');
+ok('absChangeOf reads the last move', +absChangeOf(ser([2.30,2.35])).toFixed(4), 0.05);
+
+// the case that motivated this: a real yield rising THROUGH zero
+const crossing = ser([-0.02, 0.03]);
+ok('percentage change flips the sign of a rise', pctChangeOf(crossing) < 0, true);
+ok('absolute change keeps the sign', absChangeOf(crossing) > 0, true);
+ok('seriesDeltas picks absolute for a yield', seriesDeltas(crossing,'yield')[0] > 0, true);
+ok('seriesDeltas picks returns for a price', seriesDeltas(ser([100,110]),'price')[0], 0.1);
+ok('latestChangeOf honours kind', latestChangeOf(crossing,'yield') > 0 && latestChangeOf(crossing,'price') < 0, true);
+ok('unknown kind defaults to returns', seriesDeltas(ser([100,110]), undefined)[0], 0.1);
+
+// a negative yield falling further is still a FALL
+const deeper = ser([-0.50,-0.60]);
+ok('deeper negative yield reads as a fall', absChangeOf(deeper) < 0, true);
+ok('percentage change would call it a rise', pctChangeOf(deeper) > 0, true);
+
+// instrument config
+const ids = FI.map(i=>i.seriesId);
+ok('DFII10 present', ids.includes('DFII10'), true);
+ok('T10YIE present', ids.includes('T10YIE'), true);
+ok('oil removed', ids.includes('DCOILWTICO'), false);
+ok('S&P removed', ids.includes('SP500'), false);
+ok('every instrument declares a kind', FI.every(i=>i.kind==='yield'||i.kind==='price'), true);
+ok('rate series marked as yields', FI.filter(i=>i.kind==='yield').map(i=>i.seriesId).sort().join(','), 'DFII10,DGS2,T10YIE');
+ok('nominal 10Y dropped (= real + breakeven)', ids.includes('DGS10'), false);
+ok('2Y kept as a separate policy signal', ids.includes('DGS2'), true);
+ok('no duplicate series ids', ids.length, new Set(ids).size);
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail?1:0);
