@@ -169,6 +169,43 @@ rather keep the secret out of the URL.
 
 ---
 
+## Analysis Quality — auditing its own judgement
+
+This is deliberately not about predicting better. It is about the engine being
+honest with itself on **one pair**, which is where single-market specialisation
+actually pays: enough resolved gold trades accumulate to say something real.
+
+Three questions, none of which a person can answer about themselves:
+
+**Is the confidence score meaningful?** Saying "72%" and being right 72% of the
+time are unrelated skills. The panel splits the resolved record into a
+high-confidence half and a low-confidence half and compares them. If
+high-confidence setups do not win more often, the number is decoration — and
+the panel says so plainly, including when confidence is *inverted*.
+
+Note the target is not "70% confidence → 70% win rate". At a 1:4 target a 30%
+win rate is profitable, so everything is scored in **R** (average profit per
+unit risked) rather than win rate, which flatters a strategy that takes small
+wins and large losses.
+
+**Where does the edge actually live?** Win rate and expectancy broken down by
+session, market regime, grade and direction. A strategy that works in trending
+conditions and bleeds in ranging ones shows up as exactly that, instead of
+averaging into a mediocre whole. Groups with fewer than 3 resolved trades are
+withheld rather than shown as a confident-looking number.
+
+**Were the rejected setups actually bad?** Every setup the gate turns down is
+recorded as a *shadow signal* and resolved against real price anyway — same
+resolver, but it never trains the weights. Comparing the expectancy of declined
+setups against taken ones answers the question no trading journal can, because
+nobody records their non-trades. If the rejected pile is outperforming, the
+filter is too tight and the panel says to loosen it.
+
+Everything here refuses to report on small samples. A reassuring number built on
+four trades is worse than no number, because it gets believed.
+
+---
+
 ## Deploying
 
 The Vercel project `xauusd-smc-assistant` is linked to this repository, so a

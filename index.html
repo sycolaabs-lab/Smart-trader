@@ -360,6 +360,18 @@ canvas { width:100%; background:#12151c; border-radius:12px; border:1px solid #1
   </div>
 
   <div class="panel">
+    <div class="panel-title">Analysis Quality <span class="collapse-toggle" id="resetQuality">reset declined log</span></div>
+    <div style="font-size:11px;color:#5c6270;margin-bottom:8px;line-height:1.5;">
+      This panel does not try to predict anything. It audits the engine's own judgement over its
+      resolved record — whether its confidence score carries real information, which sessions and
+      regimes its edge actually lives in, and whether the setups it rejected would have made money.
+      These are the checks a person cannot run on themselves: nobody keeps an honest ledger of the
+      trades they passed on, and nobody can tell from memory whether their own conviction means anything.
+    </div>
+    <div id="qualityContent"></div>
+  </div>
+
+  <div class="panel">
     <div class="panel-title">Background System <span class="collapse-toggle" id="bgSetupToggle" style="color:#454a56;">setup</span></div>
     <div style="font-size:11px;color:#5c6270;margin-bottom:8px;line-height:1.5;">A server-side function keeps analyzing gold on a schedule independent of this browser tab — full parity with the live engine: structure across Weekly/Daily/4H/1H/15min, correlation, fundamentals, news sentiment, and the meta-labeler, all server-side. It also tracks its own trades to resolution and retrains its meta-labeler from real outcomes — genuinely learning while you're away, not just repeating a snapshot.</div>
     <div id="bgSetupNote" class="hidden" style="font-size:10px;color:#454a56;line-height:1.6;margin-bottom:10px;padding:10px;background:#0d0f14;border-radius:8px;">

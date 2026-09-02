@@ -20,7 +20,8 @@ import {
   buildTradePlan, reasoningText, FACTOR_LABELS, patternSignature,
   computeTunedWeights, runSmcBacktest, setMetaModel,
   AUTONOMY_DEFAULTS, resolveSignal, autonomyGate,
-  macroContribution, aggregateMacroScore, pctChangeOf
+  macroContribution, aggregateMacroScore, pctChangeOf,
+  computeCalibration, computeConditionBreakdown, computeGateAudit
 } from './lib/engine.js';
 
 const LEARNING_KEY = 'smc-factor-stats-v1';
@@ -138,6 +139,46 @@ document.getElementById('resetLearning').addEventListener('click', async () => {
 
 const SIGNAL_LOG_KEY = 'smc-signal-log-v1';
 let signalLog = [];
+
+// The setups the gate turned down, tracked and resolved exactly like real ones.
+// This is the ledger no trading journal has: without it, "should I loosen my
+// filter?" can only ever be answered by feel. Capped, and never counted as a
+// trade — these are measurements, not signals.
+const SHADOW_LOG_KEY = 'smc-shadow-log-v1';
+const SHADOW_LOG_MAX = 250;
+let shadowLog = [];
+async function loadShadowLog() {
+  try {
+    const raw = localStorage.getItem(SHADOW_LOG_KEY);
+    if (raw) shadowLog = JSON.parse(raw);
+  } catch (e) { shadowLog = []; }
+}
+async function saveShadowLog() {
+  try { localStorage.setItem(SHADOW_LOG_KEY, JSON.stringify(shadowLog.slice(0, SHADOW_LOG_MAX))); }
+  catch (e) { /* storage unavailable */ }
+}
+function addShadowSignal(result, plan, declineReason) {
+  if (!result || result.direction === 'HOLD' || !plan) return;
+  if (!isFinite(plan.entry) || !isFinite(plan.sl) || !isFinite(plan.tp) || plan.rr <= 0) return;
+  // One shadow per bar at most, so a 15-minute cadence doesn't log the same
+  // standing setup dozens of times and swamp the comparison.
+  const lastBarTime = liveData.length ? liveData[liveData.length - 1].time : null;
+  if (shadowLog.length && shadowLog[0].barTime === lastBarTime) return;
+  shadowLog.unshift({
+    id: 'sh-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6),
+    dir: result.direction, entry: plan.entry, sl: plan.sl, tp: plan.tp,
+    entryType: plan.entryType, confidence: result.confidence,
+    session: result.sessionInfo ? result.sessionInfo.session : null,
+    regime: result.regimeInfo ? result.regimeInfo.regime : null,
+    grade: result.fusion ? downgradeGrade(result.fusion.grade, plan.metaScore || 0) : null,
+    metaScore: plan.metaScore || 0,
+    declineReason: declineReason || null,
+    barTime: lastBarTime,
+    time: new Date().toISOString(), status: plan.entryType === 'market' ? 'open' : 'pending'
+  });
+  shadowLog = shadowLog.slice(0, SHADOW_LOG_MAX);
+  saveShadowLog();
+}
 async function loadSignalLog() {
   try {
     const raw = localStorage.getItem(SIGNAL_LOG_KEY);
@@ -145,8 +186,13 @@ async function loadSignalLog() {
   } catch (e) { signalLog = []; }
   renderSignalLog();
 }
+// Newest-first, so trimming takes from the TAIL. slice(-N) here kept the OLDEST
+// N instead, which meant that once the log filled, every newly logged signal was
+// dropped on the very next save — it could never be resolved, so the knowledge
+// base stopped accumulating entirely at the cap.
+const SIGNAL_LOG_MAX = 600;
 async function saveSignalLog() {
-  if (signalLog.length > 200) signalLog = signalLog.slice(-200);
+  if (signalLog.length > SIGNAL_LOG_MAX) signalLog = signalLog.slice(0, SIGNAL_LOG_MAX);
   try { localStorage.setItem(SIGNAL_LOG_KEY, JSON.stringify(signalLog)); } catch (e) { /* storage unavailable */ }
   if (fbReady && fbAuth.currentUser) pushCloudState(fbAuth.currentUser.uid);
 }
@@ -156,6 +202,8 @@ function addSignalToLog(result, plan) {
     dir: result.direction, entry: plan.entry, sl: plan.sl, tp: plan.tp,
     confidence: result.confidence, factors: Object.assign({}, result.factors),
     session: result.sessionInfo ? result.sessionInfo.session : null,
+    regime: result.regimeInfo ? result.regimeInfo.regime : null,
+    entryType: plan.entryType,
     grade: result.fusion ? downgradeGrade(result.fusion.grade, plan.metaScore || 0) : null,
     qualityFeatures: plan.qualityFeatures || null, metaScore: plan.metaScore || 0,
     reason: reasoningText(result, plan),
@@ -192,6 +240,7 @@ function markSignalResult(id, won, mistakeNote) {
   saveSignalLog();
   renderSignalLog();
   renderJournalInsights();
+  renderAnalysisQuality();
 }
 function renderJournalInsights() {
   const el = document.getElementById('journalInsights');
@@ -1326,6 +1375,89 @@ document.getElementById('applyWfWeightsBtn').addEventListener('click', () => {
 });
 
 // ============================================================
+// ANALYSIS QUALITY PANEL
+// ------------------------------------------------------------
+// Renders the three self-audits. Every number here is deliberately allowed to
+// say "not enough data yet" rather than show a confident-looking figure built
+// on four trades — a reassuring number from a tiny sample is worse than no
+// number, because it gets believed.
+// ============================================================
+function fmtR(v) { return v == null ? '—' : (v >= 0 ? '+' : '') + v.toFixed(2) + 'R'; }
+function fmtPct(v) { return v == null ? '—' : (v * 100).toFixed(0) + '%'; }
+function rClass(v) { return v == null ? 'fneu' : v > 0.05 ? 'fpos' : v < -0.05 ? 'fneg' : 'fneu'; }
+
+function renderAnalysisQuality() {
+  const root = document.getElementById('qualityContent');
+  if (!root) return;
+
+  const cal = computeCalibration(signalLog);
+  const bd = computeConditionBreakdown(signalLog);
+  const audit = computeGateAudit(signalLog, shadowLog);
+
+  const rows = (list, label) => {
+    const usable = list.filter(r => r.n >= 3);
+    if (!usable.length) return '<div class="zone-empty">' + label + ': not enough resolved trades yet (need 3+ per group).</div>';
+    return usable.map(r =>
+      '<div class="zone-item"><span>' + r.key + ' <span style="color:#454a56;">(' + r.n + ')</span></span>' +
+      '<span class="mono ' + rClass(r.expectancyR) + '">' + fmtR(r.expectancyR) + ' · ' + fmtPct(r.winRate) + '</span></div>'
+    ).join('');
+  };
+
+  const o = bd.overall;
+  let html = '';
+
+  html += '<div class="data-source-note" style="margin-bottom:8px;">Expectancy is shown in R — average profit per unit risked. At a 1:4 target a 30% win rate is already profitable, so win rate alone is a poor scorecard and R is the honest one.</div>';
+
+  html += '<div class="metrics" style="margin-bottom:10px;">'
+    + '<div class="card"><div class="label">Resolved</div><div class="value mono">' + o.n + '</div></div>'
+    + '<div class="card"><div class="label">Win Rate</div><div class="value mono">' + fmtPct(o.winRate) + '</div></div>'
+    + '<div class="card"><div class="label">Expectancy</div><div class="value mono ' + rClass(o.expectancyR) + '">' + fmtR(o.expectancyR) + '</div></div>'
+    + '<div class="card"><div class="label">Total</div><div class="value mono ' + rClass(o.totalR) + '">' + fmtR(o.totalR) + '</div></div>'
+    + '</div>';
+
+  // 1. Is the confidence number worth anything?
+  html += '<div class="panel-title" style="font-size:11px;margin-top:12px;">Is the confidence score meaningful?</div>';
+  html += '<div class="event-line" style="border-left-color:#e8c37a;">' + cal.verdict + '</div>';
+  if (cal.discrimination != null) {
+    html += '<div class="zone-item"><span>High-confidence half vs low-confidence half</span><span class="mono ' + rClass(cal.discrimination) + '">'
+      + (cal.discrimination >= 0 ? '+' : '') + (cal.discrimination * 100).toFixed(0) + ' pp win rate</span></div>';
+  }
+  if (cal.buckets.length) {
+    html += '<table class="factor-table"><tr><th style="text-align:left;color:#5c6270;font-weight:500;">Confidence band</th><th style="color:#5c6270;font-weight:500;">Win rate</th><th style="color:#5c6270;font-weight:500;">Expectancy</th></tr>';
+    html += cal.buckets.map(b =>
+      '<tr><td>' + b.lo + '–' + b.hi + '% <span style="color:#454a56;">(' + b.n + ')</span></td>'
+      + '<td>' + fmtPct(b.winRate) + '</td>'
+      + '<td class="' + rClass(b.expectancyR) + '">' + fmtR(b.expectancyR) + '</td></tr>').join('');
+    html += '</table>';
+  }
+
+  // 2. Where does the edge actually live?
+  html += '<div class="panel-title" style="font-size:11px;margin-top:14px;">Where the edge actually lives</div>';
+  html += '<div style="font-size:10px;color:#454a56;margin-bottom:6px;">By session</div>' + rows(bd.bySession, 'Session');
+  html += '<div style="font-size:10px;color:#454a56;margin:8px 0 6px;">By market regime</div>' + rows(bd.byRegime, 'Regime');
+  html += '<div style="font-size:10px;color:#454a56;margin:8px 0 6px;">By grade</div>' + rows(bd.byGrade, 'Grade');
+  html += '<div style="font-size:10px;color:#454a56;margin:8px 0 6px;">By direction</div>' + rows(bd.byDirection, 'Direction');
+
+  // 3. The roads not taken.
+  html += '<div class="panel-title" style="font-size:11px;margin-top:14px;">The setups it turned down</div>';
+  html += '<div class="data-source-note" style="margin-bottom:6px;">Every setup the filter rejected is tracked and resolved against real price anyway. This is the comparison a human journal can never make, because nobody records their non-trades.</div>';
+  html += '<div class="zone-item"><span>Taken</span><span class="mono ' + rClass(audit.taken.expectancyR) + '">'
+    + fmtR(audit.taken.expectancyR) + ' <span style="color:#454a56;">(' + audit.taken.n + ')</span></span></div>';
+  html += '<div class="zone-item"><span>Declined</span><span class="mono ' + rClass(audit.declined.expectancyR) + '">'
+    + fmtR(audit.declined.expectancyR) + ' <span style="color:#454a56;">(' + audit.declined.n + ')</span></span></div>';
+  const pending = shadowLog.filter(s => s.status === 'pending' || s.status === 'open').length;
+  if (pending) html += '<div class="zone-item"><span>Declined, still running</span><span class="mono">' + pending + '</span></div>';
+  html += '<div class="event-line" style="border-left-color:#c99bff;margin-top:6px;">' + audit.verdict + '</div>';
+
+  root.innerHTML = html;
+}
+document.getElementById('resetQuality').addEventListener('click', async () => {
+  shadowLog = [];
+  await saveShadowLog();
+  renderAnalysisQuality();
+});
+
+// ============================================================
 // AUTONOMOUS MODE
 // ------------------------------------------------------------
 // The unattended operator. Once the user ticks the box, a single heartbeat
@@ -1475,7 +1607,30 @@ function resolveOpenSignals(candles, cfg) {
   });
   if (changed) { saveSignalLog(); renderSignalLog(); }
   if (resolved) autonomy.autoResolved += resolved;
+  resolveShadowSignals(candles, cfg);
   return resolved;
+}
+
+// Shadows get the same treatment, minus the learning updates — a setup the
+// engine declined should inform the audit, not train the weights as though it
+// had been traded.
+function resolveShadowSignals(candles, cfg) {
+  if (!candles || candles.length < 2 || !shadowLog.length) return;
+  let changed = false;
+  shadowLog.forEach(sig => {
+    if (sig.status !== 'pending' && sig.status !== 'open') return;
+    const verdict = resolveSignal(sig, candles, cfg);
+    if (verdict.status === 'won' || verdict.status === 'lost') {
+      sig.status = verdict.status;
+      sig.resolvedAt = new Date().toISOString();
+      changed = true;
+    } else if (verdict.status === 'expired') {
+      sig.status = 'expired'; sig.expiryReason = verdict.reason || null; changed = true;
+    } else if (verdict.status === 'open' && sig.status === 'pending') {
+      sig.status = 'open'; changed = true;
+    }
+  });
+  if (changed) { saveShadowLog(); renderAnalysisQuality(); }
 }
 
 // One unattended pass. Everything that can fail is inside the caller's try.
@@ -1506,6 +1661,9 @@ async function autonomyCycle() {
                ' (' + lastComposite.confidence + '% confidence' + (gate.grade ? ', grade ' + gate.grade : '') + ').';
     } else {
       updateSignalUI(lastComposite, plan, false); // keep the panel current without logging
+      // Track what was passed on, so the filter can be audited later rather
+      // than trusted forever.
+      addShadowSignal(lastComposite, plan, gate.reason);
       reason = 'No signal taken — ' + gate.reason + '.';
     }
   } else {
@@ -1521,6 +1679,7 @@ async function autonomyCycle() {
     await runBacktestCycle(true);
   }
 
+  renderAnalysisQuality();
   autonomy.cycles++;
   autonomy.consecutiveErrors = 0;
   autonomy.lastError = null;
@@ -1651,9 +1810,11 @@ document.addEventListener('visibilitychange', () => {
 async function bootstrap() {
   await loadLearningState();
   await loadSignalLog();
+  await loadShadowLog();
   applyKnowledgeBaseWeights();
   loadAutonomyState();
   renderAutonomyStats();
+  renderAnalysisQuality();
   refreshAll();
 
   const saved = await loadSavedKeys();
