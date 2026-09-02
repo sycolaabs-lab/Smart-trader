@@ -240,6 +240,39 @@ Server-side, `/api/tick` takes the same thresholds from `TICK_GRADE_FLOOR` and
 
 ---
 
+## Data Collected — how much it actually knows
+
+Most of the learning machinery sits dormant below a threshold, and none of that
+is visible from the outside. It is easy to run for days assuming learning is
+happening when every store is still short of the point where it does anything.
+
+The panel counts each store and shows how far it is from mattering:
+
+| Capability | Needs | What it unlocks |
+|---|---|---|
+| Knowledge base | 15 resolved outcomes | auto-tunes the factor weights |
+| Meta-labeler | 15 labelled examples | scores setup quality at all |
+| Calibration | 8 resolved signals | whether confidence discriminates |
+| Gate audit | 10 resolved declines | whether the filter is too tight |
+| Journal insights | 5 resolved trades | per-session breakdown |
+
+It also shows **per-factor evidence** — a factor only learns from outcomes where
+it actually voted, so an order block can sit at 3 votes while the headline
+count reads 12. A factor needs 5 votes before its win rate is shown at all.
+
+### The two stores are separate
+
+The browser keeps its learning in `localStorage` (and in Firestore under
+`users/<uid>` when signed in). The background worker keeps its own in Firestore
+under `system/worker`. **Neither reads the other.** They accumulate
+independently, so the totals are shown side by side rather than summed — adding
+them would imply a shared brain that does not exist.
+
+If you want one pool, the worker is the one to trust: it runs whether or not a
+tab is open.
+
+---
+
 ## Paper trading — a simulated account
 
 **Simulated only. No broker, no money, no orders leave the page.** Off by

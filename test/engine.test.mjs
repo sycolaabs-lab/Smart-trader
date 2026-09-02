@@ -223,5 +223,48 @@ ok('D still rejected at C floor', autonomyGate(R2('BUY',60,'D'),P2,[],null,{grad
 ok('confidence floor still applies at C', autonomyGate(R2('BUY',20,'C'),P2,[],null,{gradeFloor:'C',minConfidence:30}).take, false);
 ok('decline reason names the floor', /below the C floor/.test(autonomyGate(R2('BUY',60,'D'),P2,[],null,{gradeFloor:'C'}).reason), true);
 
+
+// ---------------- data inventory ----------------
+import { dataInventory, LEARNING_THRESHOLDS } from '../lib/engine.js';
+console.log('\n-- data inventory --');
+const empty = dataInventory({});
+ok('empty inventory does not throw', empty.stores.signalsTotal, 0);
+ok('nothing is ready when empty', Object.values(empty.capabilities).every(c=>!c.ready), true);
+ok('reports what is still needed', empty.capabilities.metaLabeler.remaining, LEARNING_THRESHOLDS.metaLabeler);
+
+const dinv = dataInventory({
+  learningState: { totalLogged: 9, metaExamples: new Array(20).fill({}), metaModel: [{}], patterns:{a:1,b:2},
+                   factors: { htf:{votes:8,wins:5}, ltf:{votes:2,wins:1}, ob:{votes:0,wins:0} } },
+  signalLog: [ {status:'won'},{status:'lost'},{status:'won'},{status:'open'},{status:'pending'},{status:'expired'} ],
+  shadowLog: [ {status:'won'},{status:'lost'},{status:'open'} ],
+  paperPositions: [ {status:'closed'},{status:'closed'},{status:'open'} ]
+});
+ok('counts resolved signals', dinv.stores.signalsResolved, 3);
+ok('counts open signals', dinv.stores.signalsOpen, 2);
+ok('counts expired separately', dinv.stores.signalsExpired, 1);
+ok('counts resolved shadows only', dinv.stores.shadowsResolved, 2);
+ok('counts meta examples', dinv.stores.metaExamples, 20);
+ok('counts paper closed/open', [dinv.stores.paperClosed,dinv.stores.paperOpen].join(','), '2,1');
+ok('counts patterns', dinv.stores.patterns, 2);
+ok('factors with enough votes', dinv.stores.factorsWithData, 1);
+ok('reports total factors tracked', dinv.stores.factorsTotal, 3);
+ok('meta-labeler ready at 20 examples', dinv.capabilities.metaLabeler.ready, true);
+ok('knowledge base not ready at 9', dinv.capabilities.knowledgeBase.ready, false);
+ok('knowledge base needs 6 more', dinv.capabilities.knowledgeBase.remaining, 6);
+ok('calibration not ready at 3 resolved', dinv.capabilities.calibration.ready, false);
+ok('progress percentage', dinv.capabilities.knowledgeBase.pct, 60);
+ok('detects a trained model', dinv.metaTrained, true);
+ok('factors sorted by votes', dinv.factorStats[0].key, 'htf');
+
+
+import { fmt } from '../lib/engine.js';
+console.log('\n-- fmt robustness --');
+ok('formats a number', fmt(12.345), '12.35');
+ok('undefined does not throw', fmt(undefined), '—');
+ok('null does not throw', fmt(null), '—');
+ok('NaN does not throw', fmt(NaN), '—');
+ok('Infinity does not throw', fmt(Infinity), '—');
+ok('a numeric string is not silently coerced', fmt('12'), '—');
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail?1:0);

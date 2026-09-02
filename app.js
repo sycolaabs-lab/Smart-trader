@@ -15,7 +15,7 @@ import {
   patternSignature, computeTunedWeights, runSmcBacktest, setMetaModel,
   AUTONOMY_DEFAULTS, resolveSignal, autonomyGate, macroContribution,
   aggregateMacroScore, pctChangeOf, computeCalibration,
-  computeConditionBreakdown, computeGateAudit, utcDayKey, rollQuota,
+  computeConditionBreakdown, computeGateAudit, dataInventory, utcDayKey, rollQuota,
   canSpend, spendQuota, quotaSummary, criticalReserveFor, PAPER_DEFAULTS,
   openPaperPosition, closePaperPosition, unrealisedPnl, paperAccountSummary,
   GATE_LABELS
@@ -240,6 +240,7 @@ function markSignalResult(id, won, mistakeNote) {
   renderSignalLog();
   renderJournalInsights();
   renderAnalysisQuality();
+  renderDataInventory();
 }
 function renderJournalInsights() {
   const el = document.getElementById('journalInsights');
@@ -407,9 +408,9 @@ if (fbReady) {
         ? '<span style="' + (score > 0.1 ? 'color:#3ecf8e' : score < -0.1 ? 'color:#ef4d5f' : 'color:#5c6270') + '">' + label + ' ' + (score >= 0 ? '+' : '') + score.toFixed(2) + '</span>'
         : '<span style="color:#454a56;">' + label + ' off</span>';
       const m = d.macro || {};
-      detailEl.innerHTML = '<div class="zone-item"><span>' + d.direction + ' <span style="color:#454a56;">(' + d.confidence + '%, full engine — structure + macro + meta-labeler)</span></span><span class="mono ' + dirCls + '">$' + d.price.toFixed(2) + '</span></div>'
-        + (d.direction !== 'HOLD' ? '<div class="zone-item"><span>Entry / SL / TP</span><span class="mono">$' + d.entry.toFixed(2) + ' / $' + d.sl.toFixed(2) + ' / $' + d.tp.toFixed(2) + '</span></div>' : '')
-        + (d.direction !== 'HOLD' ? '<div class="zone-item"><span>Meta-labeler score</span><span class="mono">' + (d.metaTrained ? ((d.metaScore >= 0 ? '+' : '') + d.metaScore.toFixed(2)) : 'not trained yet') + ' <span style="color:#454a56;font-size:9px;">(' + d.metaExampleCount + ' examples)</span></span></div>' : '')
+      detailEl.innerHTML = '<div class="zone-item"><span>' + d.direction + ' <span style="color:#454a56;">(' + d.confidence + '%, full engine — structure + macro + meta-labeler)</span></span><span class="mono ' + dirCls + '">$' + fmt(d.price) + '</span></div>'
+        + (d.direction !== 'HOLD' ? '<div class="zone-item"><span>Entry / SL / TP</span><span class="mono">$' + fmt(d.entry) + ' / $' + fmt(d.sl) + ' / $' + fmt(d.tp) + '</span></div>' : '')
+        + (d.direction !== 'HOLD' ? '<div class="zone-item"><span>Meta-labeler score</span><span class="mono">' + (d.metaTrained ? ((d.metaScore >= 0 ? '+' : '') + fmt(d.metaScore)) : 'not trained yet') + ' <span style="color:#454a56;font-size:9px;">(' + d.metaExampleCount + ' examples)</span></span></div>' : '')
         + '<div class="zone-item"><span>Macro reads</span><span style="font-size:10px;">' + macroTag('Corr', m.correlationAvailable, m.correlationScore || 0) + ' · ' + macroTag('Fund', m.fundamentalAvailable, m.fundamentalScore || 0) + ' · ' + macroTag('News', m.newsAvailable, m.newsScore || 0) + '</span></div>'
         + '<div class="zone-item"><span>Session / Regime</span><span class="mono" style="font-size:10px;">' + (d.session || '—') + ' · ' + (d.regime || '—') + '</span></div>';
     },
@@ -1177,10 +1178,10 @@ function refreshAll() {
         const srcTag = ' <span style="color:#454a56;font-size:9px;">[' + d.source + ']</span>';
         if (!d.available) return '<div class="zone-item" style="border-left-color:#454a56;"><span>' + d.label + srcTag + '</span><span style="color:#454a56;font-size:10px;" title="' + (d.reason || '') + '">unavailable</span></div>';
         const changeCls = d.pctChange >= 0 ? 'fpos' : 'fneg';
-        const corrTxt = d.corr == null ? 'n/a' : (d.corr >= 0.4 ? 'strong +' : d.corr <= -0.4 ? 'strong −' : Math.abs(d.corr) >= 0.15 ? (d.corr > 0 ? 'weak +' : 'weak −') : 'flat') + (d.corr != null ? ' (' + d.corr.toFixed(2) + ')' : '');
+        const corrTxt = d.corr == null ? 'n/a' : (d.corr >= 0.4 ? 'strong +' : d.corr <= -0.4 ? 'strong −' : Math.abs(d.corr) >= 0.15 ? (d.corr > 0 ? 'weak +' : 'weak −') : 'flat') + (d.corr != null ? ' (' + fmt(d.corr) + ')' : '');
         const confirms = d.contribution !== 0 && lastComposite && lastComposite.direction !== 'HOLD' && Math.sign(d.contribution) === (lastComposite.direction === 'BUY' ? 1 : -1);
         const flagTxt = lastComposite && lastComposite.direction !== 'HOLD' ? (confirms ? ' <span class="fpos">✓ confirms</span>' : ' <span class="fneg">✗ contradicts</span>') : '';
-        return '<div class="zone-item ' + (d.pctChange < 0 ? 'bearish' : '') + '"><span>' + d.label + srcTag + ' <span style="color:#454a56;">(' + corrTxt + ')</span></span><span class="mono ' + changeCls + '">' + (d.pctChange >= 0 ? '+' : '') + d.pctChange.toFixed(2) + '%' + flagTxt + '</span></div>';
+        return '<div class="zone-item ' + (d.pctChange < 0 ? 'bearish' : '') + '"><span>' + d.label + srcTag + ' <span style="color:#454a56;">(' + corrTxt + ')</span></span><span class="mono ' + changeCls + '">' + (d.pctChange >= 0 ? '+' : '') + fmt(d.pctChange) + '%' + flagTxt + '</span></div>';
       }).join('');
     }
   }
@@ -1197,7 +1198,7 @@ function refreshAll() {
         const confirms = d.contribution !== 0 && lastComposite && lastComposite.direction !== 'HOLD' && Math.sign(d.contribution) === (lastComposite.direction === 'BUY' ? 1 : -1);
         const flagTxt = lastComposite && lastComposite.direction !== 'HOLD' ? (confirms ? ' <span class="fpos">✓ confirms</span>' : ' <span class="fneg">✗ contradicts</span>') : '';
         const dateTxt = d.latestDate ? new Date(d.latestDate).toLocaleDateString([], { month: 'short', year: 'numeric' }) : '';
-        return '<div class="zone-item ' + (d.pctChange < 0 ? 'bearish' : '') + '"><span>' + d.label + ' <span style="color:#454a56;font-size:9px;">(' + dateTxt + ')</span></span><span class="mono ' + changeCls + '">' + (d.pctChange >= 0 ? '+' : '') + d.pctChange.toFixed(2) + '%' + flagTxt + '</span></div>';
+        return '<div class="zone-item ' + (d.pctChange < 0 ? 'bearish' : '') + '"><span>' + d.label + ' <span style="color:#454a56;font-size:9px;">(' + dateTxt + ')</span></span><span class="mono ' + changeCls + '">' + (d.pctChange >= 0 ? '+' : '') + fmt(d.pctChange) + '%' + flagTxt + '</span></div>';
       }).join('');
     }
   }
@@ -1478,6 +1479,117 @@ document.getElementById('applyWfWeightsBtn').addEventListener('click', () => {
 });
 
 
+
+// ============================================================
+// DATA INVENTORY PANEL
+// ------------------------------------------------------------
+// Answers "how much has it actually learned", which nothing else here does.
+// It also shows the worker's totals alongside the browser's, because the two
+// keep SEPARATE learning stores — the browser in localStorage (and Firestore
+// under users/<uid> when signed in), the worker in Firestore under
+// system/worker. Neither reads the other, so they accumulate independently and
+// a total from one says nothing about the other.
+// ============================================================
+let workerTotals = null; // populated from the worker's public tick snapshot
+
+function bar(p, colour) {
+  return '<div style="height:4px;background:#1a1d26;border-radius:2px;overflow:hidden;margin-top:3px;">'
+    + '<div style="height:100%;width:' + p + '%;background:' + colour + ';"></div></div>';
+}
+function capRow(label, cap, unit) {
+  const colour = cap.ready ? '#3ecf8e' : cap.pct >= 50 ? '#ffa726' : '#5c6270';
+  const right = cap.ready
+    ? '<span style="color:#3ecf8e;">active</span>'
+    : '<span style="color:#9298a5;">' + cap.have + ' / ' + cap.need + ' ' + (unit || '') + '</span>';
+  return '<div style="margin-bottom:8px;">'
+    + '<div style="display:flex;justify-content:space-between;font-size:11px;">'
+    + '<span>' + label + '</span>' + right + '</div>'
+    + bar(cap.pct, colour) + '</div>';
+}
+
+function renderDataInventory() {
+  const root = document.getElementById('dataContent');
+  if (!root) return;
+  const inv = dataInventory({
+    learningState, signalLog, shadowLog, paperPositions: paper.positions
+  });
+  const st = inv.stores;
+
+  let html = '<div class="metrics" style="margin-bottom:10px;">'
+    + '<div class="card"><div class="label">Resolved</div><div class="value mono">' + st.signalsResolved + '</div></div>'
+    + '<div class="card"><div class="label">Learned From</div><div class="value mono">' + st.totalLogged + '</div></div>'
+    + '<div class="card"><div class="label">Meta Examples</div><div class="value mono">' + st.metaExamples + '</div></div>'
+    + '<div class="card"><div class="label">Declined Tracked</div><div class="value mono">' + st.shadowsResolved + '</div></div>'
+    + '</div>';
+
+  html += '<div style="font-size:10px;color:#454a56;margin:10px 0 6px;">What each store unlocks</div>';
+  html += capRow('Knowledge base — auto-tunes factor weights', inv.capabilities.knowledgeBase, 'outcomes');
+  html += capRow('Meta-labeler — scores setup quality', inv.capabilities.metaLabeler, 'examples');
+  html += capRow('Calibration — is confidence meaningful', inv.capabilities.calibration, 'resolved');
+  html += capRow('Gate audit — is the filter too tight', inv.capabilities.gateAudit, 'declined');
+  html += capRow('Journal insights', inv.capabilities.journal, 'resolved');
+
+  html += '<div style="font-size:10px;color:#454a56;margin:10px 0 6px;">Raw stores (this browser)</div>';
+  const row = (k, v, extra) => '<div class="zone-item" style="padding:3px 0;"><span style="font-size:11px;">' + k
+    + '</span><span class="mono" style="font-size:11px;">' + v
+    + (extra ? ' <span style="color:#454a56;">' + extra + '</span>' : '') + '</span></div>';
+  html += row('Signals logged', st.signalsTotal, 'cap ' + inv.caps.signalLog);
+  html += row('&nbsp;&nbsp;· resolved / open / expired', st.signalsResolved + ' / ' + st.signalsOpen + ' / ' + st.signalsExpired, '');
+  html += row('Declined setups tracked', st.shadowsTotal, 'cap ' + inv.caps.shadowLog);
+  html += row('Meta-labeler examples', st.metaExamples, 'cap ' + inv.caps.metaExamples + (inv.metaTrained ? ' · trained' : ' · untrained'));
+  html += row('Paper trades closed / open', st.paperClosed + ' / ' + st.paperOpen, '');
+  html += row('Distinct patterns seen', st.patterns, '');
+  html += row('Factors with usable history', st.factorsWithData + ' / ' + st.factorsTotal, '5+ votes each');
+
+  if (inv.factorStats.length && inv.factorStats[0].votes > 0) {
+    html += '<div style="font-size:10px;color:#454a56;margin:10px 0 6px;">Per-factor evidence</div>';
+    html += inv.factorStats.filter(f => f.votes > 0).map(f => {
+      const wr = f.votes ? (f.wins / f.votes * 100) : null;
+      const cls = f.votes < 5 ? 'fneu' : wr >= 55 ? 'fpos' : wr <= 45 ? 'fneg' : 'fneu';
+      return '<div class="zone-item" style="padding:2px 0;"><span style="font-size:11px;">' + (FACTOR_LABELS[f.key] || f.key)
+        + '</span><span class="mono ' + cls + '" style="font-size:11px;">' + f.votes + ' votes'
+        + (f.votes >= 5 ? ' · ' + wr.toFixed(0) + '%' : ' <span style="color:#454a56;">(needs 5)</span>') + '</span></div>';
+    }).join('');
+  }
+
+  // The worker's pool is genuinely separate — showing them side by side rather
+  // than summed, because adding them would imply a shared brain that does not exist.
+  html += '<div style="font-size:10px;color:#454a56;margin:10px 0 6px;">Background worker (separate store)</div>';
+  if (workerTotals) {
+    html += row('Outcomes learned from', workerTotals.totalLogged, '');
+    html += row('Meta examples', workerTotals.metaExampleCount, workerTotals.metaTrained ? 'trained' : 'untrained');
+    html += row('Open signals', workerTotals.openSignals, '');
+    html += row('Last tick', workerTotals.ageMin + ' min ago', '');
+  } else {
+    html += '<div class="zone-empty">No worker tick read yet — press refresh, or the worker has not run.</div>';
+  }
+  html += '<div class="conn-note" style="margin-top:6px;">The worker keeps its own learning store in Firestore and this browser keeps its own locally. They accumulate independently and neither reads the other, so these totals are not additive.</div>';
+
+  root.innerHTML = html;
+}
+
+// Read the worker's public snapshot for its side of the ledger.
+async function refreshWorkerTotals() {
+  if (!fbReady || !fbDb) return;
+  try {
+    const doc = await fbDb.collection('system').doc('latestTick').get();
+    if (!doc.exists) { workerTotals = null; return; }
+    const d = doc.data();
+    workerTotals = {
+      totalLogged: d.totalLogged || 0,
+      metaExampleCount: d.metaExampleCount || 0,
+      metaTrained: !!d.metaTrained,
+      openSignals: d.openSignals || 0,
+      ageMin: Math.round((Date.now() - (d.time || Date.now())) / 60000)
+    };
+  } catch (e) { workerTotals = null; }
+}
+
+document.getElementById('dataRefresh').addEventListener('click', async () => {
+  await refreshWorkerTotals();
+  renderDataInventory();
+});
+
 // ============================================================
 // PAPER TRADING ACCOUNT
 // ------------------------------------------------------------
@@ -1582,7 +1694,7 @@ function renderPaper() {
     html += '<div style="font-size:10px;color:#454a56;margin:10px 0 6px;">Open positions</div>';
     html += open.map(p => {
       const u = unrealisedPnl(p, price);
-      return '<div class="zone-item"><span><span class="dirtag ' + p.dir + '">' + p.dir + '</span> ' + p.units.toFixed(2) + ' u @ $' + fmt(p.entryFill) + '</span>'
+      return '<div class="zone-item"><span><span class="dirtag ' + p.dir + '">' + p.dir + '</span> ' + fmt(p.units) + ' u @ $' + fmt(p.entryFill) + '</span>'
         + '<span class="mono ' + pnlCls(u) + '">' + money(u) + '</span></div>';
     }).join('');
   }
@@ -1593,7 +1705,7 @@ function renderPaper() {
     html += closed.map(p =>
       '<div class="zone-item"><span><span class="dirtag ' + p.dir + '">' + p.dir + '</span> ' + (p.outcome === 'won' ? '✓' : p.outcome === 'lost' ? '✗' : '–')
       + ' <span style="color:#454a56;">exit $' + fmt(p.exitPrice) + '</span></span>'
-      + '<span class="mono ' + pnlCls(p.pnl) + '">' + money(p.pnl) + (p.rMultiple != null ? ' <span style="color:#454a56;">' + (p.rMultiple >= 0 ? '+' : '') + p.rMultiple.toFixed(2) + 'R</span>' : '') + '</span></div>'
+      + '<span class="mono ' + pnlCls(p.pnl) + '">' + money(p.pnl) + (p.rMultiple != null ? ' <span style="color:#454a56;">' + (p.rMultiple >= 0 ? '+' : '') + fmt(p.rMultiple) + 'R</span>' : '') + '</span></div>'
     ).join('');
   }
 
@@ -1941,6 +2053,7 @@ async function autonomyCycle() {
   }
 
   renderAnalysisQuality();
+  renderDataInventory();
   autonomy.cycles++;
   autonomy.consecutiveErrors = 0;
   autonomy.lastError = null;
@@ -2104,6 +2217,8 @@ async function bootstrap() {
   renderAutonomyStats();
   renderAnalysisQuality();
   renderPaper();
+  renderDataInventory();
+  refreshWorkerTotals().then(renderDataInventory);
   refreshAll();
 
   const saved = await loadSavedKeys();

@@ -388,6 +388,17 @@ canvas { width:100%; background:#12151c; border-radius:12px; border:1px solid #1
     <div style="font-size:11px;color:#5c6270;line-height:1.5;">All three macro engines are connected now (above): cross-market correlation, fundamental economic data, and news sentiment. Each has its own honest caveats about interpretation — check each panel's description for what it actually measures versus what it's a simplified lean on.</div>
   </div>
 
+  <div class="panel" id="dataPanel" style="border-color:#1e2c3a;">
+    <div class="panel-title">Data Collected <span class="collapse-toggle" id="dataRefresh">refresh</span></div>
+    <div style="font-size:11px;color:#5c6270;margin-bottom:8px;line-height:1.5;">
+      Every store the engine learns from, and how far each is from the point where it actually
+      does something. Most of this machinery sits dormant below a threshold — the meta-labeler
+      needs 15 labelled examples before it scores anything at all — so counting is the only way
+      to know whether learning is happening or merely scheduled.
+    </div>
+    <div id="dataContent"></div>
+  </div>
+
   <div class="panel" id="paperPanel" style="border-color:#20332a;">
     <div class="panel-title">
       Paper Trading
