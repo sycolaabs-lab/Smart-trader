@@ -56,6 +56,23 @@ const DEFAULT_WEIGHTS = {
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
+// Wall-clock budget. The function is capped at 60s (vercel.json), and the
+// comment at the top of this file claims slow optional work must never take the
+// tick down with it — but nothing enforced that, and it duly happened: adding
+// cache signatures for correlation and fundamentals at once busted both on the
+// same invocation, forcing ~15 sequential HTTP calls plus rate-limit sleeps on
+// top of a cold start. The tick hit a 504 and never reached its final write, so
+// Firestore silently kept serving the previous one.
+//
+// Optional work now runs only while budget remains. Structure is what the tick
+// exists for; macro is an enrichment and yields first.
+const TICK_BUDGET_MS = 42000;
+const MACRO_MIN_MS = 8000;   // don't start a macro refresh without room to finish
+function budget(started) {
+  const used = Date.now() - started;
+  return { used, left: Math.max(0, TICK_BUDGET_MS - used) };
+}
+
 // ---------- Firestore (Admin) ----------
 // firebase-admin is initialised lazily and reused across warm invocations;
 // re-initialising on every request would both leak apps and add cold-start cost.
@@ -114,7 +131,8 @@ async function fredSeries(seriesId, fredKey, limit) {
 // Cross-market correlation score. Same shape as the browser's refreshCorrelation:
 // gold's own daily history is fetched once and reused for every comparison, and
 // each instrument is weighted by its measured correlation via macroContribution.
-async function computeCorrelation(tdKey, fredKey) {
+async function computeCorrelation(tdKey, fredKey, deadlineAt) {
+  const outOfTime = () => deadlineAt != null && Date.now() >= deadlineAt;
   const contributions = [];
   // Which instruments actually contributed, and which failed. Without this a
   // dead or renamed FRED series just silently drops out of the average and the
@@ -128,6 +146,7 @@ async function computeCorrelation(tdKey, fredKey) {
 
   if (fredKey) {
     for (const inst of FRED_INSTRUMENTS) {
+      if (outOfTime()) { failures.push(inst.key + ': skipped, out of time'); continue; }
       try {
         const obs = await fredSeries(inst.seriesId, fredKey, 60);
         // Yields use absolute (basis-point) changes; prices use returns.
@@ -140,7 +159,9 @@ async function computeCorrelation(tdKey, fredKey) {
     }
   }
   if (xauRets) {
-    for (const inst of CORRELATION_INSTRUMENTS) {
+    for (let i = 0; i < CORRELATION_INSTRUMENTS.length; i++) {
+      const inst = CORRELATION_INSTRUMENTS[i];
+      if (outOfTime()) { failures.push(inst.key + ': skipped, out of time'); continue; }
       try {
         const candles = await twelveSeries(tdKey, '1day', 60, inst.symbol);
         const corr = pearsonCorrelation(xauRets, seriesDeltas(candles, inst.kind));
@@ -149,7 +170,9 @@ async function computeCorrelation(tdKey, fredKey) {
       } catch (e) {
         failures.push(inst.key + ': ' + ((e && e.message) || 'failed'));
       }
-      await sleep(1200); // stay under Twelve Data's free-tier 8 requests/minute cap
+      // Throttle between calls only — sleeping after the final one burned 1.2s
+      // of a budget that had nothing left to spend it on.
+      if (i < CORRELATION_INSTRUMENTS.length - 1) await sleep(1200);
     }
   }
   return { score: aggregateMacroScore(contributions), available: contributions.length > 0, contributors, failures };
@@ -157,10 +180,11 @@ async function computeCorrelation(tdKey, fredKey) {
 
 // Macro fundamentals from FRED. These are low-frequency prints with no usable
 // short-window correlation, so the assumed polarity carries the weight.
-async function computeFundamentals(fredKey) {
+async function computeFundamentals(fredKey, deadlineAt) {
   if (!fredKey) return { score: 0, available: false };
   const contributions = [];
   for (const inst of FUNDAMENTAL_INSTRUMENTS) {
+    if (deadlineAt != null && Date.now() >= deadlineAt) break;
     try {
       const obs = await fredSeries(inst.seriesId, fredKey, 24);
       if (obs.length < 2) continue;
@@ -254,10 +278,38 @@ export async function runTick({ db, tdKey, fredKey, avKey }) {
     const wkR = await cached(state, 'weekly', REFRESH_MS.weekly, async () => { await sleep(1200); return twelveSeries(tdKey, '1week', 104); });
 
     // ---- macro inputs (all optional, all failure-tolerant) ---------------
+    // Each of these may be served straight from cache (cheap) or trigger a full
+    // refetch (expensive). Only start one if there is room to finish it, and
+    // fall back to the last cached value rather than skipping the tick.
     let corr = { score: 0, available: false }, fund = { score: 0, available: false }, news = { score: 0, available: false };
-    try { corr = (await cached(state, 'correlation', REFRESH_MS.correlation, () => computeCorrelation(tdKey, fredKey), CORRELATION_SIG)).value; } catch (e) { /* optional */ }
-    try { fund = (await cached(state, 'fundamental', REFRESH_MS.fundamental, () => computeFundamentals(fredKey), FUNDAMENTAL_SIG)).value; } catch (e) { /* optional */ }
-    try { news = (await cached(state, 'news', REFRESH_MS.news, () => computeNews(avKey))).value; } catch (e) { /* optional */ }
+    const cachedOr = (key, fallback) => (state.cache && state.cache[key] != null) ? state.cache[key] : fallback;
+    const macroSkipped = [];
+
+    for (const job of [
+      { key: 'correlation', maxAge: REFRESH_MS.correlation, sig: CORRELATION_SIG,
+        run: (deadline) => computeCorrelation(tdKey, fredKey, deadline),
+        set: v => { corr = v; } },
+      { key: 'fundamental', maxAge: REFRESH_MS.fundamental, sig: FUNDAMENTAL_SIG,
+        run: (deadline) => computeFundamentals(fredKey, deadline),
+        set: v => { fund = v; } },
+      { key: 'news', maxAge: REFRESH_MS.news, sig: null,
+        run: () => computeNews(avKey),
+        set: v => { news = v; } }
+    ]) {
+      const b = budget(started);
+      if (b.left < MACRO_MIN_MS) {
+        job.set(cachedOr(job.key, { score: 0, available: false }));
+        macroSkipped.push(job.key);
+        continue;
+      }
+      try {
+        const deadline = Date.now() + b.left - 4000; // leave room to persist and respond
+        job.set((await cached(state, job.key, job.maxAge, () => job.run(deadline), job.sig)).value);
+      } catch (e) {
+        job.set(cachedOr(job.key, { score: 0, available: false }));
+        macroSkipped.push(job.key + ' (failed)');
+      }
+    }
 
     // ---- 1. grade what the market already decided ------------------------
     let resolvedThisTick = 0;
@@ -382,6 +434,7 @@ export async function runTick({ db, tdKey, fredKey, avKey }) {
         fundamentalAvailable: !!fund.available, fundamentalScore: fund.score || 0,
         newsAvailable: !!news.available, newsScore: news.score || 0
       },
+      macroSkipped,
       openSignals: state.signalLog.filter(s => s.status === 'pending' || s.status === 'open').length,
       totalLogged: state.learningState.totalLogged || 0,
       durationMs: Date.now() - started

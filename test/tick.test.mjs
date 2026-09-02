@@ -121,6 +121,27 @@ await runTick({ db, tdKey:'TD', fredKey:'FRED', avKey:'AV' });
 ok('a changed instrument set refetches immediately', fredCalls > fredBefore2, `made ${fredCalls-fredBefore2} FRED calls, want >0`);
 ok('signature is restored after the refetch', db._docs.worker.cacheSig.correlation, sigBefore.correlation);
 
+// --- the tick must still publish when macro work is slow ---
+// Regression: a forced double cache-bust made ~15 sequential calls on a cold
+// start, blew the 60s function limit, and returned 504 without ever writing —
+// so Firestore silently kept serving the previous tick.
+const realFetch = globalThis.fetch;
+globalThis.fetch = async (url) => {
+  const u = new URL(String(url));
+  if (u.hostname === 'api.stlouisfed.org' || u.hostname === 'www.alphavantage.co') {
+    await new Promise(r => setTimeout(r, 60)); // slow macro
+  }
+  return realFetch(url);
+};
+db._docs.worker.cacheMeta = {};   // force every macro input to refetch at once
+db._docs.worker.cacheSig = {};
+const slowTick = await runTick({ db, tdKey:'TD', fredKey:'FRED', avKey:'AV' });
+globalThis.fetch = realFetch;
+ok('still publishes a tick under slow macro', !!slowTick && isFinite(slowTick.price), true);
+ok('still reports a direction', ['BUY','SELL','HOLD'].includes(slowTick.direction), true);
+ok('latestTick was actually written', typeof db._docs.latestTick.time, 'number');
+ok('reports which macro work was skipped', Array.isArray(slowTick.macroSkipped), true);
+
 console.log(`\nnetwork: twelvedata=${tdCalls} fred=${fredCalls} alphavantage=${avCalls}`);
 console.log(`${pass} passed, ${fail} failed`);
 process.exit(fail?1:0);
