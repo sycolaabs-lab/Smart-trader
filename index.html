@@ -362,6 +362,43 @@ canvas { width:100%; background:#12151c; border-radius:12px; border:1px solid #1
     <div style="font-size:11px;color:#5c6270;line-height:1.5;">All three macro engines are connected now (above): cross-market correlation, fundamental economic data, and news sentiment. Each has its own honest caveats about interpretation — check each panel's description for what it actually measures versus what it's a simplified lean on.</div>
   </div>
 
+  <div class="panel" id="paperPanel" style="border-color:#20332a;">
+    <div class="panel-title">
+      Paper Trading
+      <span class="collapse-toggle" id="paperAdvancedToggle">settings</span>
+    </div>
+    <label style="display:flex;align-items:center;gap:9px;font-size:12px;color:#c9cedb;cursor:pointer;">
+      <input type="checkbox" id="paperEnabled" style="accent-color:#3ecf8e;transform:scale(1.25);">
+      <span>Place simulated trades from the engine's own signals</span>
+    </label>
+    <div class="conn-note" style="margin-top:7px;">
+      <strong style="color:#3ecf8e;">Simulated only — no broker, no money, no orders leave this page.</strong>
+      When on, every signal the engine logs opens a position on a demo account sized off your risk
+      percentage. It runs to the signal's own take-profit or stop, and the result becomes both P&amp;L
+      and training data. This is what turns "62% of signals won" into "up 4.3% with an 11% drawdown" —
+      the number that says whether the analysis is actually worth anything.
+    </div>
+    <div class="data-source-note" id="paperStatus" style="margin-top:7px;margin-bottom:0;">Off — no positions will be opened.</div>
+
+    <div id="paperAdvanced" class="hidden" style="margin-top:10px;">
+      <div class="params">
+        <div class="field"><label>Starting balance ($)</label><input type="number" id="pStartBalance" value="10000" step="500" min="100"></div>
+        <div class="field"><label>Risk per trade (%)</label><input type="number" id="pRiskPct" value="1" step="0.1" min="0.1" max="10"></div>
+        <div class="field"><label>Spread (pips)</label><input type="number" id="pSpread" value="3" step="0.5" min="0"></div>
+        <div class="field"><label>Stop slippage (pips)</label><input type="number" id="pSlippage" value="1" step="0.5" min="0"></div>
+        <div class="field"><label>Max open positions</label><input type="number" id="pMaxPos" value="3" step="1" min="1" max="10"></div>
+      </div>
+      <div class="conn-note" style="margin-top:6px;">
+        Fills are deliberately pessimistic: entries pay the spread and stops take slippage, so a
+        nominal 1:4 winner returns slightly under 4R. A simulator that assumes perfect execution
+        produces training data that teaches the wrong lesson.
+        <span class="collapse-toggle" id="paperReset" style="margin-left:6px;">reset account</span>
+      </div>
+    </div>
+
+    <div id="paperContent" style="margin-top:10px;"></div>
+  </div>
+
   <div class="panel">
     <div class="panel-title">Analysis Quality <span class="collapse-toggle" id="resetQuality">reset declined log</span></div>
     <div style="font-size:11px;color:#5c6270;margin-bottom:8px;line-height:1.5;">

@@ -152,5 +152,59 @@ ok('summary flags protected analysis budget', /analysis path is still fully fund
 ok('summary warns when spent', /Daily budget spent/.test(quotaSummary({day:'d',used:800}, CAP, RES).note), true);
 ok('summary calm when low', /Within budget/.test(quotaSummary({day:'d',used:50}, CAP, RES).note), true);
 
+
+// ---------------- paper trading ----------------
+import { PAPER_DEFAULTS, worsePrice, paperPositionSize, openPaperPosition,
+         closePaperPosition, unrealisedPnl, paperAccountSummary } from '../lib/engine.js';
+console.log('\n-- paper trading --');
+const PCFG = { startingBalance:10000, riskPercent:1, spreadPips:3, slippagePips:1, maxConcurrent:3 };
+const near = (a,b,eps)=>Math.abs(a-b)<(eps||1e-6);
+
+// fills always move against the trader
+ok('buy entry pays the spread', worsePrice(2000,'BUY','entry',3,0.1), 2000.3);
+ok('sell entry pays the spread', worsePrice(2000,'SELL','entry',3,0.1), 1999.7);
+ok('buy stop exit slips down', worsePrice(1990,'BUY','exit',1,0.1), 1989.9);
+ok('sell stop exit slips up', worsePrice(2010,'SELL','exit',1,0.1), 2010.1);
+
+// sizing makes the stop cost exactly the configured risk
+const sz = paperPositionSize(10000, 1, 2000, 1990);
+ok('risk amount is 1% of balance', sz.riskAmount, 100);
+ok('units sized off stop distance', near(sz.units, 10), true);
+ok('zero-width stop refuses to size', paperPositionSize(10000,1,2000,2000), null);
+
+const sigBuy = { id:'s1', dir:'BUY', entry:2000, sl:1990, tp:2040, time:'2026-01-01T00:00:00Z' };
+const acct = { balance:10000, positions:[] };
+const pos = openPaperPosition(sigBuy, acct, PCFG);
+ok('entry filled worse than requested', pos.entryFill > pos.requestedEntry, true);
+ok('stop loss costs exactly the risk', near(closePaperPosition(pos,'lost',null,PCFG).pnl, -(100 + 0.1*pos.units)), true);
+ok('a loss is negative', closePaperPosition(pos,'lost',null,PCFG).pnl < 0, true);
+ok('a win is positive', closePaperPosition(pos,'won',null,PCFG).pnl > 0, true);
+// spread + slippage means realised R comes in under the nominal 4:1
+const wonR = closePaperPosition(pos,'won',null,PCFG).rMultiple;
+ok('winning R is below nominal 4 after costs', wonR < 4 && wonR > 3, true);
+ok('losing R is about -1 including slippage', closePaperPosition(pos,'lost',null,PCFG).rMultiple < -1, true);
+ok('expired closes at the mark, not a stop', closePaperPosition(pos,'expired',2000.3,PCFG).outcome, 'expired');
+ok('closing twice is a no-op', closePaperPosition(closePaperPosition(pos,'won',null,PCFG),'lost',null,PCFG).outcome, 'won');
+
+// concurrency + solvency guards
+ok('respects max concurrent', openPaperPosition(sigBuy,{balance:10000,positions:[{status:'open'},{status:'open'},{status:'open'}]},PCFG), null);
+ok('refuses on a blown account', openPaperPosition(sigBuy,{balance:0,positions:[]},PCFG), null);
+ok('refuses a HOLD', openPaperPosition({id:'x',dir:'HOLD',entry:1,sl:2,tp:3},acct,PCFG), null);
+
+// floating P&L
+ok('unrealised moves with price', unrealisedPnl(pos, pos.entryFill + 1) > 0, true);
+ok('unrealised is zero once closed', unrealisedPnl(closePaperPosition(pos,'won',null,PCFG), 3000), 0);
+
+// account summary
+const w = closePaperPosition(pos,'won',null,PCFG), l = closePaperPosition(pos,'lost',null,PCFG);
+const sum = paperAccountSummary([{...w,closedAt:'2026-01-01'},{...l,closedAt:'2026-01-02'}], 10000, 2000);
+ok('counts wins and losses', [sum.wins,sum.losses].join(','), '1,1');
+ok('win rate computed', sum.winRate, 0.5);
+ok('balance reflects realised pnl', near(sum.balance, 10000 + w.pnl + l.pnl), true);
+ok('profit factor > 1 at 1:4', sum.profitFactor > 1, true);
+ok('drawdown recorded after the loss', sum.maxDrawdown > 0, true);
+ok('empty account is flat', paperAccountSummary([], 10000, 2000).equity, 10000);
+ok('equity includes floating pnl', paperAccountSummary([pos], 10000, pos.entryFill + 1).equity > 10000, true);
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail?1:0);
