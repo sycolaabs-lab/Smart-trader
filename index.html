@@ -238,7 +238,8 @@ canvas { width:100%; background:#12151c; border-radius:12px; border:1px solid #1
           <select id="aMinGrade" style="width:100%;background:#0d0f14;border:1px solid #262a35;color:#e8c37a;padding:7px 8px;border-radius:6px;font-size:12px;">
             <option value="A">A and above — very selective</option>
             <option value="B" selected>B and above — balanced</option>
-            <option value="C">C and above — data collection</option>
+            <option value="C">C and above — needs ~4 timeframes aligned</option>
+            <option value="D">D and above — take almost anything (data collection)</option>
           </select>
         </div>
       </div>
@@ -250,10 +251,18 @@ canvas { width:100%; background:#12151c; border-radius:12px; border:1px solid #1
         nothing — at 45% a setup grades C and is rejected on grade regardless. The minimum grade is the
         knob that actually decides how much it trades.
         <br><br>
-        At the B floor, a ranging market needs 70%+ confidence to qualify at all, and a ranging market with
-        disagreeing history cannot qualify at any confidence. That is correct for trading real money and
-        far too tight for gathering data — drop to <strong>C</strong> to collect. Cooldown stops it firing
-        repeatedly off one piece of structure.
+        <br><br>
+        <strong style="color:#e8c37a;">Confidence runs structurally low.</strong> It divides by the weight of
+        all 14 factors, including ones that are simply silent — an order block only speaks when price is inside
+        one. So even a <em>perfect</em> alignment of all five timeframes reaches only ~49%, and three timeframes
+        agreeing lands around 24%. Grade A (≥70%) needs almost the entire framework to agree at once and is
+        genuinely rare.
+        <br><br>
+        That makes the bands far tighter in practice than they look: <strong>B needs roughly five timeframes
+        plus a confirming zone</strong>, C needs about four aligned, and ordinary market conditions sit in D.
+        To actually gather data, use the <strong>D</strong> floor — you are deliberately collecting
+        low-conviction setups so the engine has outcomes to learn from. Cooldown stops it firing repeatedly
+        off one piece of structure.
       </div>
     </div>
 

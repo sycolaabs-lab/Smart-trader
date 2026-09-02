@@ -180,6 +180,34 @@ The gate then requires both a confidence floor *and* a grade floor. So setting
 min confidence to 45 while demanding grade B does nothing: 45 grades as C and
 is rejected on grade regardless.
 
+### Confidence runs structurally low
+
+Confidence is `|sum(factor x weight)| / sum(ALL weights)`. The denominator
+includes every factor, **including ones that are silent** — an order block only
+speaks when price is sitting inside one, a liquidity factor only when a sweep
+just happened. A setup where ten of fourteen factors have no opinion is
+therefore scored as low conviction even when everything that *is* speaking
+agrees.
+
+Ceilings, assuming every listed factor reads a perfect ±1 and all agree:
+
+| Scenario | Max confidence | Grade |
+|---|---|---|
+| All 14 factors aligned (theoretical) | 100% | A |
+| 5 timeframes + price action + order block | 65% | B |
+| **All 5 timeframes agree, nothing else** | **49%** | C |
+| 4 timeframes agree | 35% | C |
+| 3 timeframes agree | 24% | D |
+
+Grade A (≥70) needs nearly the whole framework to agree at once and is genuinely
+rare. Ordinary market conditions sit in **D**.
+
+This is a defensible design — a setup with little confluence *is* less certain —
+but it means the grade bands are far tighter than they appear, and it is the
+main reason an unattended engine can run for hours taking nothing.
+
+### The grade floor in practice
+
 At the default **B** floor:
 
 | Confidence | Trending, history agrees | Ranging *or* history disagrees | Ranging *and* history disagrees |
@@ -192,10 +220,12 @@ A ranging market with disagreeing history cannot qualify at *any* confidence.
 That is right for trading real money and far too tight for gathering data — a
 cautious setup collects nothing, and the knowledge base never starts.
 
-**Minimum grade is the knob that actually decides how much it trades.** Drop it
-to **C** while building a record, or press *Use data-collection settings* in the
-thresholds panel (grade C, confidence 30, cooldown 30 min, 5 open, meta floor
--0.5).
+**Minimum grade is the knob that actually decides how much it trades.** Given
+the ceilings above, a C floor still rejects ordinary conditions — use **D** to
+genuinely collect, accepting that you are gathering low-conviction setups on
+purpose so there are outcomes to learn from. *Use data-collection settings* in
+the thresholds panel does this (grade D, confidence 15, cooldown 30 min, 5 open,
+meta floor -0.5).
 
 The panel tallies **why** each cycle ended, which matters because two causes
 need opposite responses:

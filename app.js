@@ -2048,8 +2048,10 @@ providerSelect.addEventListener('change', renderQuota);
 // simply never qualifies — so a cautious setup collects nothing and the
 // knowledge base never starts.
 document.getElementById('aPresetCollect').addEventListener('click', () => {
-  document.getElementById('aMinGrade').value = 'C';
-  document.getElementById('aMinConf').value = 30;
+  // D, not C: even a perfect five-timeframe alignment only scores ~49%, so a C
+  // floor (>=30%) still rejects ordinary conditions and collects almost nothing.
+  document.getElementById('aMinGrade').value = 'D';
+  document.getElementById('aMinConf').value = 15;
   document.getElementById('aCooldown').value = 30;
   document.getElementById('aMaxOpen').value = 5;
   document.getElementById('aMinMeta').value = -0.5;
