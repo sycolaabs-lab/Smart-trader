@@ -169,6 +169,47 @@ rather keep the secret out of the URL.
 
 ---
 
+## Why it may take no signals — the gate
+
+Grade and confidence are **not independent controls**, which is the single most
+confusing thing about the autonomous gate.
+
+Grade is derived from confidence — A ≥70, B ≥50, C ≥30 — and then downgraded a
+further step for a ranging market, and again if similar past setups disagree.
+The gate then requires both a confidence floor *and* a grade floor. So setting
+min confidence to 45 while demanding grade B does nothing: 45 grades as C and
+is rejected on grade regardless.
+
+At the default **B** floor:
+
+| Confidence | Trending, history agrees | Ranging *or* history disagrees | Ranging *and* history disagrees |
+|---|---|---|---|
+| 45% | rejected (C) | rejected | rejected |
+| 50–69% | **taken** (B) | rejected (C) | rejected (D) |
+| 70%+ | **taken** (A) | **taken** (B) | rejected (C) |
+
+A ranging market with disagreeing history cannot qualify at *any* confidence.
+That is right for trading real money and far too tight for gathering data — a
+cautious setup collects nothing, and the knowledge base never starts.
+
+**Minimum grade is the knob that actually decides how much it trades.** Drop it
+to **C** while building a record, or press *Use data-collection settings* in the
+thresholds panel (grade C, confidence 30, cooldown 30 min, 5 open, meta floor
+-0.5).
+
+The panel tallies **why** each cycle ended, which matters because two causes
+need opposite responses:
+
+- *"No directional edge — engine flat"* — no setup existed. Loosening
+  thresholds will not help; the market simply wasn't offering anything.
+- *"Grade below floor"* — the filter is the blocker. Lower the grade floor.
+
+Server-side, `/api/tick` takes the same thresholds from `TICK_GRADE_FLOOR` and
+`TICK_MIN_CONFIDENCE` environment variables, and reports `gateCode` and
+`gateReason` in every tick so the same diagnosis works without a browser.
+
+---
+
 ## Paper trading — a simulated account
 
 **Simulated only. No broker, no money, no orders leave the page.** Off by

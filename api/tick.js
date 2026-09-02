@@ -280,7 +280,18 @@ export async function runTick({ db, tdKey, fredKey, avKey }) {
     const plan = buildTradePlan(result, 4);
 
     // ---- 4. commit a signal if the gate clears ---------------------------
-    const gate = autonomyGate(result, plan, state.signalLog, state.lastSignalAt, AUTONOMY_DEFAULTS);
+    // Thresholds are overridable per deployment. The defaults are tuned for
+    // trading, not for gathering data: grade is derived from confidence and then
+    // downgraded again for a ranging market and for disagreeing history, so at
+    // the default B floor a ranging market needs 70%+ to qualify at all. Set
+    // TICK_GRADE_FLOOR=C while building up a record.
+    const gateCfg = Object.assign({}, AUTONOMY_DEFAULTS, {
+      gradeFloor: process.env.TICK_GRADE_FLOOR || AUTONOMY_DEFAULTS.gradeFloor,
+      minConfidence: isFinite(parseFloat(process.env.TICK_MIN_CONFIDENCE))
+        ? parseFloat(process.env.TICK_MIN_CONFIDENCE)
+        : AUTONOMY_DEFAULTS.minConfidence
+    });
+    const gate = autonomyGate(result, plan, state.signalLog, state.lastSignalAt, gateCfg);
     let tookSignal = false;
     if (gate.take) {
       state.signalLog.unshift({
@@ -328,6 +339,9 @@ export async function runTick({ db, tdKey, fredKey, avKey }) {
       resolvedThisTick,
       tookSignal,
       gateReason: gate.reason,
+      gateCode: gate.code || null,
+      gradeFloor: gateCfg.gradeFloor,
+      minConfidence: gateCfg.minConfidence,
       session: result.sessionInfo ? result.sessionInfo.session : null,
       regime: result.regimeInfo ? result.regimeInfo.regime : null,
       macro: {

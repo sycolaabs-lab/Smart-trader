@@ -40,6 +40,8 @@ export default function handler(req, res) {
     TWELVEDATA_API_KEY: present('TWELVEDATA_API_KEY'),
     FRED_API_KEY: present('FRED_API_KEY'),
     ALPHAVANTAGE_API_KEY: present('ALPHAVANTAGE_API_KEY'),
+    TICK_GRADE_FLOOR: process.env.TICK_GRADE_FLOOR || 'B (default)',
+    TICK_MIN_CONFIDENCE: process.env.TICK_MIN_CONFIDENCE || '45 (default)',
     FIREBASE_SERVICE_ACCOUNT: serviceAccount
   };
 

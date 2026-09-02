@@ -221,6 +221,8 @@ canvas { width:100%; background:#12151c; border-radius:12px; border:1px solid #1
       <div class="card"><div class="label">Open</div><div class="value mono" id="aOpen">0</div></div>
     </div>
 
+    <div id="gateTally"></div>
+
     <div class="data-source-note" id="quotaReadout" style="margin-top:9px;margin-bottom:0;">API budget: not connected yet.</div>
 
     <div id="autonomyAdvanced" class="hidden" style="margin-top:10px;">
@@ -232,11 +234,26 @@ canvas { width:100%; background:#12151c; border-radius:12px; border:1px solid #1
         <div class="field"><label>Re-backtest every (h)</label><input type="number" id="aBtHours" value="4" min="1" step="1"></div>
         <div class="field"><label>Meta-score floor</label><input type="number" id="aMinMeta" value="-0.25" step="0.05"></div>
         <div class="field"><label>Daily API credit cap</label><input type="number" id="aDailyCap" value="500" min="50" step="50"></div>
+        <div class="field"><label>Minimum grade</label>
+          <select id="aMinGrade" style="width:100%;background:#0d0f14;border:1px solid #262a35;color:#e8c37a;padding:7px 8px;border-radius:6px;font-size:12px;">
+            <option value="A">A and above — very selective</option>
+            <option value="B" selected>B and above — balanced</option>
+            <option value="C">C and above — data collection</option>
+          </select>
+        </div>
       </div>
+      <button class="btn secondary" id="aPresetCollect" style="width:100%;margin-top:8px;">Use data-collection settings</button>
       <div class="conn-note" style="margin-top:6px;">
-        Raising min confidence or the meta-score floor makes the engine pickier and trade less;
-        lowering them produces more signals and therefore more training data, at lower average
-        quality. Cooldown stops it firing repeatedly off one piece of structure.
+        <strong style="color:#e8c37a;">Grade and confidence are not independent.</strong> Grade is derived
+        from confidence (A ≥70, B ≥50, C ≥30) and then downgraded a further step for a ranging market and
+        again if similar past setups disagree. So a confidence floor below the grade's own threshold does
+        nothing — at 45% a setup grades C and is rejected on grade regardless. The minimum grade is the
+        knob that actually decides how much it trades.
+        <br><br>
+        At the B floor, a ranging market needs 70%+ confidence to qualify at all, and a ranging market with
+        disagreeing history cannot qualify at any confidence. That is correct for trading real money and
+        far too tight for gathering data — drop to <strong>C</strong> to collect. Cooldown stops it firing
+        repeatedly off one piece of structure.
       </div>
     </div>
 

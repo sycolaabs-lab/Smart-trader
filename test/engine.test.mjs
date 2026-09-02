@@ -206,5 +206,22 @@ ok('drawdown recorded after the loss', sum.maxDrawdown > 0, true);
 ok('empty account is flat', paperAccountSummary([], 10000, 2000).equity, 10000);
 ok('equity includes floating pnl', paperAccountSummary([pos], 10000, pos.entryFill + 1).equity > 10000, true);
 
+
+// ---------------- grade floor ----------------
+import { gradesAtOrAbove } from '../lib/engine.js';
+console.log('\n-- grade floor --');
+ok('B floor allows A+/A/B', gradesAtOrAbove('B').join(','), 'A+,A,B');
+ok('C floor also allows C', gradesAtOrAbove('C').join(','), 'A+,A,B,C');
+ok('A floor is strict', gradesAtOrAbove('A').join(','), 'A+,A');
+ok('unknown floor falls back to B-equivalent', gradesAtOrAbove('Z').join(','), 'A+,A,B');
+
+const R2=(d,c,g)=>({direction:d,confidence:c,fusion:{grade:g}});
+const P2={entry:2000,sl:1990,tp:2040,rr:4,metaScore:0};
+ok('C setup rejected at default B floor', autonomyGate(R2('BUY',60,'C'),P2,[],null).take, false);
+ok('C setup accepted at C floor', autonomyGate(R2('BUY',60,'C'),P2,[],null,{gradeFloor:'C'}).take, true);
+ok('D still rejected at C floor', autonomyGate(R2('BUY',60,'D'),P2,[],null,{gradeFloor:'C'}).take, false);
+ok('confidence floor still applies at C', autonomyGate(R2('BUY',20,'C'),P2,[],null,{gradeFloor:'C',minConfidence:30}).take, false);
+ok('decline reason names the floor', /below the C floor/.test(autonomyGate(R2('BUY',60,'D'),P2,[],null,{gradeFloor:'C'}).reason), true);
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail?1:0);

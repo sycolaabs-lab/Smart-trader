@@ -7,23 +7,18 @@
 // server-side worker so unattended analysis can't drift from what's on screen.
 // ============================================================
 import {
-  genData, calcEMA, calcRSI, calcATR, fmt, parseUtcDatetime, aggregateCandles,
-  detectSwings, analyzeStructure, detectOrderBlocks, detectFVGs, detectLiquidity,
-  detectRoundNumbers, detectSweep, premiumDiscount, getSessionInfo, computeSessionStats,
-  detectMarketRegime, buildFeatureVector, historicalSimilarity, buildTheses,
-  decisionFusion, downgradeGrade, detectSystemAlert, FRED_INSTRUMENTS,
-  CORRELATION_INSTRUMENTS, FUNDAMENTAL_INSTRUMENTS, pearsonCorrelation, toDailyReturns,
-  biasScore, detectPriceAction, sliceByTime, computeComposite, PIP_SIZE, hadSweepNear,
-  displacementQuality, freshnessScore, htfAlignmentScore, liquidityContextScore,
-  sessionRegimeQuality, momentumDivergenceScore, buildQualityFeatures,
-  QUALITY_FEATURE_NAMES, classifyZone, trainAdaBoostStumps, scoreAdaBoost,
-  buildTradePlan, reasoningText, FACTOR_LABELS, patternSignature,
-  computeTunedWeights, runSmcBacktest, setMetaModel,
-  AUTONOMY_DEFAULTS, resolveSignal, autonomyGate,
-  macroContribution, aggregateMacroScore, pctChangeOf,
-  computeCalibration, computeConditionBreakdown, computeGateAudit,
-  utcDayKey, rollQuota, canSpend, spendQuota, quotaSummary, criticalReserveFor,
-  PAPER_DEFAULTS, openPaperPosition, closePaperPosition, unrealisedPnl, paperAccountSummary
+  genData, calcEMA, fmt, parseUtcDatetime, premiumDiscount, downgradeGrade,
+  detectSystemAlert, FRED_INSTRUMENTS, CORRELATION_INSTRUMENTS,
+  FUNDAMENTAL_INSTRUMENTS, pearsonCorrelation, toDailyReturns,
+  computeComposite, PIP_SIZE, QUALITY_FEATURE_NAMES, classifyZone,
+  trainAdaBoostStumps, buildTradePlan, reasoningText, FACTOR_LABELS,
+  patternSignature, computeTunedWeights, runSmcBacktest, setMetaModel,
+  AUTONOMY_DEFAULTS, resolveSignal, autonomyGate, macroContribution,
+  aggregateMacroScore, pctChangeOf, computeCalibration,
+  computeConditionBreakdown, computeGateAudit, utcDayKey, rollQuota,
+  canSpend, spendQuota, quotaSummary, criticalReserveFor, PAPER_DEFAULTS,
+  openPaperPosition, closePaperPosition, unrealisedPnl, paperAccountSummary,
+  GATE_LABELS
 } from './lib/engine.js';
 
 const LEARNING_KEY = 'smc-factor-stats-v1';
@@ -505,7 +500,8 @@ let autonomy = {
   lastReason: null,
   consecutiveErrors: 0,
   skipCycles: 0,
-  lastError: null
+  lastError: null,
+  gateTally: {}
 };
 
 let lastComposite = null;
@@ -1752,7 +1748,8 @@ function autonomyConfig() {
     maxOpenSignals: num('aMaxOpen', AUTONOMY_DEFAULTS.maxOpenSignals),
     analysisIntervalMinutes: num('aInterval', AUTONOMY_DEFAULTS.analysisIntervalMinutes),
     backtestIntervalHours: num('aBtHours', AUTONOMY_DEFAULTS.backtestIntervalHours),
-    minMetaScore: num('aMinMeta', AUTONOMY_DEFAULTS.minMetaScore)
+    minMetaScore: num('aMinMeta', AUTONOMY_DEFAULTS.minMetaScore),
+    gradeFloor: (document.getElementById('aMinGrade') || {}).value || AUTONOMY_DEFAULTS.gradeFloor
   });
 }
 
@@ -1761,6 +1758,7 @@ function saveAutonomyState() {
     localStorage.setItem(AUTONOMY_KEY, JSON.stringify({
       enabled: autonomy.enabled,
       cycles: autonomy.cycles,
+      gateTally: autonomy.gateTally,
       signalsTaken: autonomy.signalsTaken,
       autoResolved: autonomy.autoResolved,
       lastAnalysisAt: autonomy.lastAnalysisAt,
@@ -1773,7 +1771,8 @@ function saveAutonomyState() {
         aInterval: document.getElementById('aInterval').value,
         aBtHours: document.getElementById('aBtHours').value,
         aMinMeta: document.getElementById('aMinMeta').value,
-        aDailyCap: document.getElementById('aDailyCap').value
+        aDailyCap: document.getElementById('aDailyCap').value,
+        aMinGrade: document.getElementById('aMinGrade').value
       }
     }));
   } catch (e) { /* storage unavailable — autonomy still works, it just won't remember across reloads */ }
@@ -1787,6 +1786,7 @@ function loadAutonomyState() {
     Object.assign(autonomy, {
       enabled: !!saved.enabled,
       cycles: saved.cycles || 0,
+      gateTally: saved.gateTally || {},
       signalsTaken: saved.signalsTaken || 0,
       autoResolved: saved.autoResolved || 0,
       lastAnalysisAt: saved.lastAnalysisAt || null,
@@ -1823,6 +1823,17 @@ function renderAutonomyStats() {
   document.getElementById('aSignals').textContent = autonomy.signalsTaken;
   document.getElementById('aResolved').textContent = autonomy.autoResolved;
   document.getElementById('aOpen').textContent = open;
+
+  const el = document.getElementById('gateTally');
+  if (!el) return;
+  const entries = Object.keys(autonomy.gateTally || {})
+    .map(k => ({ code: k, n: autonomy.gateTally[k] }))
+    .sort((a, b) => b.n - a.n);
+  if (!entries.length) { el.innerHTML = ''; return; }
+  el.innerHTML = '<div style="font-size:10px;color:#454a56;margin:8px 0 4px;">Why cycles ended this way</div>'
+    + entries.map(e => '<div class="zone-item" style="padding:3px 0;"><span style="font-size:11px;">'
+        + (GATE_LABELS[e.code] || e.code) + '</span><span class="mono" style="font-size:11px;color:'
+        + (e.code === 'taken' ? '#3ecf8e' : '#5c6270') + ';">' + e.n + '</span></div>').join('');
 }
 
 // Grade every unresolved signal against `candles`. Used both by the heartbeat
@@ -1898,6 +1909,11 @@ async function autonomyCycle() {
   if (lastComposite) {
     const plan = buildTradePlan(lastComposite, getTargetRR());
     const gate = autonomyGate(lastComposite, plan, signalLog, autonomy.lastSignalAt, cfg);
+    // Tally why each cycle ended as it did. One latest-reason line cannot show
+    // whether 13 quiet cycles mean "no setup existed" or "the filter blocked
+    // every one" — and those need opposite responses.
+    const code = gate.code || 'unknown';
+    autonomy.gateTally[code] = (autonomy.gateTally[code] || 0) + 1;
     if (gate.take) {
       updateSignalUI(lastComposite, plan, true); // logIt = true -> addSignalToLog
       autonomy.signalsTaken++;
@@ -2026,10 +2042,26 @@ document.getElementById('autonomyEnabled').addEventListener('change', function (
   if (autonomy.enabled) startAutonomy(); else stopAutonomy();
 });
 providerSelect.addEventListener('change', renderQuota);
+
+// A posture for building up a record rather than protecting capital. The engine
+// learns from resolved trades, and at the default B floor a ranging market
+// simply never qualifies — so a cautious setup collects nothing and the
+// knowledge base never starts.
+document.getElementById('aPresetCollect').addEventListener('click', () => {
+  document.getElementById('aMinGrade').value = 'C';
+  document.getElementById('aMinConf').value = 30;
+  document.getElementById('aCooldown').value = 30;
+  document.getElementById('aMaxOpen').value = 5;
+  document.getElementById('aMinMeta').value = -0.5;
+  saveAutonomyState();
+  autonomy.lastAnalysisAt = null; // re-evaluate immediately under the new thresholds
+  setAutonomyStatus('Data-collection thresholds applied — re-evaluating now.', 'live', '');
+  autonomyHeartbeat();
+});
 document.getElementById('autonomyAdvancedToggle').addEventListener('click', () => {
   document.getElementById('autonomyAdvanced').classList.toggle('hidden');
 });
-['aMinConf', 'aCooldown', 'aMaxOpen', 'aInterval', 'aBtHours', 'aMinMeta', 'aDailyCap'].forEach(id => {
+['aMinConf', 'aCooldown', 'aMaxOpen', 'aInterval', 'aBtHours', 'aMinMeta', 'aDailyCap', 'aMinGrade'].forEach(id => {
   document.getElementById(id).addEventListener('change', () => { saveAutonomyState(); renderQuota(); });
 });
 
