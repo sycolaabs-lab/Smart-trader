@@ -21,7 +21,8 @@ import {
   computeTunedWeights, runSmcBacktest, setMetaModel,
   AUTONOMY_DEFAULTS, resolveSignal, autonomyGate,
   macroContribution, aggregateMacroScore, pctChangeOf,
-  computeCalibration, computeConditionBreakdown, computeGateAudit
+  computeCalibration, computeConditionBreakdown, computeGateAudit,
+  utcDayKey, rollQuota, canSpend, spendQuota, quotaSummary
 } from './lib/engine.js';
 
 const LEARNING_KEY = 'smc-factor-stats-v1';
@@ -495,13 +496,68 @@ const liveDot = document.getElementById('liveDot');
 const btSourceNote = document.getElementById('btSourceNote');
 const providerSelect = document.getElementById('providerSelect');
 
+// ---------- API quota accounting ----------
+// Every Twelve Data call goes through spendCredit() so the day's usage is a real
+// measured number rather than an estimate. The cap is deliberately below the
+// tier limit: the background worker shares this key and must not be starved by
+// a browser tab that was left open.
+const QUOTA_KEY = 'smc-quota-v1';
+const DEFAULT_DAILY_CAP = 500; // of Twelve Data's 800/day; the rest is reserved for /api/tick
+let quotaState = { day: utcDayKey(), used: 0 };
+
+function loadQuota() {
+  try {
+    const raw = localStorage.getItem(QUOTA_KEY);
+    if (raw) quotaState = rollQuota(JSON.parse(raw), Date.now());
+  } catch (e) { /* fresh start */ }
+  quotaState = rollQuota(quotaState, Date.now());
+}
+function saveQuota() {
+  try { localStorage.setItem(QUOTA_KEY, JSON.stringify(quotaState)); } catch (e) { /* storage unavailable */ }
+}
+function dailyCap() {
+  const el = document.getElementById('aDailyCap');
+  const v = el ? parseInt(el.value, 10) : NaN;
+  return isFinite(v) && v > 0 ? v : DEFAULT_DAILY_CAP;
+}
+// Returns false when this call would breach the budget for its priority.
+// During connect, activeProvider is still null while the first calls are already
+// going out — so metering keys off the SELECTED provider. Reading activeProvider
+// here let the whole connect burst through unmetered.
+function meteredProvider() {
+  return activeProvider || (providerSelect && providerSelect.value) || null;
+}
+function spendCredit(priority, cost) {
+  quotaState = rollQuota(quotaState, Date.now());
+  if (meteredProvider() !== 'twelvedata') return true; // only Twelve Data is metered here
+  if (!canSpend(quotaState, dailyCap(), priority, cost || 1)) return false;
+  quotaState = spendQuota(quotaState, cost || 1);
+  saveQuota();
+  renderQuota();
+  return true;
+}
+function renderQuota() {
+  const el = document.getElementById('quotaReadout');
+  if (!el) return;
+  if (meteredProvider() !== 'twelvedata') { el.textContent = 'API budget tracking applies to Twelve Data only.'; return; }
+  const q = quotaSummary(quotaState, dailyCap());
+  const colour = q.pct >= 85 ? '#ef4d5f' : q.pct >= 55 ? '#ffa726' : '#3ecf8e';
+  el.innerHTML = '<span style="color:' + colour + ';">' + q.used + ' / ' + q.cap + ' credits used today (' + q.pct + '%)</span>'
+    + ' <span style="color:#454a56;">· resets 00:00 UTC · ' + q.note + '</span>';
+}
+
+
 // Each provider exposes: timeSeries(key, interval, outputsize) -> candle[], price(key) -> number,
 // plus mtfInterval/htfInterval — the native interval strings for that provider's real 1H/4H data
 // (null if the provider doesn't support that granularity, in which case the app falls back to
 // aggregating from the 15min feed automatically). Adding a new provider means adding one entry here.
 const PROVIDERS = {
   twelvedata: {
-    label: 'Twelve Data', pollSeconds: 60, resyncMinutes: 10, mtfInterval: '1h', htfInterval: '4h', dailyInterval: '1day', weeklyInterval: '1week',
+    // pollSeconds is the dedicated /price cadence. At 60s it cost 1,440 credits/day
+    // on an 800/day tier — more than the entire quota, for a value the candle resync
+    // already provides. 600s keeps a live-ish tick for the header at ~144/day, and it
+    // is low-priority so it stops entirely once the budget tightens.
+    label: 'Twelve Data', pollSeconds: 600, resyncMinutes: 15, mtfInterval: '1h', htfInterval: '4h', dailyInterval: '1day', weeklyInterval: '1week',
     async timeSeries(key, interval, outputsize, symbolOverride) {
       const sym = symbolOverride || SYMBOL;
       // timezone=UTC forces Twelve Data to return unambiguous UTC timestamps. Without it, "datetime" comes back
@@ -597,19 +653,19 @@ document.getElementById('rememberKeysCheckbox').addEventListener('change', () =>
 });
 
 async function fetchHigherTimeframes(provider, key) {
-  if (provider.mtfInterval) {
+  if (provider.mtfInterval && spendCredit('normal')) {
     try { mtfData = await provider.timeSeries(key, provider.mtfInterval, 300); }
     catch (e) { mtfData = []; }
   } else mtfData = [];
-  if (provider.htfInterval) {
+  if (provider.htfInterval && spendCredit('normal')) {
     try { htfData = await provider.timeSeries(key, provider.htfInterval, 200); }
     catch (e) { htfData = []; }
   } else htfData = [];
-  if (provider.dailyInterval) {
+  if (provider.dailyInterval && spendCredit('normal')) {
     try { dailyData = await provider.timeSeries(key, provider.dailyInterval, 200); }
     catch (e) { dailyData = []; }
   } else dailyData = [];
-  if (provider.weeklyInterval) {
+  if (provider.weeklyInterval && spendCredit('normal')) {
     try { weeklyData = await provider.timeSeries(key, provider.weeklyInterval, 104); } // ~2 years of weekly bars
     catch (e) { weeklyData = []; }
   } else weeklyData = [];
@@ -640,7 +696,7 @@ async function refreshCorrelation(providerId, tdKey, fredKey) {
   // fetching it twice was quietly burning one of the eight Twelve Data calls/min this whole engine gets.
   let xauDaily = null;
   if (providerId === 'twelvedata' && tdKey) {
-    try { xauDaily = await PROVIDERS.twelvedata.timeSeries(tdKey, '1day', 60); await sleep(1200); }
+    try { if (!spendCredit('low')) throw new Error('budget'); xauDaily = await PROVIDERS.twelvedata.timeSeries(tdKey, '1day', 60); await sleep(1200); }
     catch (e) { xauDaily = null; }
   }
   const xauRets = xauDaily ? toDailyReturns(xauDaily) : null;
@@ -673,6 +729,7 @@ async function refreshCorrelation(providerId, tdKey, fredKey) {
     } else {
       for (const inst of CORRELATION_INSTRUMENTS) {
         try {
+          if (!spendCredit('low')) throw new Error('Skipped to stay inside the daily API budget.');
           const candles = await PROVIDERS.twelvedata.timeSeries(tdKey, '1day', 60, inst.symbol);
           const rets = toDailyReturns(candles);
           const corr = pearsonCorrelation(xauRets, rets);
@@ -792,6 +849,7 @@ async function connectProvider() {
   connectBtn.disabled = true; connectBtn.textContent = 'Connecting...';
   connStatus.textContent = 'Connecting to ' + provider.label + '...'; connStatus.className = 'conn-status';
   try {
+    spendCredit('critical');
     const candles = await provider.timeSeries(key, LIVE_INTERVAL, 500);
     apiKey = key; activeProvider = providerId;
     liveData = candles;
@@ -818,6 +876,7 @@ async function connectProvider() {
     connStatus.className = 'conn-status err';
   }
   connectBtn.disabled = false; connectBtn.textContent = 'Connect';
+  renderQuota();
   // A fresh connection is exactly when autonomy should get to work. Without this
   // it would sit idle until the next 60s heartbeat noticed the provider was up.
   if (autonomy.enabled && dataMode === 'live') {
@@ -837,18 +896,21 @@ function startLivePolling() {
   if (weeklyResyncHandle) clearInterval(weeklyResyncHandle);
   const provider = PROVIDERS[activeProvider];
   pollPriceHandle = setInterval(pollPrice, provider.pollSeconds * 1000);
-  resyncHandle = setInterval(resyncCandles, provider.resyncMinutes * 60 * 1000);
+  // Autonomy resyncs candles as step 1 of its own cycle. Running this loop as well
+  // would pay for the same 15-minute candles twice.
+  resyncHandle = setInterval(() => { if (!autonomy.enabled) resyncCandles(); }, provider.resyncMinutes * 60 * 1000);
   // Higher timeframes resync on their own natural cadence — no point re-fetching a 4H
   // candle that hasn't closed yet, and it's cheaper on the API quota than constant polling.
-  if (provider.mtfInterval) mtfResyncHandle = setInterval(() => { PROVIDERS[activeProvider].timeSeries(apiKey, provider.mtfInterval, 300).then(d => { mtfData = d; refreshAll(); }).catch(() => {}); }, 60 * 60 * 1000);
-  if (provider.htfInterval) htfResyncHandle = setInterval(() => { PROVIDERS[activeProvider].timeSeries(apiKey, provider.htfInterval, 200).then(d => { htfData = d; refreshAll(); }).catch(() => {}); }, 4 * 60 * 60 * 1000);
+  if (provider.mtfInterval) mtfResyncHandle = setInterval(() => { if (!spendCredit('normal')) return; PROVIDERS[activeProvider].timeSeries(apiKey, provider.mtfInterval, 300).then(d => { mtfData = d; refreshAll(); }).catch(() => {}); }, 60 * 60 * 1000);
+  if (provider.htfInterval) htfResyncHandle = setInterval(() => { if (!spendCredit('normal')) return; PROVIDERS[activeProvider].timeSeries(apiKey, provider.htfInterval, 200).then(d => { htfData = d; refreshAll(); }).catch(() => {}); }, 4 * 60 * 60 * 1000);
   // Daily/weekly candles barely move intraday — resyncing a few times a day (daily) or once a day
   // (weekly) is plenty and keeps this well clear of any provider's rate limit.
-  if (provider.dailyInterval) dailyResyncHandle = setInterval(() => { PROVIDERS[activeProvider].timeSeries(apiKey, provider.dailyInterval, 200).then(d => { dailyData = d; refreshAll(); }).catch(() => {}); }, 12 * 60 * 60 * 1000);
-  if (provider.weeklyInterval) weeklyResyncHandle = setInterval(() => { PROVIDERS[activeProvider].timeSeries(apiKey, provider.weeklyInterval, 104).then(d => { weeklyData = d; refreshAll(); }).catch(() => {}); }, 24 * 60 * 60 * 1000);
+  if (provider.dailyInterval) dailyResyncHandle = setInterval(() => { if (!spendCredit('normal')) return; PROVIDERS[activeProvider].timeSeries(apiKey, provider.dailyInterval, 200).then(d => { dailyData = d; refreshAll(); }).catch(() => {}); }, 12 * 60 * 60 * 1000);
+  if (provider.weeklyInterval) weeklyResyncHandle = setInterval(() => { if (!spendCredit('normal')) return; PROVIDERS[activeProvider].timeSeries(apiKey, provider.weeklyInterval, 104).then(d => { weeklyData = d; refreshAll(); }).catch(() => {}); }, 24 * 60 * 60 * 1000);
   // Correlation uses daily bars — no point checking more than a few times a day.
   if (corrResyncHandle) clearInterval(corrResyncHandle);
   corrResyncHandle = setInterval(() => {
+    if (!canSpend(quotaState, dailyCap(), 'low', 3)) return; // 3 Twelve Data credits per refresh
     const fk = document.getElementById('fredKeyInput').value.trim();
     refreshCorrelation(activeProvider, apiKey, fk).then(() => refreshFundamentals(fk)).then(refreshAll);
   }, 4 * 60 * 60 * 1000);
@@ -860,8 +922,15 @@ function startLivePolling() {
   }, 6 * 60 * 60 * 1000);
 }
 let lastPriceUpdateTime = null;
+// The dedicated price endpoint costs one credit per call and only nudges the
+// last candle's close — which the candle resync already refreshes properly. At
+// a 60s interval it alone came to 1,440 credits/day against an 800/day tier,
+// which exhausted the quota (and the background worker's share of it) by early
+// afternoon. It is now a low-priority extra: nice while there is budget spare,
+// first to be dropped when there isn't.
 async function pollPrice() {
   if (!apiKey || !activeProvider) return;
+  if (!spendCredit('low')) return;
   try {
     const p = await PROVIDERS[activeProvider].price(apiKey);
     const last = liveData[liveData.length - 1];
@@ -872,6 +941,7 @@ async function pollPrice() {
 }
 async function resyncCandles() {
   if (!apiKey || !activeProvider) return;
+  if (!spendCredit('critical')) { renderQuota(); return; }
   try {
     liveData = await PROVIDERS[activeProvider].timeSeries(apiKey, LIVE_INTERVAL, 500);
     lastPriceUpdateTime = Date.now();
@@ -1529,7 +1599,8 @@ function saveAutonomyState() {
         aMaxOpen: document.getElementById('aMaxOpen').value,
         aInterval: document.getElementById('aInterval').value,
         aBtHours: document.getElementById('aBtHours').value,
-        aMinMeta: document.getElementById('aMinMeta').value
+        aMinMeta: document.getElementById('aMinMeta').value,
+        aDailyCap: document.getElementById('aDailyCap').value
       }
     }));
   } catch (e) { /* storage unavailable — autonomy still works, it just won't remember across reloads */ }
@@ -1775,11 +1846,12 @@ document.getElementById('autonomyEnabled').addEventListener('change', function (
   saveAutonomyState();
   if (autonomy.enabled) startAutonomy(); else stopAutonomy();
 });
+providerSelect.addEventListener('change', renderQuota);
 document.getElementById('autonomyAdvancedToggle').addEventListener('click', () => {
   document.getElementById('autonomyAdvanced').classList.toggle('hidden');
 });
-['aMinConf', 'aCooldown', 'aMaxOpen', 'aInterval', 'aBtHours', 'aMinMeta'].forEach(id => {
-  document.getElementById(id).addEventListener('change', saveAutonomyState);
+['aMinConf', 'aCooldown', 'aMaxOpen', 'aInterval', 'aBtHours', 'aMinMeta', 'aDailyCap'].forEach(id => {
+  document.getElementById(id).addEventListener('change', () => { saveAutonomyState(); renderQuota(); });
 });
 
 // React to connectivity changes straight away rather than waiting out a heartbeat.
@@ -1813,6 +1885,8 @@ async function bootstrap() {
   await loadShadowLog();
   applyKnowledgeBaseWeights();
   loadAutonomyState();
+  loadQuota();
+  renderQuota();
   renderAutonomyStats();
   renderAnalysisQuality();
   refreshAll();

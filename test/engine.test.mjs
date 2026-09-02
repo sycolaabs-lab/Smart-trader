@@ -111,5 +111,31 @@ ok('newest signal survives trimming', log[0].id, MAX + 5);
 ok('log stays at the cap', log.length, MAX);
 ok('oldest signals are the ones dropped', log[log.length - 1].id, 6);
 
+
+// ---------------- api quota budgeting ----------------
+import { utcDayKey, rollQuota, quotaStatus, canSpend, spendQuota, quotaSummary } from '../lib/engine.js';
+console.log('\n-- api quota --');
+const CAP = 800;
+ok('day key is UTC date', utcDayKey(Date.parse('2026-03-04T23:59:00Z')), '2026-03-04');
+ok('resets on new UTC day', rollQuota({day:'2026-03-03', used:700}, Date.parse('2026-03-04T00:01:00Z')).used, 0);
+ok('keeps count within same day', rollQuota({day:'2026-03-04', used:700}, Date.parse('2026-03-04T12:00:00Z')).used, 700);
+
+// low-priority calls yield first, so the analysis path still has budget late in the day
+ok('low priority allowed when fresh', canSpend({day:'d',used:0}, CAP, 'low'), true);
+ok('low priority cut at 55%', canSpend({day:'d',used:441}, CAP, 'low'), false);
+ok('normal still funded at 55%', canSpend({day:'d',used:441}, CAP, 'normal'), true);
+ok('normal cut at 85%', canSpend({day:'d',used:681}, CAP, 'normal'), false);
+ok('critical still funded at 85%', canSpend({day:'d',used:681}, CAP, 'critical'), true);
+ok('critical cut at cap', canSpend({day:'d',used:800}, CAP, 'critical'), false);
+ok('multi-credit cost respected', canSpend({day:'d',used:798}, CAP, 'critical', 3), false);
+
+ok('spending increments', spendQuota({day:utcDayKey(),used:5}, 1).used, 6);
+ok('status reports remaining', quotaStatus({day:'d',used:300}, CAP).remaining, 500);
+ok('exhausted flagged', quotaStatus({day:'d',used:800}, CAP).exhausted, true);
+ok('summary pct', quotaSummary({day:'d',used:400}, CAP).pct, 50);
+ok('summary warns past half', /optional refreshes/.test(quotaSummary({day:'d',used:500}, CAP).note), true);
+ok('summary warns when spent', /Daily budget spent/.test(quotaSummary({day:'d',used:800}, CAP).note), true);
+ok('summary calm when low', /Within budget/.test(quotaSummary({day:'d',used:50}, CAP).note), true);
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail?1:0);

@@ -225,15 +225,58 @@ on **production**, not on a preview URL.
 
 ---
 
-## API quota
+## API quota — Twelve Data free tier
 
-Twelve Data's free tier allows ~8 requests/minute and 800/day. Refetching every
-timeframe on every tick would exhaust the daily quota by mid-morning, so the
-worker caches higher timeframes in Firestore and refreshes each on its own
-schedule:
+The free tier allows **800 credits/day and 8/minute**, and the browser and the
+background worker share one key. Exhausting it does not degrade gracefully:
+every later call fails, so an over-eager afternoon blinds the engine for the
+rest of the day, worker included.
+
+### What it actually costs
+
+| | credits/day |
+|---|---|
+| Browser, autonomous mode, tab open 24h | **285** |
+| Worker, cron every 15 min | 141 |
+| Worker, cron every 10 min | 189 |
+| Worker, cron every 5 min | 333 |
+
+Browser + a 15-minute cron is ~426/day, comfortably inside 800. Browser + a
+5-minute cron is ~618/day, which still fits but leaves little slack.
+
+### How it stays inside the limit
+
+**The worker caches higher timeframes** in Firestore and refreshes each on its
+own schedule, so a tick costs ~1 credit instead of 8:
 
 | Input | Refresh |
 |---|---|
+| 15min candles | every tick |
+| 1H | hourly |
+| 4H | every 4 h |
+| Daily / Weekly | every 12 h / 24 h |
+| Correlation (3 credits) | every 6 h |
+| Fundamentals (FRED) | every 3 h — free, not metered |
+| News (Alpha Vantage) | every 2 h — separate quota |
+
+**The browser meters every call against a daily budget** with a priority, shown
+live in the Autonomous Mode panel. Rather than one static interval, cheap
+niceties are dropped first so the analysis path keeps running:
+
+- **low** (price ticks, correlation) stops at 55% of the cap
+- **normal** (higher-timeframe refreshes) stops at 85%
+- **critical** (the 15-minute candles the analysis runs on) stops only at 100%
+
+The browser cap defaults to **500**, below the 800 tier limit on purpose — the
+rest is reserved for `/api/tick`, so a tab left open cannot starve the worker.
+Adjustable under *thresholds*. The counter resets at 00:00 UTC and counts
+conservatively: a call is charged before it is made, so a failed request still
+costs budget rather than silently under-reporting.
+
+FRED is free and effectively unmetered. Alpha Vantage has its own much tighter
+free limit (~25/day), which is why news refreshes only every 2 hours.
+
+---|---|
 | 15min candles | every tick |
 | 1H | hourly |
 | 4H | every 4 h |
