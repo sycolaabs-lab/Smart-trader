@@ -259,13 +259,31 @@ own schedule, so a tick costs ~1 credit instead of 8:
 | Fundamentals (FRED) | every 3 h — free, not metered |
 | News (Alpha Vantage) | every 2 h — separate quota |
 
-**The browser meters every call against a daily budget** with a priority, shown
-live in the Autonomous Mode panel. Rather than one static interval, cheap
-niceties are dropped first so the analysis path keeps running:
+**The browser meters every call against a daily budget**, shown live in the
+Autonomous Mode panel. The cap is split rather than shared, so budgeting can
+never throttle the core function:
 
-- **low** (price ticks, correlation) stops at 55% of the cap
-- **normal** (higher-timeframe refreshes) stops at 85%
-- **critical** (the 15-minute candles the analysis runs on) stops only at 100%
+- A **reserve** is ring-fenced for the analysis path — fresh candles, signal
+  grading, re-analysis. Nothing else can touch it.
+- Everything else competes for the **remainder**: *low* (price ticks,
+  correlation) stops at 65% of that remainder, *normal* (higher-timeframe
+  refreshes) at 100% of it.
+
+The reserve is sized from the cadence you actually configured, so tightening
+the interval claims more budget automatically instead of quietly running short
+later in the day:
+
+| Analysis interval | Cycles/day | Reserve | Discretionary pool |
+|---|---|---|---|
+| 5 min | 288 | 399 | 101 |
+| 10 min | 144 | 205 | 295 |
+| 15 min (default) | 96 | 140 | 360 |
+| 30 min | 48 | 75 | 425 |
+
+Even with the **entire** cap spent, autonomy does not stop: it keeps grading
+open signals and re-analysing on the last candles fetched, and the panel says
+*"Running on cached candles — daily API budget spent"* rather than showing stale
+numbers as if they were current. Degraded, not dead, and never silently.
 
 The browser cap defaults to **500**, below the 800 tier limit on purpose — the
 rest is reserved for `/api/tick`, so a tab left open cannot starve the worker.

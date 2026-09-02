@@ -22,7 +22,7 @@ import {
   AUTONOMY_DEFAULTS, resolveSignal, autonomyGate,
   macroContribution, aggregateMacroScore, pctChangeOf,
   computeCalibration, computeConditionBreakdown, computeGateAudit,
-  utcDayKey, rollQuota, canSpend, spendQuota, quotaSummary
+  utcDayKey, rollQuota, canSpend, spendQuota, quotaSummary, criticalReserveFor
 } from './lib/engine.js';
 
 const LEARNING_KEY = 'smc-factor-stats-v1';
@@ -520,6 +520,14 @@ function dailyCap() {
   const v = el ? parseInt(el.value, 10) : NaN;
   return isFinite(v) && v > 0 ? v : DEFAULT_DAILY_CAP;
 }
+// Ring-fenced for the analysis path, sized from the cadence actually configured.
+// Tightening the interval raises the reserve, so speeding autonomy up cannot
+// quietly leave it short of credits later in the day.
+function analysisReserve() {
+  const el = document.getElementById('aInterval');
+  const mins = el ? parseFloat(el.value) : NaN;
+  return criticalReserveFor(isFinite(mins) && mins > 0 ? mins : AUTONOMY_DEFAULTS.analysisIntervalMinutes);
+}
 // Returns false when this call would breach the budget for its priority.
 // During connect, activeProvider is still null while the first calls are already
 // going out — so metering keys off the SELECTED provider. Reading activeProvider
@@ -530,7 +538,7 @@ function meteredProvider() {
 function spendCredit(priority, cost) {
   quotaState = rollQuota(quotaState, Date.now());
   if (meteredProvider() !== 'twelvedata') return true; // only Twelve Data is metered here
-  if (!canSpend(quotaState, dailyCap(), priority, cost || 1)) return false;
+  if (!canSpend(quotaState, dailyCap(), priority, cost || 1, analysisReserve())) return false;
   quotaState = spendQuota(quotaState, cost || 1);
   saveQuota();
   renderQuota();
@@ -540,10 +548,11 @@ function renderQuota() {
   const el = document.getElementById('quotaReadout');
   if (!el) return;
   if (meteredProvider() !== 'twelvedata') { el.textContent = 'API budget tracking applies to Twelve Data only.'; return; }
-  const q = quotaSummary(quotaState, dailyCap());
+  const q = quotaSummary(quotaState, dailyCap(), analysisReserve());
   const colour = q.pct >= 85 ? '#ef4d5f' : q.pct >= 55 ? '#ffa726' : '#3ecf8e';
   el.innerHTML = '<span style="color:' + colour + ';">' + q.used + ' / ' + q.cap + ' credits used today (' + q.pct + '%)</span>'
-    + ' <span style="color:#454a56;">· resets 00:00 UTC · ' + q.note + '</span>';
+    + ' <span style="color:#454a56;">· ' + q.reserve + ' ring-fenced for analysis · resets 00:00 UTC</span>'
+    + '<br><span style="color:#454a56;">' + q.note + '</span>';
 }
 
 
@@ -910,7 +919,7 @@ function startLivePolling() {
   // Correlation uses daily bars — no point checking more than a few times a day.
   if (corrResyncHandle) clearInterval(corrResyncHandle);
   corrResyncHandle = setInterval(() => {
-    if (!canSpend(quotaState, dailyCap(), 'low', 3)) return; // 3 Twelve Data credits per refresh
+    if (!canSpend(quotaState, dailyCap(), 'low', 3, analysisReserve())) return; // 3 Twelve Data credits per refresh
     const fk = document.getElementById('fredKeyInput').value.trim();
     refreshCorrelation(activeProvider, apiKey, fk).then(() => refreshFundamentals(fk)).then(refreshAll);
   }, 4 * 60 * 60 * 1000);
@@ -939,9 +948,14 @@ async function pollPrice() {
     refreshAll();
   } catch (e) { connStatus.textContent = 'Price update failed: ' + e.message; connStatus.className = 'conn-status err'; }
 }
+let candlesStaleForBudget = false;
 async function resyncCandles() {
   if (!apiKey || !activeProvider) return;
-  if (!spendCredit('critical')) { renderQuota(); return; }
+  // Only reachable once the FULL cap is gone, reserve included. Analysis still
+  // runs on the last candles fetched rather than stopping — degraded, not dead —
+  // and the panel says so instead of quietly showing old numbers as current.
+  if (!spendCredit('critical')) { candlesStaleForBudget = true; renderQuota(); return; }
+  candlesStaleForBudget = false;
   try {
     liveData = await PROVIDERS[activeProvider].timeSeries(apiKey, LIVE_INTERVAL, 500);
     lastPriceUpdateTime = Date.now();
@@ -1756,7 +1770,12 @@ async function autonomyCycle() {
   autonomy.lastError = null;
   saveAutonomyState();
   renderAutonomyStats();
-  setAutonomyStatus('Running autonomously — last pass ' + new Date(now).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) + '.', 'live', reason);
+  if (candlesStaleForBudget) {
+    setAutonomyStatus('Running on cached candles — daily API budget spent, resumes 00:00 UTC.', 'warn',
+      'Still grading open signals and re-analysing, but on the last candles fetched rather than fresh ones. ' + reason);
+  } else {
+    setAutonomyStatus('Running autonomously — last pass ' + new Date(now).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) + '.', 'live', reason);
+  }
 }
 
 // The heartbeat: decides whether a cycle is due, and handles every reason it

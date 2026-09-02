@@ -113,7 +113,7 @@ ok('oldest signals are the ones dropped', log[log.length - 1].id, 6);
 
 
 // ---------------- api quota budgeting ----------------
-import { utcDayKey, rollQuota, quotaStatus, canSpend, spendQuota, quotaSummary } from '../lib/engine.js';
+import { utcDayKey, rollQuota, quotaStatus, canSpend, spendQuota, quotaSummary, criticalReserveFor } from '../lib/engine.js';
 console.log('\n-- api quota --');
 const CAP = 800;
 ok('day key is UTC date', utcDayKey(Date.parse('2026-03-04T23:59:00Z')), '2026-03-04');
@@ -121,21 +121,36 @@ ok('resets on new UTC day', rollQuota({day:'2026-03-03', used:700}, Date.parse('
 ok('keeps count within same day', rollQuota({day:'2026-03-04', used:700}, Date.parse('2026-03-04T12:00:00Z')).used, 700);
 
 // low-priority calls yield first, so the analysis path still has budget late in the day
-ok('low priority allowed when fresh', canSpend({day:'d',used:0}, CAP, 'low'), true);
-ok('low priority cut at 55%', canSpend({day:'d',used:441}, CAP, 'low'), false);
-ok('normal still funded at 55%', canSpend({day:'d',used:441}, CAP, 'normal'), true);
-ok('normal cut at 85%', canSpend({day:'d',used:681}, CAP, 'normal'), false);
-ok('critical still funded at 85%', canSpend({day:'d',used:681}, CAP, 'critical'), true);
-ok('critical cut at cap', canSpend({day:'d',used:800}, CAP, 'critical'), false);
-ok('multi-credit cost respected', canSpend({day:'d',used:798}, CAP, 'critical', 3), false);
+// The core guarantee: discretionary work can never eat the analysis reserve.
+const RES = criticalReserveFor(15);          // ~140 credits/day for a 15-min cycle
+const DISC = CAP - RES;                       // everything else shares the remainder
+ok('reserve scales with cycle frequency', criticalReserveFor(15) > criticalReserveFor(30), true);
+ok('reserve covers a day of cycles', criticalReserveFor(15) >= Math.ceil(24*60/15), true);
+
+ok('low allowed when fresh', canSpend({day:'d',used:0}, CAP, 'low', 1, RES), true);
+ok('low cut at 65% of discretionary', canSpend({day:'d',used:Math.ceil(DISC*0.65)}, CAP, 'low', 1, RES), false);
+ok('normal still funded there', canSpend({day:'d',used:Math.ceil(DISC*0.65)}, CAP, 'normal', 1, RES), true);
+ok('normal cut at the discretionary edge', canSpend({day:'d',used:DISC}, CAP, 'normal', 1, RES), false);
+ok('CRITICAL still funded at the discretionary edge', canSpend({day:'d',used:DISC}, CAP, 'critical', 1, RES), true);
+ok('critical funded deep into the reserve', canSpend({day:'d',used:CAP-1}, CAP, 'critical', 1, RES), true);
+ok('critical cut only at the hard cap', canSpend({day:'d',used:CAP}, CAP, 'critical', 1, RES), false);
+ok('multi-credit cost respected', canSpend({day:'d',used:CAP-2}, CAP, 'critical', 3, RES), false);
+
+// the guarantee, stated as the property that matters
+const spentByDiscretionary = DISC;            // worst case: every non-critical call taken
+const creditsLeftForAnalysis = CAP - spentByDiscretionary;
+ok('analysis keeps its full reserve in the worst case', creditsLeftForAnalysis >= RES, true);
+ok('reserve exceeds a day of 15-min cycles', RES > 24*60/15, true);
+ok('tiny cap degrades to critical-only', canSpend({day:'d',used:0}, 50, 'low', 1, criticalReserveFor(15)), false);
+ok('tiny cap still funds critical', canSpend({day:'d',used:0}, 50, 'critical', 1, criticalReserveFor(15)), true);
 
 ok('spending increments', spendQuota({day:utcDayKey(),used:5}, 1).used, 6);
 ok('status reports remaining', quotaStatus({day:'d',used:300}, CAP).remaining, 500);
 ok('exhausted flagged', quotaStatus({day:'d',used:800}, CAP).exhausted, true);
-ok('summary pct', quotaSummary({day:'d',used:400}, CAP).pct, 50);
-ok('summary warns past half', /optional refreshes/.test(quotaSummary({day:'d',used:500}, CAP).note), true);
-ok('summary warns when spent', /Daily budget spent/.test(quotaSummary({day:'d',used:800}, CAP).note), true);
-ok('summary calm when low', /Within budget/.test(quotaSummary({day:'d',used:50}, CAP).note), true);
+ok('summary pct', quotaSummary({day:'d',used:400}, CAP, RES).pct, 50);
+ok('summary flags protected analysis budget', /analysis path is still fully funded/.test(quotaSummary({day:'d',used:DISC+5}, CAP, RES).note), true);
+ok('summary warns when spent', /Daily budget spent/.test(quotaSummary({day:'d',used:800}, CAP, RES).note), true);
+ok('summary calm when low', /Within budget/.test(quotaSummary({day:'d',used:50}, CAP, RES).note), true);
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail?1:0);
