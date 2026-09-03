@@ -5,7 +5,7 @@
   "type": "module",
   "description": "XAUUSD smart-money analysis dashboard with autonomous self-backtesting",
   "scripts": {
-    "test": "node test/engine.test.mjs && node test/tick.test.mjs"
+    "test": "node test/stats.test.mjs && node test/knowledge.test.mjs && node test/auditor.test.mjs && node test/engine.test.mjs && node test/tick.test.mjs"
   },
   "dependencies": {
     "firebase-admin": "^12.7.0"

@@ -543,5 +543,65 @@ ok('HOLD headline explains the tension', /pulling against itself/.test(hold.head
 ok('HOLD explains silent factors', /Silent factors count against/.test(hold.confidenceNote), true);
 ok('missing result is handled', explainMarket({}).headline, 'No analysis available yet.');
 
+
+// ---------------- macro model ----------------
+import { fitMacroModel, macroModelScore, describeMacroModel, MACRO_MODEL_DEFAULTS } from '../lib/engine.js';
+import { alignByDay, toChanges } from '../lib/stats.js';
+console.log('\n-- macro model --');
+const DAY=86400000;
+// build a mGold series genuinely driven by a real yield, plus a useless driver
+let ms=7; const mr=()=>{ms=(ms*1103515245+12345)&0x7fffffff;return ms/0x7fffffff-0.5;};
+const days=120, t0=Date.UTC(2026,0,1);
+const mGold=[], realYield=[], mNoise=[];
+let g=2000, ry=2.0, nz=50;
+for(let i=0;i<days;i++){
+  const dRy=mr()*0.04;                 // yield moves in points
+  ry+=dRy; nz+=mr()*2;
+  g=g*(1 - 8*dRy/100) * (1+0.0004*mr()); // mGold falls when the real yield rises
+  const time=t0+i*DAY;
+  mGold.push({time,close:g}); realYield.push({time,close:ry}); mNoise.push({time,close:nz});
+}
+const model = fitMacroModel(mGold, [
+  {key:'real10y', label:'10Y Real Yield (TIPS)', kind:'yield', series:realYield},
+  {key:'mNoise',   label:'Unrelated Index',       kind:'price', series:mNoise}
+]);
+ok('model fits', model.ok, true);
+ok('recovers the real driver as dominant', model.drivers[0].key, 'real10y');
+ok('real yield coefficient is negative', model.drivers[0].beta < 0, true);
+ok('impact is reported in gold sigmas', Math.abs(model.drivers[0].impactSigma) > 0.5, true);
+ok('real yield is significant', model.drivers[0].significant, true);
+ok('the mNoise driver is NOT significant', model.drivers.find(d=>d.key==='mNoise').significant, false);
+ok('R2 is high for a real relationship', model.r2 > 0.8, true);
+ok('marked explanatory', model.explanatory, true);
+ok('reports observation count', model.n > 100, true);
+ok('produces a usable score', typeof macroModelScore(model), 'number');
+ok('score is bounded', Math.abs(macroModelScore(model)) <= 1, true);
+ok('description names the driver', /Real Yield/.test(describeMacroModel(model)), true);
+ok('description quotes R2 and t', /% of gold/.test(describeMacroModel(model)) && /t /.test(describeMacroModel(model)), true);
+
+// mGold that ignores its drivers entirely
+const rnd2=[], rndGold=[];
+let g2=2000, r2v=2.0;
+for(let i=0;i<days;i++){const time=t0+i*DAY; r2v+=mr()*0.04; g2*=1+0.006*mr(); rndGold.push({time,close:g2}); rnd2.push({time,close:r2v});}
+const weak = fitMacroModel(rndGold, [{key:'real10y',label:'10Y Real Yield (TIPS)',kind:'yield',series:rnd2}]);
+ok('weak relationship is not called explanatory', weak.explanatory, false);
+ok('and yields no score rather than a bad one', macroModelScore(weak), null);
+ok('description says so plainly', /too little to lean on/.test(describeMacroModel(weak)), true);
+
+// refusals
+ok('refuses with no drivers', fitMacroModel(mGold, []).ok, false);
+ok('refuses with too little history', fitMacroModel(mGold.slice(0,5), [{key:'x',label:'x',kind:'price',series:realYield}]).ok, false);
+ok('unavailable model describes itself', /unavailable/.test(describeMacroModel(null)), true);
+ok('no score from a failed model', macroModelScore({ok:false}), null);
+
+// alignment is what makes any of this valid
+const a=[{time:t0,close:1},{time:t0+DAY,close:2},{time:t0+3*DAY,close:4}];
+const b=[{time:t0,close:10},{time:t0+2*DAY,close:30},{time:t0+3*DAY,close:40}];
+const al=alignByDay([a,b]);
+ok('aligns only shared days', al.days.length, 2);
+ok('pairs the right values', al.columns[0].join(',')+'|'+al.columns[1].join(','), '1,4|10,40');
+ok('yield changes are absolute', toChanges([2.30,2.35],'yield')[0].toFixed(4), '0.0500');
+ok('price changes are relative', toChanges([100,110],'price')[0].toFixed(4), '0.1000');
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail?1:0);

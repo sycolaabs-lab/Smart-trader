@@ -364,6 +364,10 @@ canvas { width:100%; background:#12151c; border-radius:12px; border:1px solid #1
       <input type="password" id="fredKeyInput" placeholder="Paste free FRED API key (optional)">
       <button id="refreshCorrBtn">Refresh</button>
     </div>
+    <label style="display:flex;align-items:center;gap:8px;font-size:11px;color:#c9cedb;cursor:pointer;margin-bottom:8px;">
+      <input type="checkbox" id="useMacroModel" checked style="accent-color:#4f8bff;">
+      <span>Score macro with the joint model rather than averaged correlations</span>
+    </label>
     <div id="correlationList"></div>
   </div>
 
@@ -387,6 +391,37 @@ canvas { width:100%; background:#12151c; border-radius:12px; border:1px solid #1
   <div class="panel">
     <div class="panel-title">Macro Engines <span class="collapse-toggle" style="color:#3ecf8e;">correlation + fundamental + news all live</span></div>
     <div style="font-size:11px;color:#5c6270;line-height:1.5;">All three macro engines are connected now (above): cross-market correlation, fundamental economic data, and news sentiment. Each has its own honest caveats about interpretation — check each panel's description for what it actually measures versus what it's a simplified lean on.</div>
+  </div>
+
+  <div class="panel" id="auditPanel" style="border-color:#3a2020;">
+    <div class="panel-title">Independent Audit</div>
+    <div style="font-size:11px;color:#5c6270;margin-bottom:8px;line-height:1.5;">
+      A separate check on the engine's work that takes none of its numbers on trust. It re-derives the
+      price, the R:R, the stop distance against volatility and the direction implied by the factors —
+      straight from raw candles — and compares. It also checks the data itself is intact, and whether the
+      reasoning is citing evidence the statistics have already rejected. It reports rather than edits, with
+      one exception: a <em>critical</em> finding blocks an autonomous trade, because an analysis that
+      contradicts its own arithmetic is not a risk preference.
+    </div>
+    <div id="auditContent"></div>
+  </div>
+
+  <div class="panel" id="knowledgePanel" style="border-color:#1e2a3a;">
+    <div class="panel-title">Accumulated Knowledge</div>
+    <div style="font-size:11px;color:#5c6270;margin-bottom:8px;line-height:1.5;">
+      What the system has worked out for itself, built up one day at a time and never discarded.
+      Relationships are estimated jointly rather than one at a time, so drivers that move together
+      split the credit instead of each claiming it. Nothing is asserted until there is enough evidence —
+      new drivers sit in <em>watching</em> until they earn a claim, and anything that stops holding gets
+      caught and downgraded rather than averaged into the past.
+      <br><br>
+      <strong style="color:#e8c37a;">Noise is assumed until proven otherwise.</strong> Seven unrelated series on
+      sixty days of data produce an in-sample fit of roughly 12% by pure chance, so in-sample R² is reported but
+      never trusted. A relationship is only called established if it survives three separate tests: it beats
+      randomly reshuffled data, it predicts days the model has never seen, and it holds up after correcting for
+      the fact that several drivers were tested at once.
+    </div>
+    <div id="knowledgeContent"></div>
   </div>
 
   <div class="panel" id="reasoningPanel" style="border-color:#2a2438;">

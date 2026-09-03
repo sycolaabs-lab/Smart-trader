@@ -277,6 +277,74 @@ calendar and could open a position straight into a release.
 
 ---
 
+## Separating signal from noise
+
+This is the part most likely to produce confident nonsense, so it is defended
+three ways rather than trusted.
+
+**The problem, quantified.** Seven drivers on sixty observations of *pure noise*
+produce an in-sample R² of about **0.12**. The original `minR2` threshold was
+0.08 — below what randomness gives you. Testing seven drivers at 5% each also
+carries a **30%** chance that at least one looks real when none is, and refitting
+daily makes a false positive a certainty rather than a risk.
+
+**Three independent defences**, all of which must pass before a relationship is
+called established:
+
+| Test | Question it answers | Why it is needed |
+|---|---|---|
+| **Block permutation** | Does randomly reshuffled data produce a fit this good? | Assumption-free. Shuffling in blocks preserves the autocorrelation that makes spurious fits easy. |
+| **Walk-forward R²** | Does it predict days it has never seen? | In-sample R² rises mechanically with drivers. Out-of-sample can go negative — and negative is the honest answer. |
+| **Benjamini-Hochberg FDR** | Does it survive having six others tested alongside it? | Controls the *proportion* of false discoveries across the family. |
+
+The tests are decisive in both directions and pinned as such:
+
+- **Pure noise** → permutation p > 0.05, out-of-sample R² ≤ 0.02, hit rate ≈ 50%, nothing established.
+- **Real signal** → permutation p < 0.05, out-of-sample R² > 0.5, hit rate > 70%, the true driver established and the spare ones rejected.
+
+Permutation uses a fixed seed. Significance that changes between reloads would
+itself be noise, and would make the whole exercise unfalsifiable.
+
+When nothing passes, the panel says so first, before any coefficient:
+
+> *Built from 300 accumulated observations, but nothing here is yet
+> distinguishable from noise: randomly reshuffled data produces a fit this good
+> 6% of the time, out-of-sample R² is −3% — worse than simply predicting the
+> average. Still watching.*
+
+---
+
+## Independent audit
+
+An auditor that reuses the engine's computed values is the engine agreeing with
+itself, so this one takes nothing on trust. Where a claim can be re-derived from
+raw candles, it is re-derived and compared.
+
+**Arithmetic** — stop and target on the correct sides of entry, R:R recomputed
+from the actual prices, direction checked against the weighted factor sum, stop
+distance measured against an independently computed ATR (a stop inside half the
+average range gets hit by ordinary movement, not by being wrong).
+
+**Data integrity** — out-of-order or duplicate timestamps, high below low,
+non-finite prices, gaps, and *coverage*: a uniformly thinned feed produces
+regular spacing and no anomalous gap, yet half the market is invisible.
+Comparing bars received against bars the span should contain catches it.
+
+**Evidence** — whether the reasoning cites macro support the noise tests have
+rejected, whether any driver has decayed, and whether confidence is being
+reported when the record says it does not discriminate.
+
+It **reports, never edits** — with one exception. A *critical* finding blocks an
+autonomous trade (`gateCode: audit`), because an analysis that contradicts its
+own arithmetic is not a risk preference and no confidence score should override
+it.
+
+Every check is tested by planting the specific fault and confirming it is
+caught. Writing those tests found a genuine weakness — a feed missing a third of
+its bars passed unflagged — which is why the coverage check exists.
+
+---
+
 ## Market Reasoning
 
 The engine collects far more than price — measured correlations, macro prints,

@@ -19,8 +19,12 @@ import {
   canSpend, spendQuota, quotaSummary, criticalReserveFor, PAPER_DEFAULTS,
   openPaperPosition, closePaperPosition, unrealisedPnl, paperAccountSummary,
   GATE_LABELS, PARTIAL_TP_DEFAULTS, fillPaperPosition,
-  NEWS_WINDOW_DEFAULTS, newsWindowState, explainMarket
+  NEWS_WINDOW_DEFAULTS, newsWindowState, explainMarket,
+  fitMacroModel, macroModelScore, describeMacroModel, alignByDay
 } from './lib/engine.js';
+import { emptyKnowledge, recordObservation, assessKnowledge, detectNovelty,
+  describeKnowledge, KNOWLEDGE_DEFAULTS } from './lib/knowledge.js';
+import { auditAnalysis } from './lib/auditor.js';
 
 const LEARNING_KEY = 'smc-factor-stats-v1';
 let learningState = { factors: {}, patterns: {}, totalLogged: 0, metaExamples: [], metaModel: null };
@@ -718,6 +722,15 @@ async function fetchFredSeries(seriesId, fredKey, limit) {
 }
 
 let correlationScore = 0;
+// Raw aligned series kept for the macro model. The univariate score throws away
+// exactly what a multivariate fit needs — the series themselves.
+let macroSeries = { gold: null, drivers: [] };
+let macroModel = null;
+let correlationScoreSource = 'univariate';
+function useMacroModel() {
+  const el = document.getElementById('useMacroModel');
+  return el ? !!el.checked : true;
+}
 let correlationDetails = []; // { key, label, source, available, pctChange, corr, contribution, reason }
 async function refreshCorrelation(providerId, tdKey, fredKey) {
   const results = [];
@@ -730,12 +743,14 @@ async function refreshCorrelation(providerId, tdKey, fredKey) {
     catch (e) { xauDaily = null; }
   }
   const xauRets = xauDaily ? toDailyReturns(xauDaily) : null;
+  macroSeries = { gold: xauDaily, drivers: [] };
 
   // FRED side — independent of the price provider, no meaningful rate limit, so these always attempt if a key is present.
   if (fredKey) {
     for (const inst of FRED_INSTRUMENTS) {
       try {
         const obs = await fetchFredSeries(inst.seriesId, fredKey, 60);
+        macroSeries.drivers.push({ key: inst.key, label: inst.label, kind: inst.kind, series: obs });
         // Yields move in basis points, not percentages of their own level —
         // seriesDeltas picks the right transform per instrument.
         const rets = seriesDeltas(obs, inst.kind);
@@ -763,6 +778,7 @@ async function refreshCorrelation(providerId, tdKey, fredKey) {
         try {
           if (!spendCredit('low')) throw new Error('Skipped to stay inside the daily API budget.');
           const candles = await PROVIDERS.twelvedata.timeSeries(tdKey, '1day', 60, inst.symbol);
+          macroSeries.drivers.push({ key: inst.key, label: inst.label, kind: inst.kind, series: candles });
           const rets = seriesDeltas(candles, inst.kind);
           const corr = pearsonCorrelation(xauRets, rets);
           const pctChange = latestChangeOf(candles, inst.kind);
@@ -779,7 +795,18 @@ async function refreshCorrelation(providerId, tdKey, fredKey) {
 
   correlationDetails = results;
   const avail = results.filter(r => r.available);
-  correlationScore = aggregateMacroScore(avail.map(r => r.contribution));
+  const univariateScore = aggregateMacroScore(avail.map(r => r.contribution));
+
+  // Fit the multivariate model and use it when it clears its own quality bar.
+  // The univariate average stays as the fallback: it is worse, but a bad fit
+  // dressed up as a number is worse still.
+  macroModel = (macroSeries.gold && macroSeries.drivers.length)
+    ? fitMacroModel(macroSeries.gold, macroSeries.drivers)
+    : null;
+  const modelScore = macroModelScore(macroModel);
+  correlationScore = (modelScore != null && useMacroModel()) ? modelScore : univariateScore;
+  correlationScoreSource = (modelScore != null && useMacroModel()) ? 'model' : 'univariate';
+  accumulateKnowledge();
 }
 
 let fundamentalScore = 0;
@@ -1597,6 +1624,187 @@ document.getElementById('dataRefresh').addEventListener('click', async () => {
 
 
 
+
+
+// ============================================================
+// INDEPENDENT AUDITOR PANEL
+// ------------------------------------------------------------
+// Runs on every analysis and re-derives what it can from raw candles rather
+// than trusting the engine's own numbers. It reports; it never edits. The one
+// place it has teeth is the autonomous gate, where a critical finding blocks a
+// signal — acting on an analysis whose arithmetic is wrong is not a judgement
+// call, and the gate is the only place that distinction can be enforced.
+// ============================================================
+let lastAudit = null;
+
+function runAudit() {
+  if (!lastComposite) { lastAudit = null; return null; }
+  const provider = PROVIDERS[activeProvider];
+  lastAudit = auditAnalysis({
+    result: lastComposite,
+    plan: lastPlan || (lastComposite ? buildTradePlan(lastComposite, getTargetRR()) : null),
+    candles: liveData,
+    expectedIntervalMs: 15 * 60 * 1000,
+    now: Date.now(),
+    maxAgeMs: provider ? provider.resyncMinutes * 60 * 1000 * 3 : 45 * 60 * 1000,
+    knowledgeAssessment,
+    calibration: computeCalibration(signalLog)
+  });
+  return lastAudit;
+}
+
+function renderAudit() {
+  const root = document.getElementById('auditContent');
+  if (!root) return;
+  const a = lastAudit;
+  if (!a) { root.innerHTML = '<div class="zone-empty">Nothing analysed yet.</div>'; return; }
+
+  const tone = a.blocking ? '#ef4d5f' : a.warnings ? '#ffa726' : '#3ecf8e';
+  let html = '<div class="event-line" style="border-left-color:' + tone + ';color:' + tone + ';font-weight:600;">'
+    + (a.blocking ? '⛔ ' : a.warnings ? '⚠️ ' : '✓ ') + a.verdict + '</div>';
+
+  html += '<div class="metrics" style="margin:10px 0;">'
+    + '<div class="card"><div class="label">Critical</div><div class="value mono ' + (a.critical ? 'fneg' : 'fneu') + '">' + a.critical + '</div></div>'
+    + '<div class="card"><div class="label">Warnings</div><div class="value mono">' + a.warnings + '</div></div>'
+    + '<div class="card"><div class="label">Notes</div><div class="value mono">' + a.notes + '</div></div>'
+    + '<div class="card"><div class="label">Blocks Trade</div><div class="value mono ' + (a.blocking ? 'fneg' : 'fpos') + '">' + (a.blocking ? 'yes' : 'no') + '</div></div>'
+    + '</div>';
+
+  if (a.findings.length) {
+    html += a.findings.map(f => {
+      const c = f.severity === 'critical' ? '#ef4d5f' : f.severity === 'warning' ? '#ffa726' : '#5c6270';
+      return '<div style="margin-bottom:8px;padding-left:8px;border-left:2px solid ' + c + ';">'
+        + '<div style="font-size:11px;color:' + c + ';font-weight:600;">' + f.title + '</div>'
+        + '<div style="font-size:11px;color:#9298a5;line-height:1.5;margin-top:2px;">' + f.detail + '</div></div>';
+    }).join('');
+  } else {
+    html += '<div class="zone-empty">Re-derived the price, R:R, stop distance and direction from raw candles — all consistent.</div>';
+  }
+  root.innerHTML = html;
+}
+
+// ============================================================
+// ACCUMULATED KNOWLEDGE
+// ------------------------------------------------------------
+// One observation per day, appended to a record that never gets thrown away.
+// The macro model is re-estimated against the whole accumulated history, so a
+// relationship becomes better established the longer it holds — and a
+// relationship that stops holding gets caught by the split-half check rather
+// than being averaged into the past.
+// ============================================================
+const KNOWLEDGE_KEY = 'smc-knowledge-v1';
+let knowledge = emptyKnowledge();
+let knowledgeAssessment = null;
+let noveltyState = null;
+
+async function loadKnowledge() {
+  try {
+    const raw = localStorage.getItem(KNOWLEDGE_KEY);
+    if (raw) knowledge = JSON.parse(raw);
+  } catch (e) { knowledge = emptyKnowledge(); }
+  if (!knowledge || !knowledge.rows) knowledge = emptyKnowledge();
+}
+async function saveKnowledge() {
+  try { localStorage.setItem(KNOWLEDGE_KEY, JSON.stringify(knowledge)); }
+  catch (e) { /* storage full or unavailable — the record stops growing, nothing breaks */ }
+}
+
+// Fold today's aligned observation into the record, then re-assess.
+function accumulateKnowledge() {
+  if (!macroSeries.gold || !macroSeries.drivers.length) return;
+  const aligned = alignByDay([macroSeries.gold].concat(macroSeries.drivers.map(d => d.series)));
+  if (aligned.days.length < 2) return;
+
+  // Every overlapping day is recorded, not just the newest — a reconnect after
+  // a gap backfills what was missed instead of leaving a hole in the record.
+  for (let i = 1; i < aligned.days.length; i++) {
+    const goldPrev = aligned.columns[0][i - 1], goldNow = aligned.columns[0][i];
+    if (!isFinite(goldPrev) || !isFinite(goldNow) || goldPrev === 0) continue;
+    const drivers = {};
+    macroSeries.drivers.forEach((d, k) => {
+      const prev = aligned.columns[k + 1][i - 1], now = aligned.columns[k + 1][i];
+      if (!isFinite(prev) || !isFinite(now)) return;
+      drivers[d.key] = d.kind === 'yield' ? now - prev : (prev !== 0 ? (now - prev) / prev : 0);
+    });
+    if (!Object.keys(drivers).length) continue;
+    knowledge = recordObservation(knowledge, {
+      day: aligned.days[i], gold: (goldNow - goldPrev) / goldPrev, drivers
+    });
+  }
+  saveKnowledge();
+
+  const specs = macroSeries.drivers.map(d => ({ key: d.key, label: d.label, kind: d.kind }));
+  knowledgeAssessment = assessKnowledge(knowledge, specs);
+  const latest = knowledge.rows.length ? knowledge.rows[knowledge.rows.length - 1].drivers : null;
+  noveltyState = latest ? detectNovelty(knowledge, latest) : null;
+  renderKnowledge();
+}
+
+function maturityColour(m) {
+  return m === 'established' ? '#3ecf8e'
+    : m === 'emerging' ? '#e8c37a'
+    : m === 'decaying' || m === 'unstable' ? '#ef4d5f'
+    : '#5c6270';
+}
+function renderKnowledge() {
+  const root = document.getElementById('knowledgeContent');
+  if (!root) return;
+  const a = knowledgeAssessment;
+  if (!a) { root.innerHTML = '<div class="zone-empty">No observations yet — connect a provider with a FRED key.</div>'; return; }
+
+  let html = '<div class="metrics" style="margin-bottom:10px;">'
+    + '<div class="card"><div class="label">Days Observed</div><div class="value mono">' + (a.totalObservations || 0) + '</div></div>'
+    + '<div class="card"><div class="label">Established</div><div class="value mono fpos">' + (a.established || 0) + '</div></div>'
+    + '<div class="card"><div class="label">Watching</div><div class="value mono">' + (a.watching || 0) + '</div></div>'
+    + '<div class="card"><div class="label">Explains</div><div class="value mono">' + (a.ok ? (a.r2 * 100).toFixed(0) + '%' : '—') + '</div></div>'
+    + '</div>';
+
+  // Lead with whether any of this is distinguishable from noise, before any
+  // coefficient is shown — a number presented first gets believed regardless of
+  // the caveat printed under it.
+  const real = a.ok && a.modelIsReal;
+  html += '<div class="event-line" style="border-left-color:' + (real ? '#3ecf8e' : '#ffa726')
+    + ';color:' + (real ? '#9298a5' : '#ffa726') + ';">' + (real ? '' : '⚠️ ') + describeKnowledge(a) + '</div>';
+
+  if (a.ok && a.permutation && a.walkForward) {
+    html += '<div style="font-size:10px;color:#454a56;margin:10px 0 6px;">Is it noise?</div>'
+      + '<div class="zone-item"><span style="font-size:11px;">Beats reshuffled data</span>'
+      + '<span class="mono ' + (a.beatsChance ? 'fpos' : 'fneg') + '" style="font-size:11px;">p=' + a.permutation.pValue.toFixed(3) + '</span></div>'
+      + '<div class="zone-item"><span style="font-size:11px;">Out-of-sample R² <span style="color:#454a56;">(never sees what it predicts)</span></span>'
+      + '<span class="mono ' + (a.predictsOutOfSample ? 'fpos' : 'fneg') + '" style="font-size:11px;">' + (a.walkForward.r2 * 100).toFixed(1) + '%</span></div>'
+      + (a.walkForward.hitRate != null ? '<div class="zone-item"><span style="font-size:11px;">Direction correct</span>'
+        + '<span class="mono ' + (a.walkForward.hitRate > 0.55 ? 'fpos' : 'fneu') + '" style="font-size:11px;">' + (a.walkForward.hitRate * 100).toFixed(0) + '%</span></div>' : '')
+      + '<div class="zone-item"><span style="font-size:11px;">In-sample R² <span style="color:#454a56;">(flattering, not evidence)</span></span>'
+      + '<span class="mono fneu" style="font-size:11px;">' + (a.r2 * 100).toFixed(1) + '%</span></div>';
+  }
+
+  if (noveltyState && noveltyState.novel) {
+    html += '<div class="event-line" style="border-left-color:#ffa726;color:#ffa726;margin-top:6px;">🔍 ' + noveltyState.reason
+      + ' ' + noveltyState.unusual.map(u => u.key + ': ' + u.note).join('; ') + '</div>';
+  }
+
+  if (a.drivers && a.drivers.length) {
+    html += '<div style="font-size:10px;color:#454a56;margin:10px 0 6px;">What it has learned, and how firmly</div>';
+    html += a.drivers.map(d => {
+      const c = maturityColour(d.maturity);
+      const impact = isFinite(d.impactSigma) ? ((d.impactSigma >= 0 ? '+' : '') + d.impactSigma.toFixed(2) + 'σ') : '—';
+      const tTxt = isFinite(d.t) ? ' t=' + d.t.toFixed(1) : '';
+      const fdrTxt = d.survivesFdr === false ? ' <span style="color:#454a56;">(fails FDR)</span>' : '';
+      return '<div class="zone-item"><span style="font-size:11px;">' + d.label
+        + ' <span style="color:' + c + ';font-size:9px;">● ' + d.maturity + (d.trend ? ' · ' + d.trend : '') + '</span></span>'
+        + '<span class="mono" style="font-size:11px;color:' + c + ';">' + impact
+        + '<span style="color:#454a56;">' + tTxt + '</span>' + fdrTxt + '</span></div>';
+    }).join('');
+  }
+
+  html += '<div class="data-source-note" style="margin-top:9px;margin-bottom:0;">'
+    + 'Nothing is claimed below ' + KNOWLEDGE_DEFAULTS.watchingBelow + ' observations. A relationship becomes '
+    + '<em>established</em> only when it is statistically significant over the accumulated record, and is downgraded '
+    + 'to <em>decaying</em> or <em>unstable</em> when the recent half of the record stops agreeing with the earlier half.'
+    + '</div>';
+  root.innerHTML = html;
+}
+
 // ============================================================
 // MARKET REASONING PANEL
 // ============================================================
@@ -2199,7 +2407,18 @@ async function autonomyCycle() {
   let reason;
   if (lastComposite) {
     const plan = buildTradePlan(lastComposite, getTargetRR());
-    const gate = autonomyGate(lastComposite, plan, signalLog, autonomy.lastSignalAt, cfg);
+    // The auditor is advisory everywhere except here. A critical finding means
+    // the analysis contradicts itself or the data it was built on — that is not
+    // a risk preference, and no confidence score should be able to override it.
+    const audit = runAudit();
+    renderAudit();
+    let gate;
+    if (audit && audit.blocking) {
+      gate = { take: false, code: 'audit',
+        reason: 'independent audit found ' + audit.critical + ' critical issue(s): ' + audit.findings[0].title };
+    } else {
+      gate = autonomyGate(lastComposite, plan, signalLog, autonomy.lastSignalAt, cfg);
+    }
     // Tally why each cycle ended as it did. One latest-reason line cannot show
     // whether 13 quiet cycles mean "no setup existed" or "the filter blocked
     // every one" — and those need opposite responses.
@@ -2235,6 +2454,8 @@ async function autonomyCycle() {
   renderDataInventory();
   renderCalendar();
   renderReasoning();
+  runAudit();
+  renderAudit();
   autonomy.cycles++;
   autonomy.consecutiveErrors = 0;
   autonomy.lastError = null;
@@ -2336,6 +2557,8 @@ document.getElementById('autonomyEnabled').addEventListener('change', function (
   if (autonomy.enabled) startAutonomy(); else stopAutonomy();
 });
 providerSelect.addEventListener('change', renderQuota);
+const umm = document.getElementById('useMacroModel');
+if (umm) umm.addEventListener('change', () => { renderKnowledge(); renderReasoning(); });
 
 // A posture for building up a record rather than protecting capital. The engine
 // learns from resolved trades, and at the default B floor a ranging market
@@ -2392,6 +2615,7 @@ async function bootstrap() {
   await loadShadowLog();
   applyKnowledgeBaseWeights();
   await loadPaper();
+  await loadKnowledge();
   await loadCalendarCache();
   loadAutonomyState();
   loadQuota();
@@ -2402,6 +2626,9 @@ async function bootstrap() {
   renderDataInventory();
   renderCalendar();
   renderReasoning();
+  renderKnowledge();
+  runAudit();
+  renderAudit();
   refreshWorkerTotals().then(renderDataInventory);
   refreshAll();
 
