@@ -474,16 +474,37 @@ It also shows **per-factor evidence** — a factor only learns from outcomes whe
 it actually voted, so an order block can sit at 3 votes while the headline
 count reads 12. A factor needs 5 votes before its win rate is shown at all.
 
-### The two stores are separate
+### The two learning stores are separate — the trade log is not
 
 The browser keeps its learning in `localStorage` (and in Firestore under
 `users/<uid>` when signed in). The background worker keeps its own in Firestore
-under `system/worker`. **Neither reads the other.** They accumulate
-independently, so the totals are shown side by side rather than summed — adding
-them would imply a shared brain that does not exist.
+under `system/worker`. **Neither reads the other's factor statistics.** They
+accumulate independently, so the totals are shown side by side rather than
+summed — adding them would imply a shared brain that does not exist.
 
-If you want one pool, the worker is the one to trust: it runs whether or not a
-tab is open.
+If you want one pool of *learning*, the worker is the one to trust: it runs
+whether or not a tab is open.
+
+The **trade log is shared**, and that is deliberate. A trade the worker took at
+3am is not a different trade because the tab was closed, so the worker publishes
+its recent trades to `system/workerSignals` and the dashboard merges them into
+the signal log as they arrive. Each row says where the trade came from — ✋
+manual, ⚙ auto (this tab), ☁ worker — and carries its paper result. Merged
+trades are graded server-side and arrive already won or lost; the Won/Lost
+buttons remain as a manual override.
+
+Merge rules: same `id` is the same trade; the more resolved copy wins (a status
+only moves forward, so a stale cached copy can never reopen a graded trade); at
+equal resolution the local copy wins, so a mistake note typed here is never
+overwritten. Learning is applied exactly once per trade, tracked by a flag on
+the trade itself so a reload, a cloud pull and a worker merge cannot triple-count
+the same outcome.
+
+`system/workerSignals` exists separately from `system/worker` because the
+worker's own document carries its candle cache — hundreds of KB the browser has
+no reason to re-download every tick. The published copy is the most recent 150
+trades, trimmed to the fields the log renders and the fields the meta-labeler
+learns from.
 
 ---
 

@@ -20,7 +20,8 @@ import {
   openPaperPosition, closePaperPosition, unrealisedPnl, paperAccountSummary,
   GATE_LABELS, PARTIAL_TP_DEFAULTS, fillPaperPosition,
   NEWS_WINDOW_DEFAULTS, newsWindowState, explainMarket,
-  fitMacroModel, macroModelScore, describeMacroModel, alignByDay
+  fitMacroModel, macroModelScore, describeMacroModel, alignByDay,
+  mergeSignalLogs, newlyResolvedSignals, newlyArrivedOpenSignals
 } from './lib/engine.js';
 import { emptyKnowledge, recordObservation, assessKnowledge, detectNovelty,
   describeKnowledge, KNOWLEDGE_DEFAULTS } from './lib/knowledge.js';
@@ -203,7 +204,7 @@ async function saveSignalLog() {
   try { localStorage.setItem(SIGNAL_LOG_KEY, JSON.stringify(signalLog)); } catch (e) { /* storage unavailable */ }
   if (fbReady && fbAuth.currentUser) schedulePushCloudState(fbAuth.currentUser.uid);
 }
-function addSignalToLog(result, plan) {
+function addSignalToLog(result, plan, origin) {
   const sig = {
     id: Date.now() + '-' + Math.random().toString(36).slice(2, 7),
     dir: result.direction, entry: plan.entry, sl: plan.sl, tp: plan.tp,
@@ -214,7 +215,11 @@ function addSignalToLog(result, plan) {
     grade: result.fusion ? downgradeGrade(result.fusion.grade, plan.metaScore || 0) : null,
     qualityFeatures: plan.qualityFeatures || null, metaScore: plan.metaScore || 0,
     reason: reasoningText(result, plan),
-    time: new Date().toISOString(), status: 'pending', mistake: null
+    time: new Date().toISOString(), status: 'pending', mistake: null,
+    // Where the trade came from. 'auto' is the autonomous heartbeat in this tab,
+    // 'worker' arrives from the server tick, 'manual' is the Generate button.
+    // Without this the log could not say which trades the system took by itself.
+    source: origin || 'manual'
   };
   signalLog.unshift(sig);
   saveSignalLog();
@@ -234,16 +239,31 @@ function applySignalOutcome(sig, won, opts) {
   if (opts.ambiguousBar) sig.ambiguousBar = true;
   if (opts.partial) sig.partial = true;
   if (opts.mistakeNote) sig.mistake = opts.mistakeNote;
-  recordOutcome(sig.dir, sig.factors, won);
+  // Feed the factor stats and the meta-labeler's training set. Retraining itself
+  // happens on the next backtest cycle, consistent with the rest of the
+  // self-learning loop, rather than retraining on every single resolution.
+  learnFromResolvedSignal(sig);
   paperCloseForSignal(sig.id, won ? 'won' : 'lost', opts.exitPrice);
-  // Feed the meta-labeler's training set too — retraining itself happens on the next backtest cycle,
-  // consistent with the rest of the self-learning loop, rather than retraining on every single resolution.
-  if (sig.qualityFeatures) {
-    learningState.metaExamples = (learningState.metaExamples || []).concat([{ features: sig.qualityFeatures, label: won ? 1 : -1 }]).slice(-500);
-    saveLearningState();
-  }
   return true;
 }
+// Learning is applied exactly once per signal, wherever the outcome came from.
+// The flag lives on the signal itself rather than in a side list so it survives
+// a reload, a cloud pull and a worker merge — the three ways the same resolved
+// trade can come back around.
+function learnFromResolvedSignal(sig) {
+  if (!sig || sig.learned) return false;
+  if (sig.status !== 'won' && sig.status !== 'lost') return false;
+  const won = sig.status === 'won';
+  recordOutcome(sig.dir, sig.factors || {}, won);
+  if (sig.qualityFeatures) {
+    learningState.metaExamples = (learningState.metaExamples || [])
+      .concat([{ features: sig.qualityFeatures, label: won ? 1 : -1 }]).slice(-500);
+    saveLearningState();
+  }
+  sig.learned = true;
+  return true;
+}
+
 function markSignalResult(id, won, mistakeNote) {
   const sig = signalLog.find(s => s.id === id);
   if (!applySignalOutcome(sig, won, { mistakeNote: mistakeNote, auto: false })) return;
@@ -253,6 +273,86 @@ function markSignalResult(id, won, mistakeNote) {
   renderAnalysisQuality();
   renderDataInventory();
 }
+// Fold signals from another source — the background worker, or the cloud copy
+// of this account — into the local log.
+//
+// This is the fix for the log only ever knowing about trades taken while the
+// tab was open. The worker takes trades unattended and grades them server-side;
+// none of that was reaching the log, so an autonomous trade was invisible and
+// its win or loss unknowable from the UI. Everything the merge learns about
+// gets the same treatment a locally-taken trade gets: a paper position, a
+// learning update, a rendered row.
+// Snapshot listeners are registered while the module evaluates, but the local
+// log is restored asynchronously in bootstrap(). A worker snapshot arriving in
+// that window would merge into an empty log and then be overwritten by the
+// restore — the trade would flicker into the UI and vanish. Buffer until the
+// local state is actually loaded.
+let signalsBootstrapped = false;
+const pendingIngest = [];
+
+function flushPendingIngest() {
+  signalsBootstrapped = true;
+  while (pendingIngest.length) {
+    const job = pendingIngest.shift();
+    ingestSignals(job.incoming, job.label);
+  }
+}
+
+function ingestSignals(incoming, label) {
+  if (!Array.isArray(incoming) || !incoming.length) return 0;
+  if (!signalsBootstrapped) { pendingIngest.push({ incoming, label }); return 0; }
+  const before = signalLog;
+  const merged = mergeSignalLogs(before, incoming, SIGNAL_LOG_MAX);
+  const arrived = newlyArrivedOpenSignals(before, merged);
+  const resolved = newlyResolvedSignals(before, merged);
+  const beforeById = new Map(before.map(s => [s.id, s]));
+  signalLog = merged;
+
+  // A trade that turned up already live needs a position, or the paper account
+  // silently ignores everything the system did while this tab was closed.
+  arrived.forEach(sig => paperOpenForSignal(sig));
+
+  // A resting order the worker saw fill.
+  merged.forEach(sig => {
+    if (sig.status !== 'open') return;
+    const was = beforeById.get(sig.id);
+    if (was && was.status === 'pending') paperFillForSignal(sig.id, sig.filledAt || new Date().toISOString());
+  });
+
+  resolved.forEach(sig => {
+    // Taken and graded entirely between two merges — the position never existed
+    // here. Open it so the account books the trade, then close it. Sizing uses
+    // the balance now rather than at entry, which is an approximation, but a
+    // recorded approximate trade beats an autonomous trade the account never
+    // hears about.
+    if (paper.enabled && !paper.positions.some(p => p.signalId === sig.id)) {
+      paperOpenForSignal(Object.assign({}, sig, { entryType: 'market' }));
+    }
+    paperCloseForSignal(sig.id, sig.status, sig.exitPrice);
+    learnFromResolvedSignal(sig);
+  });
+
+  const changed = arrived.length || resolved.length || merged.length !== before.length;
+  if (changed) {
+    saveSignalLog();
+    renderSignalLog();
+    renderJournalInsights();
+    renderAnalysisQuality();
+    renderDataInventory();
+    renderAutonomyStats();
+  }
+  if ((arrived.length || resolved.length) && label) {
+    setWorkerLogNote(label + ': ' + (arrived.length ? arrived.length + ' new trade(s) ' : '') +
+      (resolved.length ? (arrived.length ? 'and ' : '') + resolved.length + ' resolved' : '') + '.');
+  }
+  return arrived.length + resolved.length;
+}
+
+function setWorkerLogNote(text) {
+  const el = document.getElementById('workerLogNote');
+  if (el) el.textContent = text || '';
+}
+
 function renderJournalInsights() {
   const el = document.getElementById('journalInsights');
   if (!el) return;
@@ -272,6 +372,37 @@ function renderJournalInsights() {
   const mistakes = resolved.filter(s => s.mistake).length;
   el.innerHTML = 'By session — ' + lines.join(' · ') + (mistakes ? '<br>' + mistakes + ' loss(es) have a logged mistake note — check the log below for patterns.' : '');
 }
+const SIGNAL_ORIGIN_LABELS = {
+  manual: '✋ manual',
+  auto: '⚙ auto',
+  worker: '☁ worker'
+};
+
+function paperPositionFor(signalId) {
+  return paper.positions.find(p => p.signalId === signalId) || null;
+}
+
+// The paper account's view of this signal, shown on the log row itself. Without
+// it the log and the paper panel were two separate lists with no way to tell
+// which row corresponded to which trade.
+function paperTagHtml(pos) {
+  if (!pos) return '';
+  const wrap = (colour, text) => '<span class="mono" style="font-size:9px;margin-left:6px;color:' + colour + ';">' + text + '</span>';
+  if (pos.status === 'pending') return wrap('#9298a5', 'paper: resting');
+  if (pos.status === 'cancelled') return wrap('#454a56', 'paper: cancelled');
+  if (pos.status === 'open') {
+    const fl = unrealisedPnl(pos, currentMarkPrice());
+    if (!isFinite(fl)) return wrap('#9298a5', 'paper: open');
+    return wrap(fl >= 0 ? '#3ecf8e' : '#ef4d5f', 'paper: ' + (fl >= 0 ? '+' : '-') + '$' + Math.abs(fl).toFixed(2) + ' floating');
+  }
+  if (pos.status === 'closed') {
+    const p = pos.pnl || 0;
+    const r = pos.rMultiple != null ? ' (' + (pos.rMultiple >= 0 ? '+' : '') + pos.rMultiple.toFixed(2) + 'R)' : '';
+    return wrap(p >= 0 ? '#3ecf8e' : '#ef4d5f', 'paper: ' + (p >= 0 ? '+' : '-') + '$' + Math.abs(p).toFixed(2) + r);
+  }
+  return '';
+}
+
 function renderSignalLog() {
   const log = document.getElementById('tradeLog');
   if (!signalLog.length) { log.innerHTML = '<div class="log-empty">No signals generated yet.</div>'; return; }
@@ -282,8 +413,16 @@ function renderSignalLog() {
     const gradeTxt = sig.grade ? ' [' + sig.grade + ']' : '';
     const sessionTxt = sig.session ? ' · ' + sig.session : '';
     const stateTxt = sig.status === 'open' ? ' · filled' : sig.status === 'pending' ? ' · awaiting entry' : '';
-    item.innerHTML = '<span class="dirtag ' + sig.dir + '">' + sig.dir + gradeTxt + '</span><span class="mono">$' + fmt(sig.entry) + '</span><span class="mono">' + sig.confidence + '%</span><span style="color:#5c6270">' + timeTxt + sessionTxt + stateTxt + '</span>';
+    const originTxt = SIGNAL_ORIGIN_LABELS[sig.source] || SIGNAL_ORIGIN_LABELS.manual;
+    const pos = paperPositionFor(sig.id);
+    item.innerHTML = '<span class="dirtag ' + sig.dir + '">' + sig.dir + gradeTxt + '</span><span class="mono">$' + fmt(sig.entry) + '</span><span class="mono">' + sig.confidence + '%</span><span style="color:#5c6270">' + timeTxt + sessionTxt + stateTxt + '</span>'
+      + '<span style="font-size:9px;color:#5c6270;border:1px solid #2a2f3a;border-radius:4px;padding:1px 5px;margin-left:6px;">' + originTxt + '</span>'
+      + paperTagHtml(pos);
     const wrap = document.createElement('span');
+    // An autonomous trade grades itself off the candles, so the manual buttons
+    // are an override rather than the only way an outcome is ever recorded.
+    // They stay available — a human can still overrule the resolver — but the
+    // row now says plainly that nobody has to press anything.
     if (sig.status === 'pending' || sig.status === 'open') {
       const wonBtn = document.createElement('button'); wonBtn.textContent = 'Won'; wonBtn.style.cssText = 'background:#123326;color:#3ecf8e;border:1px solid #1e4030;border-radius:5px;font-size:10px;padding:2px 7px;margin-left:6px;cursor:pointer;';
       const lostBtn = document.createElement('button'); lostBtn.textContent = 'Lost'; lostBtn.style.cssText = 'background:#32161a;color:#ef4d5f;border:1px solid #401e22;border-radius:5px;font-size:10px;padding:2px 7px;margin-left:4px;cursor:pointer;';
@@ -293,11 +432,18 @@ function renderSignalLog() {
         markSignalResult(sig.id, false, note || null);
       });
       wrap.appendChild(wonBtn); wrap.appendChild(lostBtn);
+      if (sig.source && sig.source !== 'manual') {
+        const note = document.createElement('span');
+        note.style.cssText = 'font-size:9px;color:#454a56;margin-left:6px;';
+        note.textContent = 'self-grading';
+        note.title = 'The system is watching this trade against live candles and will mark it won or lost by itself. The buttons are a manual override.';
+        wrap.appendChild(note);
+      }
     } else {
       const tag = document.createElement('span');
       const colour = sig.status === 'won' ? '#3ecf8e' : sig.status === 'expired' ? '#9298a5' : '#ef4d5f';
       tag.style.cssText = 'font-size:10px;margin-left:6px;color:' + colour + ';';
-      const auto = sig.resolvedBy === 'auto' ? ' (auto)' : '';
+      const auto = sig.resolvedBy === 'worker' ? ' (worker)' : sig.resolvedBy === 'auto' ? ' (auto)' : '';
       if (sig.status === 'won') tag.textContent = '✓ won' + (sig.partial ? ' (partial)' : '') + auto;
       else if (sig.status === 'expired') tag.textContent = '– expired' + (sig.expiryReason ? ' · ' + sig.expiryReason : '');
       else tag.textContent = '✗ lost' + auto + (sig.mistake ? ' — ' + sig.mistake : '');
@@ -363,7 +509,10 @@ async function pullCloudState(uid) {
         learningState = parsed;
         setMetaModel(learningState.metaModel);
       }
-      if (data.signalLog) signalLog = data.signalLog;
+      // Merge rather than assign. A wholesale replace would drop every signal
+      // the background worker had contributed since the last push, including
+      // trades this device has already booked in the paper account.
+      if (data.signalLog) ingestSignals(data.signalLog, 'Cloud sync');
     } else {
       // First sync for this account — seed the cloud with whatever's currently on this device.
       await pushCloudState(uid);
@@ -452,6 +601,34 @@ if (fbReady) {
     catch (e) { document.getElementById('syncStatus').textContent = 'Google sign-in failed: ' + e.message; }
   });
   document.getElementById('signOutBtn').addEventListener('click', async () => { await fbAuth.signOut(); });
+
+  // The worker's published signal log — public system data, not gated behind
+  // sign-in, so trades taken by the background tick show up even in a browser
+  // that never signed in.
+  //
+  // `latestTick` below is only a summary of the most recent pass: it carries a
+  // direction and a price but no signal identity, so it can never say which
+  // trade was entered or how it ended. Until this listener existed nothing in
+  // the browser read the trades themselves — an autonomously taken trade never
+  // reached the signal log, and the only outcomes the log could show were the
+  // ones a human had clicked. system/workerSignals is a trimmed copy the tick
+  // writes for exactly this, so subscribing does not drag the worker's candle
+  // cache down on every tick.
+  fbDb.collection('system').doc('workerSignals').onSnapshot(
+    (doc) => {
+      if (!doc.exists) return;
+      try {
+        const raw = doc.data().signalLog;
+        const incoming = typeof raw === 'string' ? JSON.parse(raw) : raw;
+        const list = asObjectArray(incoming, ['id']).map(sig =>
+          sig.source ? sig : Object.assign({}, sig, { source: 'worker' }));
+        ingestSignals(list, 'Background worker');
+      } catch (e) {
+        setWorkerLogNote('Could not read the worker signal log: ' + e.message);
+      }
+    },
+    (err) => { setWorkerLogNote('Worker signal log unreadable: ' + err.message); }
+  );
 
   // Live listener on the server's latest tick — public system data, not gated behind sign-in, so this
   // updates in real time even if the browser never signed in and never triggered the tick itself.
@@ -1344,7 +1521,7 @@ function refreshAll() {
   resizeLiveCanvas();
 }
 
-function updateSignalUI(result, plan, logIt) {
+function updateSignalUI(result, plan, logIt, origin) {
   const dirDisplay = document.getElementById('dirDisplay');
   dirDisplay.className = 'dir';
   if (result.direction === 'BUY') { dirDisplay.classList.add('buy'); dirDisplay.innerText = '📈 BUY'; }
@@ -1390,7 +1567,7 @@ function updateSignalUI(result, plan, logIt) {
   }).join('');
 
   if (logIt && result.direction !== 'HOLD') {
-    addSignalToLog(result, plan);
+    addSignalToLog(result, plan, origin);
   }
 }
 document.getElementById('genBtn').addEventListener('click', function () {
@@ -2088,6 +2265,7 @@ function paperOpenForSignal(sig) {
   paper.positions = paper.positions.slice(0, 500);
   savePaper();
   renderPaper();
+  renderSignalLog(); // the log row carries this position's state
 }
 function paperCloseForSignal(signalId, outcome, atPrice) {
   if (!paper.positions.length) return;
@@ -2098,6 +2276,7 @@ function paperCloseForSignal(signalId, outcome, atPrice) {
   paper.positions[idx] = closePaperPosition(paper.positions[idx], outcome, currentMarkPrice(), paperConfig(), atPrice);
   savePaper();
   renderPaper();
+  renderSignalLog();
 }
 
 // The signal's limit entry was tagged — the resting order is now a position.
@@ -2108,6 +2287,7 @@ function paperFillForSignal(signalId, atTime) {
   paper.positions[idx] = fillPaperPosition(paper.positions[idx], atTime);
   savePaper();
   renderPaper();
+  renderSignalLog();
 }
 
 function money(v) {
@@ -2503,7 +2683,7 @@ async function autonomyCycle() {
     const code = gate.code || 'unknown';
     autonomy.gateTally[code] = (autonomy.gateTally[code] || 0) + 1;
     if (gate.take) {
-      updateSignalUI(lastComposite, plan, true); // logIt = true -> addSignalToLog
+      updateSignalUI(lastComposite, plan, true, 'auto'); // logIt = true -> addSignalToLog
       autonomy.signalsTaken++;
       autonomy.lastSignalAt = now;
       reason = 'Took a ' + lastComposite.direction + ' at $' + fmt(plan.entry) +
@@ -2697,6 +2877,11 @@ async function bootstrap() {
   await loadCalendarCache();
   loadAutonomyState();
   loadQuota();
+  // Every store the merge touches is loaded by this point — the log it merges
+  // into, the paper account it books positions in, the learning state it
+  // updates. Replay anything the worker sent while that was still loading.
+  flushPendingIngest();
+  renderSignalLog();   // first render happened before the paper account loaded
   renderQuota();
   renderAutonomyStats();
   renderAnalysisQuality();

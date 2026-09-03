@@ -622,6 +622,8 @@ canvas { width:100%; background:#12151c; border-radius:12px; border:1px solid #1
   </div>
 
   <div class="log-title">Signal Log</div>
+  <div style="font-size:10px;color:#454a56;margin-bottom:6px;line-height:1.4;">Every trade the system takes appears here, whichever part of it took the trade: <span style="color:#5c6270;">✋ manual</span> from the Generate button, <span style="color:#5c6270;">⚙ auto</span> from autonomous mode in this tab, <span style="color:#5c6270;">☁ worker</span> from the background tick that keeps running with the tab closed. Anything not marked manual grades itself against live candles and books its own paper result — the Won/Lost buttons are a manual override, not the only way an outcome gets recorded.</div>
+  <div class="data-source-note" id="workerLogNote" style="margin-bottom:6px;"></div>
   <div class="data-source-note" id="journalInsights" style="margin-bottom:8px;">Log at least 5 resolved trades to see personalized insights.</div>
   <div id="tradeLog"><div class="log-empty">No signals generated yet this session.</div></div>
 </div>

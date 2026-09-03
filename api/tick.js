@@ -50,6 +50,10 @@ const REFRESH_MS = {
 };
 
 const WORKER_DOC = 'worker';
+// Published separately from the worker's own state so the dashboard can watch
+// the trade list without pulling the candle cache down with it.
+const PUBLIC_SIGNALS_DOC = 'workerSignals';
+const PUBLIC_SIGNAL_LIMIT = 150;
 const TICK_DOC = 'latestTick';
 
 const DEFAULT_WEIGHTS = {
@@ -365,8 +369,12 @@ export async function runTick({ db, tdKey, fredKey, avKey }) {
         sig.status = 'expired';
         sig.expiryReason = verdict.reason || null;
         sig.resolvedAt = new Date().toISOString();
+        sig.resolvedBy = 'worker';
       } else if (verdict.status === 'open' && sig.status === 'pending') {
         sig.status = 'open';
+        // The browser books the paper fill off this timestamp, so it has to be
+        // recorded here rather than invented on arrival.
+        sig.filledAt = new Date().toISOString();
       }
     });
 
@@ -451,6 +459,39 @@ export async function runTick({ db, tdKey, fredKey, avKey }) {
       lastSignalAt: state.lastSignalAt,
       updatedAt: Date.now()
     }, { merge: true });
+
+    // A small, public copy of the signal log for the dashboard to subscribe to.
+    //
+    // The worker document above is the worker's own state and carries its
+    // candle cache — hundreds of KB that a browser would re-download on every
+    // tick for no reason. And latestTick is only a summary: it has a direction
+    // and a price but no signal identity, so it can never say which trade was
+    // entered or how it ended. Neither was usable as the log's source, which is
+    // why autonomously taken trades were invisible in the UI.
+    //
+    // So: the most recent trades, trimmed to the fields the log actually
+    // renders. Enough to show what the system took, whether it filled, and how
+    // it resolved.
+    const publicSignals = state.signalLog.slice(0, PUBLIC_SIGNAL_LIMIT).map(s => ({
+      id: s.id, dir: s.dir, entry: s.entry, sl: s.sl, tp: s.tp,
+      entryType: s.entryType, confidence: s.confidence, grade: s.grade,
+      session: s.session, time: s.time, status: s.status,
+      filledAt: s.filledAt || null,
+      resolvedAt: s.resolvedAt || null, resolvedBy: s.resolvedBy || null,
+      exitPrice: s.exitPrice != null ? s.exitPrice : null,
+      partial: !!s.partial, expiryReason: s.expiryReason || null,
+      // The factors and quality features are what the browser learns from, so a
+      // merged trade trains the local model exactly like a locally-taken one.
+      factors: s.factors || null,
+      qualityFeatures: s.qualityFeatures || null,
+      metaScore: s.metaScore || 0,
+      source: s.source || 'worker'
+    }));
+    await sysRef.doc(PUBLIC_SIGNALS_DOC).set({
+      signalLog: JSON.stringify(publicSignals),
+      count: state.signalLog.length,
+      updatedAt: Date.now()
+    });
 
     // The public snapshot the dashboard subscribes to. Field names here are the
     // contract with the Background System panel in index.html — changing one

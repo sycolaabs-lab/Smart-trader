@@ -1,4 +1,5 @@
-import { resolveSignal, autonomyGate } from '../lib/engine.js';
+import { resolveSignal, autonomyGate, mergeSignalLogs, newlyResolvedSignals,
+  newlyArrivedOpenSignals, signalResolutionRank } from '../lib/engine.js';
 const C=(t,o,h,l,c)=>({time:t,open:o,high:h,low:l,close:c});
 let pass=0,fail=0;
 const ok=(n,a,e)=>{ const g=JSON.stringify(a)===JSON.stringify(e); console.log((g?'PASS':'FAIL')+' '+n+(g?'':'  got='+JSON.stringify(a)+' want='+JSON.stringify(e))); g?pass++:fail++; };
@@ -602,6 +603,66 @@ ok('aligns only shared days', al.days.length, 2);
 ok('pairs the right values', al.columns[0].join(',')+'|'+al.columns[1].join(','), '1,4|10,40');
 ok('yield changes are absolute', toChanges([2.30,2.35],'yield')[0].toFixed(4), '0.0500');
 ok('price changes are relative', toChanges([100,110],'price')[0].toFixed(4), '0.1000');
+
+
+// ============================================================
+// SIGNAL LOG MERGE — worker trades reaching the browser log
+// ============================================================
+const T = (n) => new Date(1700000000000 + n * 60000).toISOString();
+const S = (id, status, extra) => Object.assign({ id, dir: 'BUY', entry: 2000, sl: 1990, tp: 2020, time: T(Number(id)), status }, extra || {});
+
+// identity + ordering
+ok('merges disjoint logs', mergeSignalLogs([S('1','pending')], [S('2','open')]).length, 2);
+ok('newest first', mergeSignalLogs([S('1','pending')], [S('2','open')]).map(s=>s.id), ['2','1']);
+ok('same id is one signal', mergeSignalLogs([S('1','pending')], [S('1','pending')]).length, 1);
+ok('respects the cap', mergeSignalLogs([S('1','pending'),S('2','pending')], [S('3','pending')], 2).map(s=>s.id), ['3','2']);
+ok('empty incoming is a no-op', mergeSignalLogs([S('1','pending')], []).map(s=>s.id), ['1']);
+ok('empty local takes incoming', mergeSignalLogs([], [S('1','won')]).map(s=>s.status), ['won']);
+ok('tolerates non-arrays', mergeSignalLogs(null, undefined), []);
+ok('drops records with no id', mergeSignalLogs([{dir:'BUY'}], [S('1','open')]).length, 1);
+
+// resolution only ever moves forward
+ok('worker win beats local pending', mergeSignalLogs([S('1','pending')], [S('1','won')])[0].status, 'won');
+ok('worker loss beats local open', mergeSignalLogs([S('1','open')], [S('1','lost')])[0].status, 'lost');
+ok('worker open beats local pending', mergeSignalLogs([S('1','pending')], [S('1','open')])[0].status, 'open');
+ok('stale worker pending cannot reopen a local win', mergeSignalLogs([S('1','won')], [S('1','pending')])[0].status, 'won');
+ok('stale worker open cannot reopen a local loss', mergeSignalLogs([S('1','lost')], [S('1','open')])[0].status, 'lost');
+ok('expired does not override a win', mergeSignalLogs([S('1','won')], [S('1','expired')])[0].status, 'won');
+ok('a win overrides expired', mergeSignalLogs([S('1','expired')], [S('1','won')])[0].status, 'won');
+
+// field-level merging
+ok('local notes survive a worker copy that lacks them',
+  mergeSignalLogs([S('1','pending',{mistake:'chased it',reason:'local text'})], [S('1','won',{exitPrice:2020})])[0].mistake, 'chased it');
+ok('and the reason text is kept',
+  mergeSignalLogs([S('1','pending',{reason:'local text'})], [S('1','won')])[0].reason, 'local text');
+ok('worker exit price is picked up',
+  mergeSignalLogs([S('1','open')], [S('1','won',{exitPrice:2020})])[0].exitPrice, 2020);
+ok('learned flag is never erased by an incoming copy',
+  mergeSignalLogs([S('1','won',{learned:true})], [S('1','won')])[0].learned, true);
+ok('a tie keeps the local record',
+  mergeSignalLogs([S('1','won',{exitPrice:2020})], [S('1','won',{exitPrice:9999})])[0].exitPrice, 2020);
+ok('worker source label survives',
+  mergeSignalLogs([], [S('1','open',{source:'worker'})])[0].source, 'worker');
+
+// what the caller has to act on
+const beforeLog = [S('1','pending'), S('2','open')];
+const afterLog = mergeSignalLogs(beforeLog, [S('1','won',{exitPrice:2020}), S('3','open',{source:'worker'})]);
+ok('newly resolved is just the one that resolved', newlyResolvedSignals(beforeLog, afterLog).map(s=>s.id), ['1']);
+ok('newly arrived is just the one that is new', newlyArrivedOpenSignals(beforeLog, afterLog).map(s=>s.id), ['3']);
+ok('an already-resolved signal is not re-reported',
+  newlyResolvedSignals([S('1','won')], mergeSignalLogs([S('1','won')], [S('1','won')])).length, 0);
+ok('a trade taken and graded between merges still counts as resolved',
+  newlyResolvedSignals([], mergeSignalLogs([], [S('9','won')])).map(s=>s.id), ['9']);
+ok('but it is not reported as newly arrived and open',
+  newlyArrivedOpenSignals([], mergeSignalLogs([], [S('9','won')])).length, 0);
+ok('an expired arrival is not a resolved outcome',
+  newlyResolvedSignals([], mergeSignalLogs([], [S('9','expired')])).length, 0);
+ok('a still-pending arrival is reported as arrived',
+  newlyArrivedOpenSignals([], mergeSignalLogs([], [S('9','pending')])).map(s=>s.id), ['9']);
+ok('ranks order correctly',
+  [signalResolutionRank(S('1','pending')),signalResolutionRank(S('1','open')),signalResolutionRank(S('1','won'))],
+  [0,1,3]);
+ok('an unknown status ranks as unresolved', signalResolutionRank({id:'x',status:'weird'}), 0);
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail?1:0);

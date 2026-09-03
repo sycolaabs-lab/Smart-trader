@@ -149,6 +149,53 @@ ok('worker reports audit results', typeof auditTick.auditCritical, 'number');
 ok('audit findings are published', Array.isArray(auditTick.auditFindings), true);
 ok('a clean run has no critical findings', auditTick.auditCritical === 0, 'found ' + auditTick.auditCritical + ': ' + JSON.stringify(auditTick.auditFindings));
 
+
+// --- the worker must publish its trades where the browser can see them ------
+// Regression: the worker kept its signal log inside its own state document
+// (alongside a candle cache the browser has no business downloading) and
+// published only a one-line summary. So a trade taken unattended never reached
+// the dashboard's signal log, and there was no way to tell what it had entered
+// or whether it won.
+ok('a public signal doc is written', !!db._docs.workerSignals, 'no workerSignals doc');
+ok('it is a JSON string', typeof db._docs.workerSignals.signalLog, 'string');
+const pubLog = JSON.parse(db._docs.workerSignals.signalLog);
+ok('the published log is an array', Array.isArray(pubLog), true);
+ok('it reports the full log size separately', typeof db._docs.workerSignals.count, 'number');
+ok('it carries an update timestamp', typeof db._docs.workerSignals.updatedAt, 'number');
+ok('it never exceeds the publish cap', pubLog.length <= 150, `published ${pubLog.length}`);
+
+// Seed a trade directly into the worker's state, then confirm a tick publishes
+// it in a form the browser can merge and learn from.
+const seeded = {
+  id: 'seed-1', dir: 'BUY', entry: 1990, sl: 1980, tp: 2020, entryType: 'market',
+  confidence: 55, grade: 'C', session: 'London', status: 'open',
+  time: new Date(Date.now() - 6 * 3600e3).toISOString(),
+  factors: { structure: 1, momentum: 0.5 }, qualityFeatures: [0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5],
+  metaScore: 0.2, source: 'worker'
+};
+const wlog = JSON.parse(db._docs.worker.signalLog);
+wlog.unshift(seeded);
+db._docs.worker.signalLog = JSON.stringify(wlog);
+await runTick({ db, tdKey:'TD', fredKey:'FRED', avKey:'AV' });
+const pub2 = JSON.parse(db._docs.workerSignals.signalLog);
+const found = pub2.find(s => s.id === 'seed-1');
+ok('a worker trade appears in the published log', !!found, 'seed-1 missing from ' + pub2.length + ' entries');
+if (found) {
+  ok('it is labelled as the worker\'s', found.source, 'worker');
+  ok('it carries the levels the log renders', [found.entry, found.sl, found.tp], [1990, 1980, 2020]);
+  ok('it carries the factors the browser learns from', typeof found.factors, 'object');
+  ok('and the quality features the meta-labeler needs', Array.isArray(found.qualityFeatures), true);
+  ok('its status is published', typeof found.status, 'string');
+  ok('a resolved trade publishes who resolved it and where it exited',
+    found.status === 'won' || found.status === 'lost'
+      ? (found.resolvedBy === 'worker' && found.exitPrice != null)
+      : true,
+    JSON.stringify({status: found.status, by: found.resolvedBy, exit: found.exitPrice}));
+}
+// The cache is the reason this is a separate document; make sure it stayed out.
+ok('the published doc carries no candle cache', db._docs.workerSignals.cache === undefined,
+  'keys: ' + Object.keys(db._docs.workerSignals).join(','));
+
 console.log(`\nnetwork: twelvedata=${tdCalls} fred=${fredCalls} alphavantage=${avCalls}`);
 console.log(`${pass} passed, ${fail} failed`);
 process.exit(fail?1:0);
