@@ -294,6 +294,37 @@ on the worker). Set any to `0` to disable that arm.
 | Open position | 72h | `TICK_KILL_OPEN_HOURS` | A filled position has neither hit its stop nor its target |
 | Zone left behind | 1.5R | `TICK_KILL_DRIFT_R` | Price ran that much *further* from the entry without ever tagging it |
 
+### Every live trade says whether it is still working
+
+The log used to show `awaiting entry` or `filled` and nothing more. Both are
+equally true of a trade placed a minute ago and of one that has been resting for
+eleven hours with the kill switch about to take it — which is exactly the
+distinction you need when scanning the list.
+
+Each live row now carries a liveness chip:
+
+```
+● resting 1.0h · alive                 green
+◐ resting 7.0h · going stale           amber   (past half its allotted time)
+○ resting 11.0h · about to be killed   red     (85%+ of the way to the cull)
+● running 5.0h · alive · +1.60R        green
+○ running 70.0h · about to be scratched · -0.60R
+```
+
+A resting order is aged against the fill limit, a filled one against the hold
+limit, and a filled limit ages from the **fill**, not from when the order was
+placed. Hovering says when it will be cancelled or scratched, and how far price
+sits from the entry. Filled positions also show progress in R, because a
+position at -0.8R with an hour left is dead in every sense the clock alone
+cannot express.
+
+On the simulated feed no R reading is shown at all — a number computed from
+generated candles is a made-up figure wearing a real one's clothes. The clock
+half of the chip is true either way.
+
+Ages refresh once a minute while anything is live, so a chip never sits frozen
+at whatever it read when the log was last drawn.
+
 ### The clock is real time, not bars
 
 The old expiry counted candles, inside the candle loop. That cannot fire when no

@@ -17,12 +17,12 @@ import {
   aggregateMacroScore, pctChangeOf, seriesDeltas, latestChangeOf, computeCalibration,
   computeConditionBreakdown, computeGateAudit, dataInventory, utcDayKey, rollQuota,
   canSpend, spendQuota, quotaSummary, criticalReserveFor, PAPER_DEFAULTS,
-  openPaperPosition, closePaperPosition, unrealisedPnl, paperAccountSummary,
+  openPaperPosition, closePaperPosition, unrealisedPnl, paperAccountSummary, shouldPaperTrade,
   GATE_LABELS, PARTIAL_TP_DEFAULTS, fillPaperPosition,
   NEWS_WINDOW_DEFAULTS, newsWindowState, explainMarket,
   fitMacroModel, macroModelScore, describeMacroModel, alignByDay,
   mergeSignalLogs, newlyResolvedSignals, newlyArrivedOpenSignals, newlyExpiredSignals,
-  interpretConfidence, confidenceBand, CONFIDENCE_PRACTICAL_MAX
+  interpretConfidence, confidenceBand, CONFIDENCE_PRACTICAL_MAX, signalLiveness
 } from './lib/engine.js';
 import { emptyKnowledge, recordObservation, assessKnowledge, detectNovelty,
   describeKnowledge, KNOWLEDGE_DEFAULTS } from './lib/knowledge.js';
@@ -401,6 +401,23 @@ const SIGNAL_ORIGIN_LABELS = {
   worker: '☁ worker'
 };
 
+const LIVENESS_TONES = { live: '#3ecf8e', warn: '#ffa726', bad: '#ef4d5f', good: '#3ecf8e', idle: '#5c6270' };
+
+// A chip saying whether the trade is still working or effectively dead, with
+// the time it has left and how far it has travelled. Only for trades that are
+// still live — a closed one already shows its outcome.
+function livenessTagHtml(life) {
+  if (!life || (life.state !== 'resting' && life.state !== 'running')) return '';
+  const colour = LIVENESS_TONES[life.tone] || LIVENESS_TONES.idle;
+  const dot = life.tone === 'live' ? '●' : life.tone === 'warn' ? '◐' : '○';
+  return '<span class="mono" title="' + escapeAttr(life.detail || '') + '" style="font-size:9px;margin-left:6px;color:'
+    + colour + ';">' + dot + ' ' + escapeAttr(life.label) + '</span>';
+}
+
+function escapeAttr(t) {
+  return String(t == null ? '' : t).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
 function paperPositionFor(signalId) {
   return paper.positions.find(p => p.signalId === signalId) || null;
 }
@@ -426,6 +443,20 @@ function paperTagHtml(pos) {
   return '';
 }
 
+// Ages only mean something if they move. Without this the chip freezes at
+// whatever it read when the log was last drawn, which for a quiet market could
+// be hours — and a stale "alive" is exactly the thing being fixed.
+let livenessTimer = null;
+function startLivenessTicker() {
+  if (livenessTimer) clearInterval(livenessTimer);
+  livenessTimer = setInterval(() => {
+    if (signalLog.some(s => s.status === 'pending' || s.status === 'open')) {
+      renderSignalLog();
+      renderAutonomyStats();
+    }
+  }, 60000);
+}
+
 function renderSignalLog() {
   const log = document.getElementById('tradeLog');
   if (!signalLog.length) { log.innerHTML = '<div class="log-empty">No signals generated yet.</div>'; return; }
@@ -435,11 +466,19 @@ function renderSignalLog() {
     const timeTxt = new Date(sig.time).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
     const gradeTxt = sig.grade ? ' [' + sig.grade + ']' : '';
     const sessionTxt = sig.session ? ' · ' + sig.session : '';
-    const stateTxt = sig.status === 'open' ? ' · filled' : sig.status === 'pending' ? ' · awaiting entry' : '';
     const originTxt = SIGNAL_ORIGIN_LABELS[sig.source] || SIGNAL_ORIGIN_LABELS.manual;
     const pos = paperPositionFor(sig.id);
-    item.innerHTML = '<span class="dirtag ' + sig.dir + '">' + sig.dir + gradeTxt + '</span><span class="mono">$' + fmt(sig.entry) + '</span><span class="mono" style="color:' + confidenceBandColour(sig.confidence) + ';" title="' + confidenceBandTitle(sig.confidence) + '">' + sig.confidence + '%</span><span style="color:#5c6270">' + timeTxt + sessionTxt + stateTxt + '</span>'
+    // "awaiting entry" and "filled" are true of a trade placed a minute ago and
+    // of one that has been sitting for eleven hours about to be culled. The
+    // liveness chip is the difference between those two.
+    // No price on the simulated feed: an R reading computed off generated
+    // candles is a made-up number wearing a real one's clothes. The clock half
+    // of the chip is still true either way.
+    const life = signalLiveness(sig, autonomyConfig(),
+      { price: dataMode === 'live' ? currentMarkPrice() : null });
+    item.innerHTML = '<span class="dirtag ' + sig.dir + '">' + sig.dir + gradeTxt + '</span><span class="mono">$' + fmt(sig.entry) + '</span><span class="mono" style="color:' + confidenceBandColour(sig.confidence) + ';" title="' + escapeAttr(confidenceBandTitle(sig.confidence)) + '">' + sig.confidence + '%</span><span style="color:#5c6270">' + timeTxt + sessionTxt + '</span>'
       + '<span style="font-size:9px;color:#5c6270;border:1px solid #2a2f3a;border-radius:4px;padding:1px 5px;margin-left:6px;">' + originTxt + '</span>'
+      + livenessTagHtml(life)
       + paperTagHtml(pos);
     const wrap = document.createElement('span');
     // An autonomous trade grades itself off the candles, so the manual buttons
@@ -2347,9 +2386,7 @@ function paperBalance() {
 // the account compounds (or shrinks) as it goes rather than sizing off a
 // constant, which is what makes drawdown meaningful.
 function paperOpenForSignal(sig) {
-  if (!paper.enabled) return;
-  // A hand-generated signal only opens a position if the signal panel says so.
-  if ((sig.source || 'manual') === 'manual' && paper.manual === false) return;
+  if (!shouldPaperTrade(sig, paper)) return;
   const cfg = paperConfig();
   const pos = openPaperPosition(sig, { balance: paperBalance(), positions: paper.positions }, cfg);
   if (!pos) return;
@@ -3044,6 +3081,7 @@ async function bootstrap() {
   // updates. Replay anything the worker sent while that was still loading.
   flushPendingIngest();
   renderSignalLog();   // first render happened before the paper account loaded
+  startLivenessTicker();
   renderQuota();
   renderAutonomyStats();
   renderAnalysisQuality();

@@ -1,5 +1,5 @@
 import { resolveSignal, autonomyGate, mergeSignalLogs, newlyResolvedSignals,
-  newlyArrivedOpenSignals, newlyExpiredSignals, signalResolutionRank, interpretConfidence, confidenceBand,
+  newlyArrivedOpenSignals, newlyExpiredSignals, signalResolutionRank, signalLiveness, shouldPaperTrade, interpretConfidence, confidenceBand,
   confidenceBands, breakevenWinRate, CONFIDENCE_PRACTICAL_MAX, CONFIDENCE_EVIDENCE } from '../lib/engine.js';
 const C=(t,o,h,l,c)=>({time:t,open:o,high:h,low:l,close:c});
 let pass=0,fail=0;
@@ -887,6 +887,93 @@ ok('a zero timestamp does not auto-expire',
   resolveSignal(KS({time: 0}), [], {now: NOW}).status, 'pending');
 ok('nor does a garbage one',
   resolveSignal(KS({time: 'not a date'}), [], {now: NOW}).status, 'pending');
+
+
+// ============================================================
+// IS THIS TRADE STILL ALIVE?
+// ============================================================
+// "awaiting entry" and "filled" are true of a trade placed a minute ago and of
+// one about to be culled. The chip has to tell those apart.
+const LV_NOW = Date.parse('2026-03-10T12:00:00Z');
+const lvAgo = h => new Date(LV_NOW - h * 3600000).toISOString();
+const LV = (o) => Object.assign({ dir:'BUY', entry:2000, sl:1990, tp:2040, entryType:'limit' }, o);
+const live = (o, price) => signalLiveness(LV(o), {}, { now: LV_NOW, price });
+
+// resting orders age against the fill limit (12h)
+ok('a fresh order is alive', live({status:'pending', time:lvAgo(1)}).tone, 'live');
+ok('and says so', /alive/.test(live({status:'pending', time:lvAgo(1)}).label), true);
+ok('half way through it is going stale', live({status:'pending', time:lvAgo(7)}).tone, 'warn');
+ok('and says so', /going stale/.test(live({status:'pending', time:lvAgo(7)}).label), true);
+ok('near the limit it is about to be killed', live({status:'pending', time:lvAgo(11)}).tone, 'bad');
+ok('and says so', /about to be killed/.test(live({status:'pending', time:lvAgo(11)}).label), true);
+ok('the age is on the chip', /resting 11\.0h/.test(live({status:'pending', time:lvAgo(11)}).label), true);
+ok('minutes for anything under an hour', /resting 30m/.test(live({status:'pending', time:lvAgo(0.5)}).label), true);
+ok('the detail says when it will be cancelled',
+  /Cancelled in 1\.0h/.test(live({status:'pending', time:lvAgo(11)}).detail), true);
+ok('and how far price is from the entry',
+  /12\.00R away/.test(live({status:'pending', time:lvAgo(1)}, 2120).detail), true);
+
+// filled positions age against the hold limit (72h) and report their P&L in R
+ok('a filled position is running', live({status:'open', filledAt:lvAgo(5)}).state, 'running');
+ok('a young one is alive', live({status:'open', filledAt:lvAgo(5)}).tone, 'live');
+ok('one past half its life is stalling', live({status:'open', filledAt:lvAgo(40)}).tone, 'warn');
+ok('one near the limit is about to be scratched',
+  /about to be scratched/.test(live({status:'open', filledAt:lvAgo(70)}).label), true);
+ok('progress in R is on the chip', /\+1\.60R/.test(live({status:'open', filledAt:lvAgo(5)}, 2016).label), true);
+ok('a losing position shows it', /-0\.60R/.test(live({status:'open', filledAt:lvAgo(5)}, 1994).label), true);
+ok('the detail spells it out', /behind by 0\.60R/.test(live({status:'open', filledAt:lvAgo(5)}, 1994).detail), true);
+ok('a SELL reads the other way',
+  /\+1\.00R/.test(signalLiveness(LV({dir:'SELL', entry:2000, sl:2010, tp:1970, status:'open', filledAt:lvAgo(3)}),
+    {}, {now: LV_NOW, price: 1990}).label), true);
+
+// a filled limit ages from the FILL, not from when the order was placed
+ok('an order placed long ago but filled recently is alive',
+  live({status:'open', time:lvAgo(200), filledAt:lvAgo(2)}).tone, 'live');
+
+// closed and killed trades already show their outcome
+ok('a won trade is closed', live({status:'won', time:lvAgo(5)}).state, 'closed');
+ok('a lost trade is closed', live({status:'lost', time:lvAgo(5)}).tone, 'bad');
+ok('a killed trade says it was killed',
+  live({status:'expired', killSwitch:'stale-order', time:lvAgo(5)}).label, 'killed as stale');
+ok('a plain expiry does not claim the kill switch',
+  live({status:'expired', time:lvAgo(5)}).label, 'expired');
+
+// robustness
+ok('no signal does not throw', signalLiveness(null, {}, {}).state, 'unknown');
+ok('a missing timestamp gives no age', live({status:'pending', time:null}).ageHours, null);
+ok('and no ratio to colour by', live({status:'pending', time:null}).tone, 'live');
+ok('a disabled limit reports no deadline',
+  /No time limit set/.test(signalLiveness(LV({status:'pending', time:lvAgo(50)}), {maxHoursToFill:0}, {now:LV_NOW}).detail), true);
+ok('with no price there is no R reading', live({status:'open', filledAt:lvAgo(5)}).progressR, null);
+ok('a zero-width stop does not divide by zero',
+  signalLiveness(LV({entry:2000, sl:2000, status:'open', filledAt:lvAgo(5)}), {}, {now:LV_NOW, price:2010}).progressR, null);
+ok('hours left never goes negative',
+  live({status:'pending', time:lvAgo(99)}).hoursLeft, 0);
+
+
+// ============================================================
+// WHICH SIGNALS THE PAPER ACCOUNT TAKES
+// ============================================================
+// Two switches: the account itself, and the signal panel's own one for trades
+// generated by hand.
+const ON = { enabled: true, manual: true };
+const NO_MANUAL = { enabled: true, manual: false };
+const OFF = { enabled: false, manual: true };
+const sigFrom = src => ({ id:'x', dir:'BUY', entry:2000, sl:1990, tp:2040, source: src });
+
+ok('account off takes nothing', shouldPaperTrade(sigFrom('manual'), OFF), false);
+ok('not even autonomous ones', shouldPaperTrade(sigFrom('auto'), OFF), false);
+ok('account on takes a manual signal', shouldPaperTrade(sigFrom('manual'), ON), true);
+ok('and an autonomous one', shouldPaperTrade(sigFrom('auto'), ON), true);
+ok('and a worker one', shouldPaperTrade(sigFrom('worker'), ON), true);
+ok('excluding hand-made ones skips manual', shouldPaperTrade(sigFrom('manual'), NO_MANUAL), false);
+ok('but never silences autonomous trades', shouldPaperTrade(sigFrom('auto'), NO_MANUAL), true);
+ok('nor the worker', shouldPaperTrade(sigFrom('worker'), NO_MANUAL), true);
+ok('an unlabelled signal counts as manual', shouldPaperTrade(sigFrom(undefined), NO_MANUAL), false);
+ok('and is taken when manual trading is on', shouldPaperTrade(sigFrom(undefined), ON), true);
+ok('a missing account takes nothing', shouldPaperTrade(sigFrom('auto'), null), false);
+ok('an account with no manual flag defaults to taking them',
+  shouldPaperTrade(sigFrom('manual'), { enabled: true }), true);
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail?1:0);
