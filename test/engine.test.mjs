@@ -416,5 +416,132 @@ ok('resting orders count toward the cap', openPaperPosition(marketSig, full, RCF
 ok('missing entryType defaults to pending', openPaperPosition({...limitSig, entryType:undefined}, acctR, RCFG).status, 'pending');
 ok('resolveSignal agrees on that default', resolveSignal({...limitSig, entryType:undefined, time:0}, []).status, 'pending');
 
+
+// ---------------- economic release calendar ----------------
+import { ECONOMIC_RELEASES, NEWS_WINDOW_DEFAULTS, isUsEasternDst, releaseTimestamp,
+         buildReleaseCalendar, newsWindowState } from '../lib/engine.js';
+console.log('\n-- release calendar --');
+const iso = ts => new Date(ts).toISOString();
+
+// DST, because a fixed offset is wrong for two thirds of the year
+ok('summer 08:30 ET is 12:30 UTC', iso(releaseTimestamp('2026-09-04',8,30)), '2026-09-04T12:30:00.000Z');
+ok('winter 08:30 ET is 13:30 UTC', iso(releaseTimestamp('2026-01-15',8,30)), '2026-01-15T13:30:00.000Z');
+ok('FOMC 14:00 ET is 18:00 UTC', iso(releaseTimestamp('2026-09-03',14,0)), '2026-09-03T18:00:00.000Z');
+ok('DST on in September', isUsEasternDst(Date.parse('2026-09-04T12:00:00Z')), true);
+ok('DST off in January', isUsEasternDst(Date.parse('2026-01-15T12:00:00Z')), false);
+// boundaries: DST 2026 runs Mar 8 - Nov 1
+ok('DST off just before it starts', isUsEasternDst(Date.parse('2026-03-08T06:00:00Z')), false);
+ok('DST on just after it starts', isUsEasternDst(Date.parse('2026-03-08T08:00:00Z')), true);
+ok('DST off after it ends', isUsEasternDst(Date.parse('2026-11-01T08:00:00Z')), false);
+ok('bad date returns null', releaseTimestamp('', 8, 30), null);
+
+// building from raw FRED rows
+const cal = buildReleaseCalendar([
+  { release_id: 10,   date: '2026-09-11' },   // CPI, high
+  { release_id: 50,   date: '2026-09-04' },   // NFP, high
+  { release_id: 91,   date: '2026-09-25' },   // UMich, medium
+  { release_id: 9999, date: '2026-09-05' }    // not tracked
+]);
+ok('ignores untracked releases', cal.length, 3);
+ok('sorted by time', cal.map(e=>e.key).join(','), 'nfp,cpi,umich');
+ok('carries impact', cal.find(e=>e.key==='nfp').impact, 'high');
+ok('empty input is safe', buildReleaseCalendar(null).length, 0);
+
+// the window itself
+const nfpAt = releaseTimestamp('2026-09-04',8,30);
+const at = mins => nfpAt + mins*60000;
+ok('clear well before', newsWindowState(cal, at(-180)).blocked, false);
+ok('blocked 20 min before', newsWindowState(cal, at(-20)).blocked, true);
+ok('blocked at the release', newsWindowState(cal, at(0)).blocked, true);
+ok('blocked 10 min after', newsWindowState(cal, at(10)).blocked, true);
+ok('clear 30 min after', newsWindowState(cal, at(30)).blocked, false);
+ok('names the event', newsWindowState(cal, at(-20)).active.name, 'Employment Situation (NFP)');
+ok('knows which side of it', newsWindowState(cal, at(-20)).active.phase, 'before');
+ok('and after', newsWindowState(cal, at(5)).active.phase, 'after');
+
+// medium impact warns without blocking
+const umichAt = releaseTimestamp('2026-09-25',10,0);
+const umichState = newsWindowState(cal, umichAt - 10*60000);
+ok('medium impact does not block', umichState.blocked, false);
+ok('but is still reported', umichState.active.name, 'Consumer Sentiment (UMich)');
+ok('blocking medium too, when asked', newsWindowState(cal, umichAt-10*60000, {blockImpacts:['high','medium']}).blocked, true);
+ok('disabling stops blocking entirely', newsWindowState(cal, at(-20), {enabled:false}).blocked, false);
+ok('reports the next event', newsWindowState(cal, at(-180)).next.key, 'nfp');
+ok('no next once all are past', newsWindowState(cal, umichAt + 99*24*3600000).next, null);
+
+// the gate refuses inside a blocking window
+const RN=(d,c,g)=>({direction:d,confidence:c,fusion:{grade:g}});
+const PN={entry:2000,sl:1990,tp:2040,rr:4,metaScore:0};
+const blocked = autonomyGate(RN('BUY',80,'A'),PN,[],null,{newsState:newsWindowState(cal, at(-20))});
+ok('gate blocks a strong setup before NFP', blocked.take, false);
+ok('gate reports a news code', blocked.code, 'news');
+ok('reason names the release', /Employment Situation/.test(blocked.reason), true);
+ok('gate allows it once clear', autonomyGate(RN('BUY',80,'A'),PN,[],null,{newsState:newsWindowState(cal, at(180))}).take, true);
+
+
+// ---------------- market explanation ----------------
+import { explainMarket, rankDrivers } from '../lib/engine.js';
+console.log('\n-- market explanation --');
+const bullResult = {
+  direction:'BUY', confidence:55,
+  structWeekly:{trend:'bullish'}, structDaily:{trend:'bullish'}, structHtf:{trend:'bullish'},
+  structMtf:{trend:'bullish'}, structLtf:{trend:'bullish'},
+  sessionInfo:{session:'London'}, regimeInfo:{regime:'Trending'}
+};
+const bullMacro = [
+  {label:'10Y Real Yield (TIPS)', available:true, contribution:0.72, corr:-0.78, pctChange:-0.06, kind:'yield'},
+  {label:'Broad Dollar Index',    available:true, contribution:0.31, corr:-0.55, pctChange:-0.20, kind:'price'},
+  {label:'Silver',                available:true, contribution:0.12, corr:0.61,  pctChange:0.40,  kind:'price'},
+  {label:'Bitcoin',               available:false}
+];
+ok('ranks drivers by absolute contribution', rankDrivers(bullMacro,[])[0].label, '10Y Real Yield (TIPS)');
+ok('drops unavailable instruments', rankDrivers(bullMacro,[]).length, 3);
+ok('drops zero contributions', rankDrivers([{label:'x',available:true,contribution:0}],[]).length, 0);
+ok('handles null input', rankDrivers(null,null).length, 0);
+
+const agree = explainMarket({ result: bullResult, correlationDetails: bullMacro, newsAvailable:false });
+ok('headline states direction and confidence', agree.headline, 'BUY bias at 55% confidence.');
+ok('names the dominant driver', /Real Yield/.test(agree.narrative.join(' ')), true);
+ok('quotes the measured correlation', /measured correlation -0.78/.test(agree.narrative.join(' ')), true);
+ok('yield move is shown in pp not %', /0.06pp/.test(agree.narrative.join(' ')), true);
+ok('reports agreement when they align', /Price and macro agree/.test(agree.narrative.join(' ')), true);
+ok('no conflict flagged', agree.conflicts.length, 0);
+ok('reports session and regime', /London/.test(agree.narrative.join(' ')), true);
+
+// the interesting case: price moving against its drivers
+const bearMacro = bullMacro.map(d => d.available ? {...d, contribution: -d.contribution} : d);
+const clash = explainMarket({ result: bullResult, correlationDetails: bearMacro, newsAvailable:false });
+ok('flags a structure/macro conflict', clash.conflicts.length, 1);
+ok('says price is moving against its backdrop', /against its macro backdrop/.test(clash.narrative.join(' ')), true);
+ok('records the leans', [clash.structureLean, clash.macroLean].join(','), '1,-1');
+
+// split structure
+const split = explainMarket({ result: {...bullResult, structLtf:{trend:'bearish'}, structMtf:{trend:'bearish'}},
+                              correlationDetails: bullMacro, newsAvailable:false });
+ok('describes split timeframes', /Structure is split/.test(split.narrative.join(' ')), true);
+
+// no macro at all
+const bare = explainMarket({ result: bullResult, correlationDetails: [], fundamentalDetails: [] });
+ok('says so when macro is absent', /rests on price structure alone/.test(bare.narrative.join(' ')), true);
+
+// news window folds in
+const nfpAt2 = releaseTimestamp('2026-09-04',8,30);
+const cal2 = buildReleaseCalendar([{release_id:50, date:'2026-09-04'}]);
+const withNews = explainMarket({ result: bullResult, correlationDetails: bullMacro,
+  newsState: newsWindowState(cal2, nfpAt2 - 20*60000) });
+ok('mentions the imminent release', /Employment Situation/.test(withNews.narrative.join(' ')), true);
+ok('explains why it is standing aside', /held back through the window/.test(withNews.narrative.join(' ')), true);
+
+// sentiment
+const withSent = explainMarket({ result: bullResult, correlationDetails: bullMacro, newsAvailable:true, newsScore:0.4 });
+ok('reads risk-off sentiment as supportive', /risk-off/.test(withSent.narrative.join(' ')), true);
+ok('flags sentiment as the softest input', /softest input/.test(withSent.narrative.join(' ')), true);
+
+// HOLD
+const hold = explainMarket({ result: {...bullResult, direction:'HOLD', confidence:8}, correlationDetails: bullMacro });
+ok('HOLD headline explains the tension', /pulling against itself/.test(hold.headline), true);
+ok('HOLD explains silent factors', /Silent factors count against/.test(hold.confidenceNote), true);
+ok('missing result is handled', explainMarket({}).headline, 'No analysis available yet.');
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail?1:0);

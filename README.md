@@ -240,6 +240,73 @@ Server-side, `/api/tick` takes the same thresholds from `TICK_GRADE_FLOOR` and
 
 ---
 
+## Economic release calendar
+
+The fundamental series tracked here are *published* numbers, which arrive with a
+lag — they say what CPI was, never that CPI is out in twenty minutes. NFP, CPI
+and FOMC routinely move gold tens of dollars in seconds: spreads widen, and a
+stop sitting inside the noise gets taken on a spike that then reverses.
+
+FRED publishes a forward release schedule, so this needs **no new provider and
+no new key** — the same FRED key the correlation engine uses.
+
+| Release | Impact | Time (ET) |
+|---|---|---|
+| Employment Situation (NFP) | high | 08:30 |
+| Consumer Price Index | high | 08:30 |
+| FOMC Press Release | high | 14:00 |
+| Personal Income & Outlays (PCE) | high | 08:30 |
+| Producer Price Index | medium | 08:30 |
+| Retail Sales | medium | 08:30 |
+| Gross Domestic Product | medium | 08:30 |
+| Consumer Sentiment (UMich) | medium | 10:00 |
+| Jobless Claims | medium | 08:30 |
+
+By default the engine **stands aside from 30 minutes before to 15 minutes
+after** a high-impact release. Medium-impact events warn but do not block,
+adjustable in the panel. A blocked cycle records `gateCode: news` so the tally
+shows it.
+
+FRED supplies the date but not the time of day, so each release carries its
+known publication time in US Eastern, converted with real DST rules — a fixed
+offset would put every release an hour out for two thirds of the year.
+
+The calendar is fetched **before** the gate consults it. Refreshing it at the
+end of a cycle meant the first pass after a reconnect ran against an empty
+calendar and could open a position straight into a release.
+
+---
+
+## Market Reasoning
+
+The engine collects far more than price — measured correlations, macro prints,
+sentiment, session, regime, and the release calendar. Those were all just
+numbers feeding a score, so the output could say *what* it thought without ever
+saying *why*.
+
+The reasoning panel assembles a causal reading from evidence the system already
+holds:
+
+- **What price is doing** — structure across five timeframes, and whether they
+  agree. A split is reported as a split, since disagreeing timeframes are
+  themselves the reason confidence is low.
+- **What is driving it** — macro inputs ranked by *measured* correlation, not
+  assumed relationships. "10Y Real Yield down 0.06pp (measured correlation
+  -0.78), supportive of gold."
+- **Whether those agree** — and when they do not, it says so. A move
+  unsupported by its drivers is flagged as lower quality rather than averaged
+  into a comfortable middle.
+- **Context** — session, regime, sentiment (explicitly labelled the softest
+  input, since it is a classifier reading headlines rather than a measured
+  relationship), and what is scheduled next.
+- **Why confidence is what it is** — including that silent factors count
+  against the score.
+
+**No language model is involved.** Every sentence derives from a number the
+engine measured, which is what makes it checkable rather than plausible-sounding.
+
+---
+
 ## Correlation basket
 
 | Instrument | Source | Series | Type |

@@ -27,7 +27,8 @@ import {
   trainAdaBoostStumps, parseUtcDatetime, pearsonCorrelation, toDailyReturns,
   CORRELATION_INSTRUMENTS, FUNDAMENTAL_INSTRUMENTS, FRED_INSTRUMENTS,
   AUTONOMY_DEFAULTS, macroContribution, aggregateMacroScore, pctChangeOf,
-  seriesDeltas, latestChangeOf
+  seriesDeltas, latestChangeOf, ECONOMIC_RELEASES, buildReleaseCalendar,
+  newsWindowState, NEWS_WINDOW_DEFAULTS
 } from '../lib/engine.js';
 
 const SYMBOL = 'XAU/USD';
@@ -43,7 +44,8 @@ const REFRESH_MS = {
   weekly: 24 * 60 * 60 * 1000,
   correlation: 6 * 60 * 60 * 1000,
   fundamental: 3 * 60 * 60 * 1000,  // FRED is free and unmetered, but the data is daily anyway
-  news: 2 * 60 * 60 * 1000          // Alpha Vantage free tier is ~25 requests/day
+  news: 2 * 60 * 60 * 1000,         // Alpha Vantage free tier is ~25 requests/day
+  calendar: 12 * 60 * 60 * 1000     // a release schedule does not change hour to hour
 };
 
 const WORKER_DOC = 'worker';
@@ -126,6 +128,22 @@ async function fredSeries(seriesId, fredKey, limit) {
     .map(o => ({ time: new Date(o.date + 'T00:00:00Z').getTime(), close: parseFloat(o.value) }));
   if (!obs.length) throw new Error('No usable data points');
   return obs.slice(-limit);
+}
+
+// Upcoming economic releases, straight from FRED (no CORS concern server-side).
+async function fetchReleaseCalendar(fredKey) {
+  if (!fredKey) return [];
+  const today = new Date().toISOString().slice(0, 10);
+  const wanted = new Set(ECONOMIC_RELEASES.map(r => r.id));
+  const qs = new URLSearchParams({
+    api_key: fredKey, file_type: 'json', include_release_dates_with_no_data: 'true',
+    realtime_start: today, sort_order: 'asc', limit: '1000'
+  });
+  const r = await fetch('https://api.stlouisfed.org/fred/releases/dates?' + qs);
+  const j = await r.json();
+  if (j.error_code) throw new Error(j.error_message || 'FRED calendar error');
+  const rows = (j.release_dates || []).filter(d => wanted.has(d.release_id));
+  return buildReleaseCalendar(rows).filter(e => e.at >= Date.now() - 24 * 3600 * 1000);
 }
 
 // Cross-market correlation score. Same shape as the browser's refreshCorrelation:
@@ -282,6 +300,7 @@ export async function runTick({ db, tdKey, fredKey, avKey }) {
     // refetch (expensive). Only start one if there is room to finish it, and
     // fall back to the last cached value rather than skipping the tick.
     let corr = { score: 0, available: false }, fund = { score: 0, available: false }, news = { score: 0, available: false };
+    let calendar = [];
     const cachedOr = (key, fallback) => (state.cache && state.cache[key] != null) ? state.cache[key] : fallback;
     const macroSkipped = [];
 
@@ -294,11 +313,14 @@ export async function runTick({ db, tdKey, fredKey, avKey }) {
         set: v => { fund = v; } },
       { key: 'news', maxAge: REFRESH_MS.news, sig: null,
         run: () => computeNews(avKey),
-        set: v => { news = v; } }
+        set: v => { news = v; } },
+      { key: 'calendar', maxAge: REFRESH_MS.calendar, sig: null,
+        run: () => fetchReleaseCalendar(fredKey),
+        set: v => { calendar = v || []; } }
     ]) {
       const b = budget(started);
       if (b.left < MACRO_MIN_MS) {
-        job.set(cachedOr(job.key, { score: 0, available: false }));
+        job.set(cachedOr(job.key, job.key === 'calendar' ? [] : { score: 0, available: false }));
         macroSkipped.push(job.key);
         continue;
       }
@@ -306,7 +328,7 @@ export async function runTick({ db, tdKey, fredKey, avKey }) {
         const deadline = Date.now() + b.left - 4000; // leave room to persist and respond
         job.set((await cached(state, job.key, job.maxAge, () => job.run(deadline), job.sig)).value);
       } catch (e) {
-        job.set(cachedOr(job.key, { score: 0, available: false }));
+        job.set(cachedOr(job.key, job.key === 'calendar' ? [] : { score: 0, available: false }));
         macroSkipped.push(job.key + ' (failed)');
       }
     }
@@ -368,7 +390,9 @@ export async function runTick({ db, tdKey, fredKey, avKey }) {
     // downgraded again for a ranging market and for disagreeing history, so at
     // the default B floor a ranging market needs 70%+ to qualify at all. Set
     // TICK_GRADE_FLOOR=C while building up a record.
+    const newsState = newsWindowState(calendar, Date.now(), NEWS_WINDOW_DEFAULTS);
     const gateCfg = Object.assign({}, AUTONOMY_DEFAULTS, {
+      newsState,
       gradeFloor: process.env.TICK_GRADE_FLOOR || AUTONOMY_DEFAULTS.gradeFloor,
       minConfidence: isFinite(parseFloat(process.env.TICK_MIN_CONFIDENCE))
         ? parseFloat(process.env.TICK_MIN_CONFIDENCE)
@@ -424,6 +448,9 @@ export async function runTick({ db, tdKey, fredKey, avKey }) {
       tookSignal,
       gateReason: gate.reason,
       gateCode: gate.code || null,
+      newsBlocked: !!newsState.blocked,
+      newsActive: newsState.active ? newsState.active.name : null,
+      nextRelease: newsState.next ? { name: newsState.next.name, at: newsState.next.at, impact: newsState.next.impact } : null,
       gradeFloor: gateCfg.gradeFloor,
       minConfidence: gateCfg.minConfidence,
       session: result.sessionInfo ? result.sessionInfo.session : null,

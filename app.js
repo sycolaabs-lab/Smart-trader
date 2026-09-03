@@ -18,7 +18,8 @@ import {
   computeConditionBreakdown, computeGateAudit, dataInventory, utcDayKey, rollQuota,
   canSpend, spendQuota, quotaSummary, criticalReserveFor, PAPER_DEFAULTS,
   openPaperPosition, closePaperPosition, unrealisedPnl, paperAccountSummary,
-  GATE_LABELS, PARTIAL_TP_DEFAULTS, fillPaperPosition
+  GATE_LABELS, PARTIAL_TP_DEFAULTS, fillPaperPosition,
+  NEWS_WINDOW_DEFAULTS, newsWindowState, explainMarket
 } from './lib/engine.js';
 
 const LEARNING_KEY = 'smc-factor-stats-v1';
@@ -911,6 +912,7 @@ async function connectProvider() {
   // A fresh connection is exactly when autonomy should get to work. Without this
   // it would sit idle until the next 60s heartbeat noticed the provider was up.
   if (autonomy.enabled && dataMode === 'live') {
+    await refreshCalendar(false);
     await autonomyCatchUp();
     autonomy.lastAnalysisAt = null; // the new connection deserves an immediate pass
     autonomyHeartbeat();
@@ -1593,6 +1595,134 @@ document.getElementById('dataRefresh').addEventListener('click', async () => {
   renderDataInventory();
 });
 
+
+
+// ============================================================
+// MARKET REASONING PANEL
+// ============================================================
+function renderReasoning() {
+  const root = document.getElementById('reasoningContent');
+  if (!root) return;
+  if (!lastComposite) { root.innerHTML = '<div class="zone-empty">No analysis yet.</div>'; return; }
+
+  const ex = explainMarket({
+    result: lastComposite,
+    correlationDetails, fundamentalDetails,
+    newsScore: newsSentimentScore,
+    newsAvailable: !!(newsDetails && newsDetails.length),
+    newsState: currentNewsState()
+  });
+
+  const dirCls = lastComposite.direction === 'BUY' ? 'fpos' : lastComposite.direction === 'SELL' ? 'fneg' : 'fneu';
+  let html = '<div class="event-line ' + dirCls + '" style="border-left-color:#c99bff;font-size:12px;font-weight:600;">'
+    + ex.headline + '</div>';
+
+  if (ex.conflicts.length) {
+    html += ex.conflicts.map(c => '<div class="event-line" style="border-left-color:#ffa726;color:#ffa726;margin-top:6px;">⚠️ ' + c + '</div>').join('');
+  }
+
+  html += '<div style="margin-top:8px;font-size:11px;color:#9298a5;line-height:1.6;">'
+    + ex.narrative.map(n => '<div style="margin-bottom:6px;">' + n + '</div>').join('') + '</div>';
+
+  if (ex.drivers.length) {
+    html += '<div style="font-size:10px;color:#454a56;margin:10px 0 6px;">Dominant drivers, ranked by measured influence</div>';
+    html += ex.drivers.map(d => {
+      const cls = d.contribution > 0 ? 'fpos' : d.contribution < 0 ? 'fneg' : 'fneu';
+      const corrTxt = d.corr != null ? ' <span style="color:#454a56;">r=' + d.corr.toFixed(2) + '</span>' : '';
+      return '<div class="zone-item"><span style="font-size:11px;">' + d.label + corrTxt + '</span>'
+        + '<span class="mono ' + cls + '" style="font-size:11px;">' + (d.contribution >= 0 ? '+' : '') + d.contribution.toFixed(2) + '</span></div>';
+    }).join('');
+  }
+
+  html += '<div class="data-source-note" style="margin-top:9px;margin-bottom:0;">' + ex.confidenceNote + '</div>';
+  root.innerHTML = html;
+}
+
+// ============================================================
+// ECONOMIC RELEASE CALENDAR
+// ------------------------------------------------------------
+// Fetched through /api/calendar (FRED sends no CORS headers) and cached for
+// hours — a release schedule does not change minute to minute. The engine
+// stands aside through high-impact windows rather than trying to trade them.
+// ============================================================
+const CALENDAR_KEY = 'smc-calendar-v1';
+const CALENDAR_TTL_MS = 6 * 60 * 60 * 1000;
+let releaseCalendar = [];
+let calendarFetchedAt = 0;
+
+async function loadCalendarCache() {
+  try {
+    const raw = localStorage.getItem(CALENDAR_KEY);
+    if (!raw) return;
+    const saved = JSON.parse(raw);
+    releaseCalendar = saved.calendar || [];
+    calendarFetchedAt = saved.fetchedAt || 0;
+  } catch (e) { /* fetch fresh */ }
+}
+async function refreshCalendar(force) {
+  const fredKey = (document.getElementById('fredKeyInput') || {}).value || '';
+  if (!fredKey.trim()) return;
+  if (!force && Date.now() - calendarFetchedAt < CALENDAR_TTL_MS && releaseCalendar.length) return;
+  try {
+    const r = await fetch('/api/calendar?api_key=' + encodeURIComponent(fredKey.trim()));
+    const j = await r.json();
+    if (j.error || !Array.isArray(j.calendar)) return;
+    releaseCalendar = j.calendar;
+    calendarFetchedAt = Date.now();
+    try { localStorage.setItem(CALENDAR_KEY, JSON.stringify({ calendar: releaseCalendar, fetchedAt: calendarFetchedAt })); }
+    catch (e) { /* storage unavailable */ }
+  } catch (e) { /* the calendar is an enhancement; never block analysis on it */ }
+  renderCalendar();
+}
+function currentNewsState() {
+  return newsWindowState(releaseCalendar, Date.now(), {
+    enabled: (document.getElementById('newsBlockEnabled') || { checked: true }).checked,
+    beforeMin: parseFloat((document.getElementById('newsBeforeMin') || {}).value) || NEWS_WINDOW_DEFAULTS.beforeMin,
+    afterMin: parseFloat((document.getElementById('newsAfterMin') || {}).value) || NEWS_WINDOW_DEFAULTS.afterMin,
+    blockImpacts: ((document.getElementById('newsBlockMedium') || {}).checked) ? ['high', 'medium'] : ['high']
+  });
+}
+function renderCalendar() {
+  const banner = document.getElementById('newsBanner');
+  const list = document.getElementById('calendarList');
+  if (!banner || !list) return;
+  const st = currentNewsState();
+
+  if (st.active) {
+    const mins = Math.round(Math.abs(st.active.minutesUntil));
+    const when = st.active.phase === 'before' ? 'in ' + mins + ' min' : mins + ' min ago';
+    banner.classList.remove('hidden');
+    banner.innerHTML = (st.blocked ? '⛔ ' : '⚠️ ') + '<strong>' + st.active.name + '</strong> ' + when
+      + ' — ' + (st.blocked ? 'no new positions through this window.' : 'expect wider spreads.');
+    banner.style.background = st.blocked ? '#2a1408' : '#1c1030';
+    banner.style.borderColor = st.blocked ? '#5a3a12' : '#3a2a5a';
+    banner.style.color = st.blocked ? '#ffa726' : '#c99bff';
+  } else {
+    banner.classList.add('hidden');
+  }
+
+  if (!releaseCalendar.length) {
+    list.innerHTML = '<div class="zone-empty">No calendar loaded — needs a FRED key (the same one the correlation engine uses).</div>';
+    return;
+  }
+  const soon = releaseCalendar.filter(e => e.at > Date.now() - 6 * 3600 * 1000).slice(0, 8);
+  list.innerHTML = soon.map(e => {
+    const mins = (e.at - Date.now()) / 60000;
+    const when = mins < 0 ? Math.round(-mins) + 'm ago'
+      : mins < 90 ? 'in ' + Math.round(mins) + 'm'
+      : mins < 60 * 48 ? 'in ' + Math.round(mins / 60) + 'h'
+      : new Date(e.at).toLocaleDateString([], { month: 'short', day: 'numeric' });
+    const colour = e.impact === 'high' ? '#ef4d5f' : '#5c6270';
+    return '<div class="zone-item"><span><span style="color:' + colour + ';font-size:9px;">●</span> ' + e.name
+      + '</span><span class="mono" style="font-size:11px;color:#9298a5;">' + when + '</span></div>';
+  }).join('');
+}
+document.getElementById('refreshCalendarBtn').addEventListener('click', () => refreshCalendar(true));
+['newsBlockEnabled', 'newsBeforeMin', 'newsAfterMin', 'newsBlockMedium'].forEach(id => {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener('change', renderCalendar);
+});
+
 // ============================================================
 // PAPER TRADING ACCOUNT
 // ------------------------------------------------------------
@@ -1901,6 +2031,7 @@ function autonomyConfig() {
     backtestIntervalHours: num('aBtHours', AUTONOMY_DEFAULTS.backtestIntervalHours),
     minMetaScore: num('aMinMeta', AUTONOMY_DEFAULTS.minMetaScore),
     partialTP: partialTPConfig(),
+    newsState: currentNewsState(),
     gradeFloor: (document.getElementById('aMinGrade') || {}).value || AUTONOMY_DEFAULTS.gradeFloor
   });
 }
@@ -2048,6 +2179,12 @@ async function autonomyCycle() {
   const cfg = autonomyConfig();
   const now = Date.now();
 
+  // 0. Calendar first. It gates whether a signal may be taken at all, so it has
+  // to be current BEFORE the gate reads it — refreshing at the end of the cycle
+  // meant the first pass after a reconnect ran against an empty calendar and
+  // could take a position straight into a release window.
+  await refreshCalendar(false);
+
   // 1. Fresh candles. resyncCandles() already refreshes liveData from the provider.
   await resyncCandles();
 
@@ -2096,6 +2233,8 @@ async function autonomyCycle() {
 
   renderAnalysisQuality();
   renderDataInventory();
+  renderCalendar();
+  renderReasoning();
   autonomy.cycles++;
   autonomy.consecutiveErrors = 0;
   autonomy.lastError = null;
@@ -2253,6 +2392,7 @@ async function bootstrap() {
   await loadShadowLog();
   applyKnowledgeBaseWeights();
   await loadPaper();
+  await loadCalendarCache();
   loadAutonomyState();
   loadQuota();
   renderQuota();
@@ -2260,6 +2400,8 @@ async function bootstrap() {
   renderAnalysisQuality();
   renderPaper();
   renderDataInventory();
+  renderCalendar();
+  renderReasoning();
   refreshWorkerTotals().then(renderDataInventory);
   refreshAll();
 
@@ -2287,6 +2429,11 @@ async function bootstrap() {
       document.getElementById('autoBacktestStatus').textContent = 'Connect a data provider to enable auto-backtesting.';
     }
   }
+
+  // The calendar gates trading, so it must be loaded before autonomy's first pass.
+  await refreshCalendar(false);
+  renderCalendar();
+  renderReasoning();
 
   // Recover anything that resolved while the app was closed, then pick the loop back up.
   if (autonomy.enabled) {
