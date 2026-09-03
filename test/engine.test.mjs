@@ -1,5 +1,6 @@
 import { resolveSignal, autonomyGate, mergeSignalLogs, newlyResolvedSignals,
-  newlyArrivedOpenSignals, signalResolutionRank } from '../lib/engine.js';
+  newlyArrivedOpenSignals, signalResolutionRank, interpretConfidence, confidenceBand,
+  confidenceBands, breakevenWinRate, CONFIDENCE_PRACTICAL_MAX, CONFIDENCE_EVIDENCE } from '../lib/engine.js';
 const C=(t,o,h,l,c)=>({time:t,open:o,high:h,low:l,close:c});
 let pass=0,fail=0;
 const ok=(n,a,e)=>{ const g=JSON.stringify(a)===JSON.stringify(e); console.log((g?'PASS':'FAIL')+' '+n+(g?'':'  got='+JSON.stringify(a)+' want='+JSON.stringify(e))); g?pass++:fail++; };
@@ -663,6 +664,120 @@ ok('ranks order correctly',
   [signalResolutionRank(S('1','pending')),signalResolutionRank(S('1','open')),signalResolutionRank(S('1','won'))],
   [0,1,3]);
 ok('an unknown status ranks as unresolved', signalResolutionRank({id:'x',status:'weird'}), 0);
+
+
+// ============================================================
+// WHAT A CONFIDENCE NUMBER MEANS
+// ============================================================
+const CS = (conf, status, r) => ({
+  id: 'c' + Math.random().toString(36).slice(2), dir: 'BUY', confidence: conf, status,
+  entry: 2000, sl: 1990, tp: 1990 + 10 * (r == null ? 3 : r),
+  exitPrice: status === 'won' ? 1990 + 10 * (r == null ? 3 : r) : 1990,
+  time: T(1)
+});
+const many = (n, conf, status) => Array.from({length: n}, () => CS(conf, status));
+
+// scale: the fixed fallback before there is a record
+ok('no history falls back to fixed bands', confidenceBands([]).adaptive, false);
+ok('and uses the grade thresholds', confidenceBands([]).cuts, [30, 50]);
+ok('a low score bands low', confidenceBand(12, []).key, 'low');
+ok('a mid score bands mid', confidenceBand(40, []).key, 'mid');
+ok('a high score bands high', confidenceBand(58, []).key, 'high');
+ok('the fixed high band names the real ceiling', /49%/.test(confidenceBand(58, []).label), true);
+
+// scale: bands re-centre on what this engine actually produces
+const spread = [];
+for (let i = 0; i < 30; i++) spread.push(CS(10 + i, 'won'));
+ok('enough history switches to adaptive bands', confidenceBands(spread).adaptive, true);
+ok('adaptive bands sit inside the observed range', confidenceBands(spread).cuts[1] < 50, true);
+ok('a score near this engine\'s top bands high even though it is under 50',
+  confidenceBand(38, spread).key, 'high');
+ok('and says so in the engine\'s own terms', /this system produces/.test(confidenceBand(38, spread).label), true);
+ok('a flat distribution refuses to fake bands',
+  confidenceBands(many(30, 42, 'won')).adaptive, false);
+ok('too few signals stay on the fixed bands', confidenceBands(many(19, 42, 'won')).adaptive, false);
+
+// meaning: no record must not imply one
+const blank = interpretConfidence(45, [], { rr: 3 });
+ok('an unproven number says it is unproven', blank.evidence, 'none');
+ok('and the headline says there is no record', /No track record/.test(blank.headline), true);
+ok('and it never reports a win rate it does not have', blank.track, null);
+ok('it still explains what the number is', /not a probability/.test(blank.meaning), true);
+ok('and it names the target that makes a low win rate fine', /3\.0:1/.test(blank.meaning), true);
+
+// the breakeven has to be computed, not asserted: "a low win rate is still
+// profitable" is exactly wrong at 1:1
+ok('breakeven at 4:1 is 20%', Math.round(breakevenWinRate(4)*100), 20);
+ok('breakeven at 1:1 is 50%', breakevenWinRate(1), 0.5);
+ok('breakeven at 0.5:1 is 67%', Math.round(breakevenWinRate(0.5)*100), 67);
+ok('no target gives no breakeven', breakevenWinRate(0), null);
+ok('a generous target says a low win rate is fine',
+  /not the same as a bad system/.test(interpretConfidence(45, [], {rr:4}).meaning), true);
+ok('a 1:1 target does NOT say that',
+  /not the same as a bad system/.test(interpretConfidence(45, [], {rr:1}).meaning), false);
+ok('it says there is little room instead',
+  /little room for a low win rate/.test(interpretConfidence(45, [], {rr:1}).meaning), true);
+ok('a negative-edge target is called demanding',
+  /demanding trade/.test(interpretConfidence(45, [], {rr:0.5}).meaning), true);
+ok('an unset target says the breakeven is unknown',
+  /depends on the target/.test(interpretConfidence(45, [], {}).meaning), true);
+
+// meaning: with a record, the number carries it
+const record = [
+  ...many(12, 55, 'won'), ...many(8, 55, 'lost'),      // high band: 12/20
+  ...many(4, 20, 'won'),  ...many(16, 20, 'lost')      // low band: 4/20
+];
+const hi = interpretConfidence(55, record, { rr: 3 });
+const lo = interpretConfidence(20, record, { rr: 3 });
+ok('the high band reports its own resolved record', hi.track.n, 20);
+ok('with the right win count', hi.track.wins, 12);
+ok('and states it plainly', /won 12 of 20 \(60%\)/.test(hi.headline), true);
+
+// a win rate alone does not say whether the level makes money
+ok('a profitable band says so outright', /Net profitable at this level/.test(hi.headline), true);
+ok('a losing band says so outright', /Net losing at this level/.test(lo.headline), true);
+ok('an unproven band claims neither', /Net (profitable|losing)/.test(blank.headline), false);
+ok('the low band reports a different record', lo.track.wins, 4);
+ok('bands do not bleed into each other', hi.sampleInBand + lo.sampleInBand, 40);
+ok('the high band does not claim the low band\'s trades', hi.sampleInBand, 20);
+ok('nor the other way round', lo.sampleInBand, 20);
+ok('a 20-trade band record counts as usable evidence', hi.evidence, 'usable');
+ok('and says how far to trust it', /not enough to bet the account/.test(hi.evidenceNote), true);
+ok('a bigger band record is solid', interpretConfidence(55, many(40, 55, 'won'), {}).evidence, 'solid');
+ok('and says it is worth trusting', /worth trusting/.test(interpretConfidence(55, many(40, 55, 'won'), {}).evidenceNote), true);
+
+// meaning: does the number discriminate at all
+ok('a discriminating record is reported as informative',
+  /carrying real information/.test(hi.discriminationNote), true);
+const flat = [...many(10, 55, 'won'), ...many(10, 55, 'lost'), ...many(10, 20, 'won'), ...many(10, 20, 'lost')];
+ok('a non-discriminating record says the number buys nothing',
+  /NOT winning more often/.test(interpretConfidence(55, flat, {}).discriminationNote), true);
+const inverted = [...many(4, 55, 'won'), ...many(16, 55, 'lost'), ...many(16, 20, 'won'), ...many(4, 20, 'lost')];
+ok('an inverted record says so outright',
+  /inverted/.test(interpretConfidence(55, inverted, {}).discriminationNote), true);
+
+// evidence ladder
+ok('four trades is not evidence', interpretConfidence(55, many(4, 55, 'won'), {}).evidence, 'none');
+ok('six is thin', interpretConfidence(55, many(6, 55, 'won'), {}).evidence, 'thin');
+ok('fifteen is usable', interpretConfidence(55, many(15, 55, 'won'), {}).evidence, 'usable');
+ok('an anecdote is labelled an anecdote',
+  /anecdote/.test(interpretConfidence(55, many(6, 55, 'won'), {}).evidenceNote), true);
+
+// the ceiling is the point
+ok('the ceiling is the practical one, not 100', blank.ceiling >= CONFIDENCE_PRACTICAL_MAX, true);
+ok('a score at the ceiling reads as full', interpretConfidence(49, [], {}).ofCeiling, 1);
+ok('a score above it does not exceed full', interpretConfidence(80, [], {}).ofCeiling, 1);
+ok('half the ceiling reads as about half',
+  Math.abs(interpretConfidence(24.5, [], {}).ofCeiling - 0.5) < 0.01, true);
+
+// robustness
+ok('a missing score does not throw', interpretConfidence(undefined, [], {}).band.key, 'unknown');
+ok('and says there is no score', /No confidence score/.test(interpretConfidence(undefined, [], {}).headline), true);
+ok('a non-array log is tolerated', interpretConfidence(45, null, {}).evidence, 'none');
+ok('unresolved signals never count as a record',
+  interpretConfidence(55, many(40, 55, 'pending'), {}).sampleInBand, 0);
+ok('the evidence thresholds are ordered',
+  CONFIDENCE_EVIDENCE.thin < CONFIDENCE_EVIDENCE.usable && CONFIDENCE_EVIDENCE.usable < CONFIDENCE_EVIDENCE.solid, true);
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail?1:0);

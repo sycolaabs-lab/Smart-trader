@@ -597,6 +597,22 @@ canvas { width:100%; background:#12151c; border-radius:12px; border:1px solid #1
       <div class="dir hold" id="dirDisplay">⏸ HOLD</div>
       <div class="confidence" id="confidenceLabel">0% confidence</div>
     </div>
+    <!-- The confidence number on its own is decoration. This is what it means:
+         where it sits on the scale this engine actually reaches, and what
+         signals at this level have gone on to do. -->
+    <div id="confidenceMeaning" style="background:#0d0f14;border-radius:8px;border-left:3px solid #4f8bff;padding:9px 11px;margin-bottom:10px;">
+      <div id="confBar" style="height:5px;background:#1a1e27;border-radius:3px;overflow:hidden;margin-bottom:7px;">
+        <div id="confBarFill" style="height:100%;width:0;background:#4f8bff;border-radius:3px;transition:width .3s;"></div>
+      </div>
+      <div style="display:flex;justify-content:space-between;align-items:baseline;gap:8px;margin-bottom:5px;">
+        <span id="confBandLabel" style="font-size:11px;color:#9298a5;">—</span>
+        <span id="confEvidenceTag" class="mono" style="font-size:9px;color:#5c6270;white-space:nowrap;"></span>
+      </div>
+      <div id="confHeadline" style="font-size:12px;line-height:1.5;color:#c7cbd4;margin-bottom:5px;">Run an analysis to see what this level of confidence has meant.</div>
+      <div id="confDetail" style="font-size:10px;line-height:1.5;color:#5c6270;"></div>
+      <span class="collapse-toggle" id="confMoreToggle" style="font-size:10px;color:#4f8bff;cursor:pointer;display:inline-block;margin-top:6px;">what is this number?</span>
+      <div id="confMore" class="hidden" style="font-size:10px;line-height:1.5;color:#454a56;margin-top:6px;border-top:1px solid #1a1e27;padding-top:6px;"></div>
+    </div>
     <div class="s-grid">
       <div class="s-item"><div class="v mono" id="sEntry">-</div><div class="l" id="sEntryType">Entry</div></div>
       <div class="s-item"><div class="v mono" id="sSl">-</div><div class="l" id="sSlPips">Stop Loss</div></div>

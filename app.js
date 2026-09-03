@@ -21,7 +21,8 @@ import {
   GATE_LABELS, PARTIAL_TP_DEFAULTS, fillPaperPosition,
   NEWS_WINDOW_DEFAULTS, newsWindowState, explainMarket,
   fitMacroModel, macroModelScore, describeMacroModel, alignByDay,
-  mergeSignalLogs, newlyResolvedSignals, newlyArrivedOpenSignals
+  mergeSignalLogs, newlyResolvedSignals, newlyArrivedOpenSignals,
+  interpretConfidence, confidenceBand, CONFIDENCE_PRACTICAL_MAX
 } from './lib/engine.js';
 import { emptyKnowledge, recordObservation, assessKnowledge, detectNovelty,
   describeKnowledge, KNOWLEDGE_DEFAULTS } from './lib/knowledge.js';
@@ -372,6 +373,19 @@ function renderJournalInsights() {
   const mistakes = resolved.filter(s => s.mistake).length;
   el.innerHTML = 'By session — ' + lines.join(' · ') + (mistakes ? '<br>' + mistakes + ' loss(es) have a logged mistake note — check the log below for patterns.' : '');
 }
+// The same band reading as the signal panel, applied to the log so a column of
+// bare percentages reads as high/mid/low FOR THIS ENGINE rather than against an
+// imaginary 0-100 scale.
+function confidenceBandColour(v) {
+  const band = confidenceBand(v, signalLog);
+  return band.key === 'high' ? '#3ecf8e' : band.key === 'mid' ? '#e8c37a' : '#9298a5';
+}
+function confidenceBandTitle(v) {
+  const band = confidenceBand(v, signalLog);
+  return v + '% — ' + band.label + '. This engine\'s realistic ceiling is about '
+    + CONFIDENCE_PRACTICAL_MAX + '%, so read it against that, not against 100.';
+}
+
 const SIGNAL_ORIGIN_LABELS = {
   manual: '✋ manual',
   auto: '⚙ auto',
@@ -415,7 +429,7 @@ function renderSignalLog() {
     const stateTxt = sig.status === 'open' ? ' · filled' : sig.status === 'pending' ? ' · awaiting entry' : '';
     const originTxt = SIGNAL_ORIGIN_LABELS[sig.source] || SIGNAL_ORIGIN_LABELS.manual;
     const pos = paperPositionFor(sig.id);
-    item.innerHTML = '<span class="dirtag ' + sig.dir + '">' + sig.dir + gradeTxt + '</span><span class="mono">$' + fmt(sig.entry) + '</span><span class="mono">' + sig.confidence + '%</span><span style="color:#5c6270">' + timeTxt + sessionTxt + stateTxt + '</span>'
+    item.innerHTML = '<span class="dirtag ' + sig.dir + '">' + sig.dir + gradeTxt + '</span><span class="mono">$' + fmt(sig.entry) + '</span><span class="mono" style="color:' + confidenceBandColour(sig.confidence) + ';" title="' + confidenceBandTitle(sig.confidence) + '">' + sig.confidence + '%</span><span style="color:#5c6270">' + timeTxt + sessionTxt + stateTxt + '</span>'
       + '<span style="font-size:9px;color:#5c6270;border:1px solid #2a2f3a;border-radius:4px;padding:1px 5px;margin-left:6px;">' + originTxt + '</span>'
       + paperTagHtml(pos);
     const wrap = document.createElement('span');
@@ -668,6 +682,12 @@ document.getElementById('togglePasswordBtn').addEventListener('click', () => {
   pwInput.type = showing ? 'password' : 'text';
   btn.textContent = showing ? '👁' : '🙈';
   btn.setAttribute('aria-label', showing ? 'Show password' : 'Hide password');
+});
+const confMoreToggle = document.getElementById('confMoreToggle');
+if (confMoreToggle) confMoreToggle.addEventListener('click', () => {
+  const more = document.getElementById('confMore');
+  const hidden = more.classList.toggle('hidden');
+  confMoreToggle.textContent = hidden ? 'what is this number?' : 'hide';
 });
 document.getElementById('bgSetupToggle').addEventListener('click', () => {
   document.getElementById('bgSetupNote').classList.toggle('hidden');
@@ -1521,6 +1541,42 @@ function refreshAll() {
   resizeLiveCanvas();
 }
 
+// The confidence number, explained by the system's own record rather than left
+// as a bare percentage.
+//
+// Three things make it mean something, and none of them is the number itself:
+// where it sits on the scale this engine actually reaches (perfect five-timeframe
+// alignment tops out near 49%, so 45% is near the ceiling, not "below average"),
+// what signals at this level have gone on to do, and how much that record is
+// worth. When there is no record the panel says so instead of implying one.
+function renderConfidenceMeaning(result, plan) {
+  const box = document.getElementById('confidenceMeaning');
+  if (!box) return;
+  const ci = interpretConfidence(result.confidence, signalLog, {
+    calibration: computeCalibration(signalLog),
+    rr: plan ? plan.rr : null
+  });
+
+  const fill = document.getElementById('confBarFill');
+  const pct = ci.ofCeiling != null ? Math.round(ci.ofCeiling * 100) : 0;
+  fill.style.width = pct + '%';
+  // Colour by the band, not by the raw number — the whole point is that the raw
+  // number is read against the wrong scale.
+  fill.style.background = ci.band.key === 'high' ? '#3ecf8e' : ci.band.key === 'mid' ? '#e8c37a' : '#5c6270';
+
+  document.getElementById('confBandLabel').textContent =
+    result.confidence + '% — ' + ci.band.label + ' (' + pct + '% of this engine\'s realistic ceiling)';
+
+  const evTag = document.getElementById('confEvidenceTag');
+  const evColour = { none: '#ef4d5f', thin: '#ffa726', usable: '#e8c37a', solid: '#3ecf8e' }[ci.evidence];
+  evTag.textContent = ci.sampleInBand + ' resolved in band';
+  evTag.style.color = evColour;
+
+  document.getElementById('confHeadline').textContent = ci.headline;
+  document.getElementById('confDetail').textContent = ci.evidenceNote + ' ' + ci.discriminationNote;
+  document.getElementById('confMore').textContent = ci.meaning + ' ' + ci.scaleNote;
+}
+
 function updateSignalUI(result, plan, logIt, origin) {
   const dirDisplay = document.getElementById('dirDisplay');
   dirDisplay.className = 'dir';
@@ -1528,6 +1584,7 @@ function updateSignalUI(result, plan, logIt, origin) {
   else if (result.direction === 'SELL') { dirDisplay.classList.add('sell'); dirDisplay.innerText = '📉 SELL'; }
   else { dirDisplay.classList.add('hold'); dirDisplay.innerText = '⏸ HOLD'; }
   document.getElementById('confidenceLabel').textContent = result.confidence + '% confidence';
+  renderConfidenceMeaning(result, plan);
   document.getElementById('sEntry').innerText = '$' + fmt(plan.entry);
   document.getElementById('sSl').innerText = '$' + fmt(plan.sl);
   document.getElementById('sTp').innerText = '$' + fmt(plan.tp);

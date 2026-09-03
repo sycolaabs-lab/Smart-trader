@@ -206,6 +206,42 @@ This is a defensible design — a setup with little confluence *is* less certain
 but it means the grade bands are far tighter than they appear, and it is the
 main reason an unattended engine can run for hours taking nothing.
 
+### What the confidence number means
+
+A bare "58%" is decoration. It looks like a probability and is not one, and it
+is read against a scale that does not exist: the practical ceiling is about
+**49%**, so 45% is near the top of the range rather than below average. The
+signal panel therefore reports the number with the three things that give it
+meaning.
+
+**Where it sits.** Once 20+ signals are logged the bands are computed from the
+system's *own* distribution — bottom, middle and top third of what this engine
+actually produces — rather than from an uncalibrated 0-100. Below that the fixed
+grade thresholds stand in, and the panel says which is in use. The bar shows the
+score as a share of the realistic ceiling, not of 100.
+
+**What it has meant.** The resolved record of past signals in the same band:
+"Signals in this band have won 12 of 20 (60%) at +1.40R per trade. Net
+profitable at this level." A win rate alone cannot answer whether a level makes
+money — 20% at 4:1 is profitable, 45% at 1:1 is not — so the expectancy and the
+verdict are stated outright.
+
+**How much that is worth.** Sample size in the band, laddered: under 5 resolved
+is not evidence and the panel says the number is an opinion, not a record; 5-11
+is "an anecdote"; 12-29 is worth reading; 30+ is worth trusting. Alongside it,
+whether confidence *discriminates* at all — if high-confidence setups are not
+beating low-confidence ones, a big number is buying nothing, and the panel says
+so in those words.
+
+The explainer also states the breakeven win rate for the actual target on the
+table. That is computed, not asserted: "a low win rate is still fine" is true at
+4:1 (20% breakeven) and exactly wrong at 1:1 (50%).
+
+Signal-log rows are coloured by the same bands and carry the same reading on
+hover, so a column of bare percentages reads as high/mid/low *for this engine*.
+
+When there is no record, the panel says there is no record. It never implies one.
+
 ### The grade floor in practice
 
 At the default **B** floor:
