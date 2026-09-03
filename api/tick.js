@@ -54,6 +54,11 @@ const WORKER_DOC = 'worker';
 // the trade list without pulling the candle cache down with it.
 const PUBLIC_SIGNALS_DOC = 'workerSignals';
 const PUBLIC_SIGNAL_LIMIT = 150;
+
+function envNum(name, fallback) {
+  const v = parseFloat(process.env[name]);
+  return isFinite(v) ? v : fallback;
+}
 const TICK_DOC = 'latestTick';
 
 const DEFAULT_WEIGHTS = {
@@ -339,10 +344,19 @@ export async function runTick({ db, tdKey, fredKey, avKey }) {
     }
 
     // ---- 1. grade what the market already decided ------------------------
+    // The kill switch runs here, on the unattended side, because this is where
+    // an order actually goes stale: the browser may be closed for days while
+    // the worker keeps ticking. Overridable per deployment without a redeploy.
+    const resolveCfg = Object.assign({}, AUTONOMY_DEFAULTS, {
+      maxHoursToFill: envNum('TICK_KILL_FILL_HOURS', AUTONOMY_DEFAULTS.maxHoursToFill),
+      maxHoursOpen: envNum('TICK_KILL_OPEN_HOURS', AUTONOMY_DEFAULTS.maxHoursOpen),
+      maxDriftRToFill: envNum('TICK_KILL_DRIFT_R', AUTONOMY_DEFAULTS.maxDriftRToFill)
+    });
     let resolvedThisTick = 0;
+    let killedThisTick = 0;
     state.signalLog.forEach(sig => {
       if (sig.status !== 'pending' && sig.status !== 'open') return;
-      const verdict = resolveSignal(sig, ltf, AUTONOMY_DEFAULTS);
+      const verdict = resolveSignal(sig, ltf, resolveCfg);
       if (verdict.status === 'won' || verdict.status === 'lost') {
         const won = verdict.status === 'won';
         sig.status = verdict.status;
@@ -368,8 +382,13 @@ export async function runTick({ db, tdKey, fredKey, avKey }) {
       } else if (verdict.status === 'expired') {
         sig.status = 'expired';
         sig.expiryReason = verdict.reason || null;
+        sig.killSwitch = verdict.killSwitch || null;
         sig.resolvedAt = new Date().toISOString();
         sig.resolvedBy = 'worker';
+        // Deliberately no learning update here. An expired signal has no
+        // outcome, and manufacturing one from a stale order is exactly the
+        // contamination the kill switch exists to prevent.
+        killedThisTick++;
       } else if (verdict.status === 'open' && sig.status === 'pending') {
         sig.status = 'open';
         // The browser books the paper fill off this timestamp, so it has to be
@@ -480,6 +499,7 @@ export async function runTick({ db, tdKey, fredKey, avKey }) {
       resolvedAt: s.resolvedAt || null, resolvedBy: s.resolvedBy || null,
       exitPrice: s.exitPrice != null ? s.exitPrice : null,
       partial: !!s.partial, expiryReason: s.expiryReason || null,
+      killSwitch: s.killSwitch || null,
       // The factors and quality features are what the browser learns from, so a
       // merged trade trains the local model exactly like a locally-taken one.
       factors: s.factors || null,
@@ -506,6 +526,7 @@ export async function runTick({ db, tdKey, fredKey, avKey }) {
       metaTrained: !!(state.learningState.metaModel && state.learningState.metaModel.length),
       metaExampleCount: examples.length,
       resolvedThisTick,
+      killedThisTick,
       tookSignal,
       gateReason: gate.reason,
       gateCode: gate.code || null,

@@ -276,6 +276,57 @@ Server-side, `/api/tick` takes the same thresholds from `TICK_GRADE_FLOOR` and
 
 ---
 
+## Kill switch — stale orders are a liability, not an opportunity
+
+An order that rests for a day is not still waiting for its setup. The move it
+was placed for has already happened. When price finally comes back to that
+level it is **retesting a zone that is spent**, not offering the trade that was
+analysed — and filling it there records an outcome the system would never
+actually have taken. That is how a self-learning loop quietly poisons itself:
+not with wrong answers, but with answers to questions it never asked.
+
+Three arms, all configurable in the autonomy panel (and by environment variable
+on the worker). Set any to `0` to disable that arm.
+
+| Arm | Default | Env var | Fires when |
+|---|---|---|---|
+| Resting order | 12h | `TICK_KILL_FILL_HOURS` | A limit entry has not filled in that much **real** time |
+| Open position | 72h | `TICK_KILL_OPEN_HOURS` | A filled position has neither hit its stop nor its target |
+| Zone left behind | 1.5R | `TICK_KILL_DRIFT_R` | Price ran that much *further* from the entry without ever tagging it |
+
+### The clock is real time, not bars
+
+The old expiry counted candles, inside the candle loop. That cannot fire when no
+candle arrives — and "no candle arrives" is exactly when orders go stale: gold
+is shut all weekend, a provider stalls, an API quota runs out. Real time keeps
+passing while the bar counter is frozen, so an order could rest for days and
+still be treated as live. Elapsed time is now checked **before any candle is
+looked at**, so a weekend expires an order instead of freezing it.
+
+Replays are told apart from live automatically: if the newest candle is more
+than a week behind the wall clock, the newest candle *is* now. No live feed is
+ever that stale and no weekend comes close, so a backtest is judged by its data
+while a live order is judged by the clock. Callers that know pass `cfg.now`.
+
+### The drift arm measures the right thing
+
+A limit entry sits away from price by design — "retrace into the order block"
+starts life below the market. Measuring drift from the entry alone would cancel
+almost every order on its first bar. So the opening gap is the baseline, and
+only movement **beyond** it counts as the market leaving the zone behind.
+
+### A killed trade is not an outcome
+
+Expired signals are never training data. No win, no loss, no factor votes, no
+meta-labeler example. The paper order is **cancelled**, not closed, so no P&L is
+invented from a trade that never happened, and the freed slot stops a dead order
+blocking new signals through the `maxOpenSignals` cap.
+
+The autonomy panel shows **Killed Stale** and **Oldest Resting** — the latter
+ages each live trade against the limit that applies to it (a resting order
+against the fill limit, a filled one against the hold limit) and turns amber at
+75% of that limit, red past it. Log rows show `⊘ killed` with the reason.
+
 ## Economic release calendar
 
 The fundamental series tracked here are *published* numbers, which arrive with a

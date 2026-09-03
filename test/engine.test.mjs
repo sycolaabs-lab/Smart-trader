@@ -1,5 +1,5 @@
 import { resolveSignal, autonomyGate, mergeSignalLogs, newlyResolvedSignals,
-  newlyArrivedOpenSignals, signalResolutionRank, interpretConfidence, confidenceBand,
+  newlyArrivedOpenSignals, newlyExpiredSignals, signalResolutionRank, interpretConfidence, confidenceBand,
   confidenceBands, breakevenWinRate, CONFIDENCE_PRACTICAL_MAX, CONFIDENCE_EVIDENCE } from '../lib/engine.js';
 const C=(t,o,h,l,c)=>({time:t,open:o,high:h,low:l,close:c});
 let pass=0,fail=0;
@@ -658,6 +658,22 @@ ok('but it is not reported as newly arrived and open',
   newlyArrivedOpenSignals([], mergeSignalLogs([], [S('9','won')])).length, 0);
 ok('an expired arrival is not a resolved outcome',
   newlyResolvedSignals([], mergeSignalLogs([], [S('9','expired')])).length, 0);
+
+// a killed trade arriving from the worker has to cancel its paper order, and
+// must never be booked as an outcome
+ok('a newly killed signal is reported',
+  newlyExpiredSignals([S('1','pending')], mergeSignalLogs([S('1','pending')], [S('1','expired')])).map(s=>s.id), ['1']);
+ok('an already-expired one is not reported twice',
+  newlyExpiredSignals([S('1','expired')], mergeSignalLogs([S('1','expired')], [S('1','expired')])).length, 0);
+ok('a killed arrival that was never seen locally still counts',
+  newlyExpiredSignals([], mergeSignalLogs([], [S('9','expired')])).map(s=>s.id), ['9']);
+ok('a killed signal is not a resolved outcome',
+  newlyResolvedSignals([S('1','pending')], mergeSignalLogs([S('1','pending')], [S('1','expired')])).length, 0);
+ok('and a won one is not reported as killed',
+  newlyExpiredSignals([S('1','pending')], mergeSignalLogs([S('1','pending')], [S('1','won')])).length, 0);
+ok('the kill reason survives the merge',
+  mergeSignalLogs([S('1','pending')], [S('1','expired',{killSwitch:'stale-order'})])[0].killSwitch, 'stale-order');
+
 ok('a still-pending arrival is reported as arrived',
   newlyArrivedOpenSignals([], mergeSignalLogs([], [S('9','pending')])).map(s=>s.id), ['9']);
 ok('ranks order correctly',
@@ -778,6 +794,99 @@ ok('unresolved signals never count as a record',
   interpretConfidence(55, many(40, 55, 'pending'), {}).sampleInBand, 0);
 ok('the evidence thresholds are ordered',
   CONFIDENCE_EVIDENCE.thin < CONFIDENCE_EVIDENCE.usable && CONFIDENCE_EVIDENCE.usable < CONFIDENCE_EVIDENCE.solid, true);
+
+
+// ============================================================
+// KILL SWITCH — stale orders must not become training data
+// ============================================================
+// A resting order that sits for a day is a liability: the move it was placed
+// for has happened, and when price finally returns it is retesting a spent zone
+// rather than offering the setup that was analysed. Grading that fill teaches
+// the system from a trade it would never have taken.
+const H = 3600000;
+const NOW = Date.parse('2026-03-10T12:00:00Z');
+const ksAgo = h => NOW - h * H;
+const KS = (o) => Object.assign({ dir:'BUY', entry:2000, sl:1990, tp:2040, entryType:'limit' }, o);
+// candles that never reach the entry, timestamped as live data
+const away = (n, from) => Array.from({length:n}, (_, i) =>
+  C(from + (i+1) * 9e5, 2012, 2014, 2010, 2012));
+
+// --- the case that started this: no new bars at all -----------------------
+// The weekend. A stalled provider. A spent quota. Real time passes, no candle
+// arrives, and the old bar-counted expiry could not fire because it only ran
+// inside the candle loop.
+ok('a resting order with no new bars still expires on the clock',
+  resolveSignal(KS({time: ksAgo(20)}), [], {now: NOW}).status, 'expired');
+ok('and says the clock is why', /without filling/.test(resolveSignal(KS({time: ksAgo(20)}), [], {now: NOW}).reason), true);
+ok('it is tagged as a stale order', resolveSignal(KS({time: ksAgo(20)}), [], {now: NOW}).killSwitch, 'stale-order');
+ok('inside the window it is left alone',
+  resolveSignal(KS({time: ksAgo(3)}), [], {now: NOW}).status, 'pending');
+ok('the boundary expires', resolveSignal(KS({time: ksAgo(12)}), [], {now: NOW}).status, 'expired');
+ok('just inside it does not', resolveSignal(KS({time: ksAgo(11.9)}), [], {now: NOW}).status, 'pending');
+ok('a longer limit can be configured',
+  resolveSignal(KS({time: ksAgo(20)}), [], {now: NOW, maxHoursToFill: 48}).status, 'pending');
+ok('and the kill switch can be turned off entirely',
+  resolveSignal(KS({time: ksAgo(500)}), [], {now: NOW, maxHoursToFill: 0}).status, 'pending');
+
+// --- a filled position that never resolves --------------------------------
+ok('a position open too long is scratched',
+  resolveSignal(KS({time: ksAgo(100), entryType:'market', filledAt: new Date(ksAgo(100)).toISOString()}), [], {now: NOW}).status, 'expired');
+ok('it is tagged as a stale position',
+  resolveSignal(KS({time: ksAgo(100), entryType:'market', filledAt: new Date(ksAgo(100)).toISOString()}), [], {now: NOW}).killSwitch, 'stale-position');
+ok('a young position is left running',
+  resolveSignal(KS({time: ksAgo(4), entryType:'market'}), [], {now: NOW}).status, 'open');
+ok('a limit that filled is aged from the FILL, not the signal',
+  resolveSignal(KS({time: ksAgo(100), filledAt: new Date(ksAgo(2)).toISOString()}), [], {now: NOW}).status, 'open');
+
+// --- the move happened without us ------------------------------------------
+// Price runs away from a limit that never filled. Coming back later is a
+// retest of a zone that already did its work.
+const start = ksAgo(2);
+const ran = [C(start + 9e5, 2012, 2014, 2010, 2012), C(start + 18e5, 2014, 2060, 2013, 2058)];
+const drifted = resolveSignal(KS({time: start}), ran, {now: NOW});
+ok('price running away cancels the order', drifted.status, 'expired');
+ok('and names it a retest rather than the setup', /retest, not this setup/.test(drifted.reason), true);
+ok('tagged so the reason is machine-readable', drifted.killSwitch, 'zone-left-behind');
+
+// The baseline matters: a limit is placed away from price BY DESIGN, so the
+// opening gap must not count as drift or every limit dies on its first bar.
+const parked = [C(start + 9e5, 2030, 2032, 2028, 2030), C(start + 18e5, 2030, 2032, 2028, 2030)];
+ok('a limit resting far below price is not cancelled for being far below price',
+  resolveSignal(KS({time: start}), parked, {now: NOW}).status, 'pending');
+ok('only movement BEYOND the opening gap counts',
+  resolveSignal(KS({time: start}), parked.concat([C(start + 27e5, 2030, 2050, 2029, 2049)]), {now: NOW}).status, 'expired');
+ok('and a move that stays inside the threshold does not',
+  resolveSignal(KS({time: start}), parked.concat([C(start + 27e5, 2030, 2044, 2029, 2043)]), {now: NOW}).status, 'pending');
+ok('a SELL limit drifts the other way',
+  resolveSignal(KS({dir:'SELL', entry:2000, sl:2010, tp:1960, time: start}),
+    [C(start+9e5,1988,1990,1986,1988), C(start+18e5,1988,1989,1968,1970)], {now: NOW}).status, 'expired');
+ok('drift cancelling can be turned off',
+  resolveSignal(KS({time: start}), ran, {now: NOW, maxDriftRToFill: 0}).status, 'pending');
+ok('a fill still beats a drift cancel in the same bar',
+  resolveSignal(KS({time: start}), [C(start+9e5, 2012, 2060, 1998, 2058)], {now: NOW}).status, 'won');
+
+// --- replaying history must not trip the clock ----------------------------
+// Every backtest signal is old. If the wall clock applied there, nothing would
+// ever resolve — the whole record would read as expired.
+const oldT = Date.parse('2020-01-06T00:00:00Z');
+ok('an old signal graded against old candles is judged by the data',
+  resolveSignal(KS({time: oldT}), [C(oldT+9e5, 2000, 2045, 1998, 2040)]).status, 'won');
+ok('and an unfilled old one is still pending, not clock-expired',
+  resolveSignal(KS({time: oldT}), [C(oldT+9e5, 2012, 2014, 2010, 2012)]).status, 'pending');
+ok('an explicit clock overrides the guess',
+  resolveSignal(KS({time: oldT}), [C(oldT+9e5, 2012, 2014, 2010, 2012)], {now: oldT + 20*H}).status, 'expired');
+
+// --- an expired signal is never an outcome --------------------------------
+ok('expiry is not a win', resolveSignal(KS({time: ksAgo(20)}), [], {now: NOW}).status !== 'won', true);
+ok('expiry is not a loss', resolveSignal(KS({time: ksAgo(20)}), [], {now: NOW}).status !== 'lost', true);
+ok('and it carries no exit price to book',
+  resolveSignal(KS({time: ksAgo(20)}), [], {now: NOW}).exitPrice, undefined);
+
+// --- a missing timestamp is missing data, not an old order ----------------
+ok('a zero timestamp does not auto-expire',
+  resolveSignal(KS({time: 0}), [], {now: NOW}).status, 'pending');
+ok('nor does a garbage one',
+  resolveSignal(KS({time: 'not a date'}), [], {now: NOW}).status, 'pending');
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail?1:0);

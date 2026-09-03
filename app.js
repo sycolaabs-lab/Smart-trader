@@ -21,7 +21,7 @@ import {
   GATE_LABELS, PARTIAL_TP_DEFAULTS, fillPaperPosition,
   NEWS_WINDOW_DEFAULTS, newsWindowState, explainMarket,
   fitMacroModel, macroModelScore, describeMacroModel, alignByDay,
-  mergeSignalLogs, newlyResolvedSignals, newlyArrivedOpenSignals,
+  mergeSignalLogs, newlyResolvedSignals, newlyArrivedOpenSignals, newlyExpiredSignals,
   interpretConfidence, confidenceBand, CONFIDENCE_PRACTICAL_MAX
 } from './lib/engine.js';
 import { emptyKnowledge, recordObservation, assessKnowledge, detectNovelty,
@@ -306,6 +306,7 @@ function ingestSignals(incoming, label) {
   const merged = mergeSignalLogs(before, incoming, SIGNAL_LOG_MAX);
   const arrived = newlyArrivedOpenSignals(before, merged);
   const resolved = newlyResolvedSignals(before, merged);
+  const expired = newlyExpiredSignals(before, merged);
   const beforeById = new Map(before.map(s => [s.id, s]));
   signalLog = merged;
 
@@ -320,6 +321,11 @@ function ingestSignals(incoming, label) {
     if (was && was.status === 'pending') paperFillForSignal(sig.id, sig.filledAt || new Date().toISOString());
   });
 
+  // Killed by the worker: cancel the paper order. An expired signal has no
+  // outcome, so this closes the position without booking a win or a loss, and
+  // stops a dead order holding a slot the gate counts against new signals.
+  expired.forEach(sig => paperCloseForSignal(sig.id, 'expired'));
+
   resolved.forEach(sig => {
     // Taken and graded entirely between two merges — the position never existed
     // here. Open it so the account books the trade, then close it. Sizing uses
@@ -333,7 +339,7 @@ function ingestSignals(incoming, label) {
     learnFromResolvedSignal(sig);
   });
 
-  const changed = arrived.length || resolved.length || merged.length !== before.length;
+  const changed = arrived.length || resolved.length || expired.length || merged.length !== before.length;
   if (changed) {
     saveSignalLog();
     renderSignalLog();
@@ -342,11 +348,14 @@ function ingestSignals(incoming, label) {
     renderDataInventory();
     renderAutonomyStats();
   }
-  if ((arrived.length || resolved.length) && label) {
-    setWorkerLogNote(label + ': ' + (arrived.length ? arrived.length + ' new trade(s) ' : '') +
-      (resolved.length ? (arrived.length ? 'and ' : '') + resolved.length + ' resolved' : '') + '.');
+  if ((arrived.length || resolved.length || expired.length) && label) {
+    const parts = [];
+    if (arrived.length) parts.push(arrived.length + ' new trade(s)');
+    if (resolved.length) parts.push(resolved.length + ' resolved');
+    if (expired.length) parts.push(expired.length + ' killed as stale');
+    setWorkerLogNote(label + ': ' + parts.join(', ') + '.');
   }
-  return arrived.length + resolved.length;
+  return arrived.length + resolved.length + expired.length;
 }
 
 function setWorkerLogNote(text) {
@@ -459,7 +468,10 @@ function renderSignalLog() {
       tag.style.cssText = 'font-size:10px;margin-left:6px;color:' + colour + ';';
       const auto = sig.resolvedBy === 'worker' ? ' (worker)' : sig.resolvedBy === 'auto' ? ' (auto)' : '';
       if (sig.status === 'won') tag.textContent = '✓ won' + (sig.partial ? ' (partial)' : '') + auto;
-      else if (sig.status === 'expired') tag.textContent = '– expired' + (sig.expiryReason ? ' · ' + sig.expiryReason : '');
+      else if (sig.status === 'expired') {
+        tag.textContent = (sig.killSwitch ? '⊘ killed' : '– expired') + (sig.expiryReason ? ' · ' + sig.expiryReason : '');
+        tag.title = 'Not counted as a win or a loss. An expired trade has no outcome, so it is never used as training data.';
+      }
       else tag.textContent = '✗ lost' + auto + (sig.mistake ? ' — ' + sig.mistake : '');
       wrap.appendChild(tag);
     }
@@ -2599,6 +2611,11 @@ function autonomyConfig() {
     analysisIntervalMinutes: num('aInterval', AUTONOMY_DEFAULTS.analysisIntervalMinutes),
     backtestIntervalHours: num('aBtHours', AUTONOMY_DEFAULTS.backtestIntervalHours),
     minMetaScore: num('aMinMeta', AUTONOMY_DEFAULTS.minMetaScore),
+    // Kill switch. 0 in any field disables that arm rather than expiring
+    // everything instantly, which is what a 0 limit would otherwise mean.
+    maxHoursToFill: num('aKillFill', AUTONOMY_DEFAULTS.maxHoursToFill),
+    maxHoursOpen: num('aKillOpen', AUTONOMY_DEFAULTS.maxHoursOpen),
+    maxDriftRToFill: num('aKillDrift', AUTONOMY_DEFAULTS.maxDriftRToFill),
     partialTP: partialTPConfig(),
     newsState: currentNewsState(),
     gradeFloor: (document.getElementById('aMinGrade') || {}).value || AUTONOMY_DEFAULTS.gradeFloor
@@ -2619,6 +2636,9 @@ function saveAutonomyState() {
       cfg: {
         aMinConf: document.getElementById('aMinConf').value,
         aCooldown: document.getElementById('aCooldown').value,
+        aKillFill: document.getElementById('aKillFill').value,
+        aKillOpen: document.getElementById('aKillOpen').value,
+        aKillDrift: document.getElementById('aKillDrift').value,
         aMaxOpen: document.getElementById('aMaxOpen').value,
         aInterval: document.getElementById('aInterval').value,
         aBtHours: document.getElementById('aBtHours').value,
@@ -2670,11 +2690,45 @@ function setAutonomyStatus(text, tone, reason) {
 }
 
 function renderAutonomyStats() {
-  const open = signalLog.filter(s => s.status === 'pending' || s.status === 'open').length;
+  const live = signalLog.filter(s => s.status === 'pending' || s.status === 'open');
   document.getElementById('aCycles').textContent = autonomy.cycles;
   document.getElementById('aSignals').textContent = autonomy.signalsTaken;
   document.getElementById('aResolved').textContent = autonomy.autoResolved;
-  document.getElementById('aOpen').textContent = open;
+  document.getElementById('aOpen').textContent = live.length;
+
+  const killedEl = document.getElementById('aKilled');
+  if (killedEl) killedEl.textContent = signalLog.filter(s => s.status === 'expired').length;
+
+  // How long the oldest live trade has been sitting. This is the number that
+  // was invisible before: an order resting for a day looked identical to one
+  // placed a minute ago.
+  const oldestEl = document.getElementById('aOldest');
+  if (oldestEl) {
+    const cfg = autonomyConfig();
+    // Each trade is aged against the limit that actually applies to it: a
+    // resting order against the fill limit, a filled one against the hold
+    // limit. Using the larger of the two would leave an order 2.5x past its own
+    // deadline showing no warning at all.
+    const ages = live.map(s => {
+      const filled = s.status === 'open';
+      const t = Date.parse(filled ? (s.filledAt || s.time) : s.time);
+      if (!isFinite(t)) return null;
+      const hours = (Date.now() - t) / 3600000;
+      const limit = filled ? cfg.maxHoursOpen : cfg.maxHoursToFill;
+      return { hours, ratio: limit > 0 ? hours / limit : 0 };
+    }).filter(v => v != null);
+    if (!ages.length) {
+      oldestEl.textContent = '—';
+      oldestEl.style.color = '';
+    } else {
+      const worst = ages.reduce((a, b) => b.hours > a.hours ? b : a, ages[0]);
+      const closest = ages.reduce((a, b) => b.ratio > a.ratio ? b : a, ages[0]);
+      oldestEl.textContent = worst.hours < 1 ? Math.round(worst.hours * 60) + 'm' : worst.hours.toFixed(1) + 'h';
+      // Amber as a trade approaches its own kill limit, red once past it, so
+      // one about to be culled is visible before it disappears.
+      oldestEl.style.color = closest.ratio >= 1 ? '#ef4d5f' : closest.ratio >= 0.75 ? '#ffa726' : '';
+    }
+  }
 
   const el = document.getElementById('gateTally');
   if (!el) return;
@@ -2693,7 +2747,7 @@ function renderAutonomyStats() {
 // Returns how many signals reached a win/loss verdict.
 function resolveOpenSignals(candles, cfg) {
   if (!candles || candles.length < 2) return 0;
-  let resolved = 0, changed = false;
+  let resolved = 0, killed = 0, changed = false;
   signalLog.forEach(sig => {
     if (sig.status !== 'pending' && sig.status !== 'open') return;
     const verdict = resolveSignal(sig, candles, cfg);
@@ -2704,9 +2758,11 @@ function resolveOpenSignals(candles, cfg) {
     } else if (verdict.status === 'expired') {
       sig.status = 'expired';
       sig.expiryReason = verdict.reason || null;
+      sig.killSwitch = verdict.killSwitch || null;
       sig.resolvedAt = new Date().toISOString();
       sig.resolvedBy = 'auto';
       paperCloseForSignal(sig.id, 'expired');
+      if (verdict.killSwitch) killed++;
       changed = true; // expired signals never become training data — no outcome to learn from
     } else if (verdict.status === 'open' && sig.status === 'pending') {
       sig.status = 'open'; // limit entry got tagged; it's a live position now
@@ -2717,6 +2773,7 @@ function resolveOpenSignals(candles, cfg) {
   });
   if (changed) { saveSignalLog(); renderSignalLog(); }
   if (resolved) autonomy.autoResolved += resolved;
+  if (killed) autonomy.killed = (autonomy.killed || 0) + killed;
   resolveShadowSignals(candles, cfg);
   return resolved;
 }
@@ -2941,8 +2998,10 @@ document.getElementById('aPresetCollect').addEventListener('click', () => {
 document.getElementById('autonomyAdvancedToggle').addEventListener('click', () => {
   document.getElementById('autonomyAdvanced').classList.toggle('hidden');
 });
-['aMinConf', 'aCooldown', 'aMaxOpen', 'aInterval', 'aBtHours', 'aMinMeta', 'aDailyCap', 'aMinGrade'].forEach(id => {
-  document.getElementById(id).addEventListener('change', () => { saveAutonomyState(); renderQuota(); });
+['aMinConf', 'aCooldown', 'aMaxOpen', 'aInterval', 'aBtHours', 'aMinMeta', 'aDailyCap', 'aMinGrade',
+ 'aKillFill', 'aKillOpen', 'aKillDrift'].forEach(id => {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener('change', () => { saveAutonomyState(); renderQuota(); });
 });
 
 // React to connectivity changes straight away rather than waiting out a heartbeat.

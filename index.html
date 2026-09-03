@@ -220,9 +220,22 @@ canvas { width:100%; background:#12151c; border-radius:12px; border:1px solid #1
       <div class="card"><div class="label">Signals Taken</div><div class="value mono" id="aSignals">0</div></div>
       <div class="card"><div class="label">Self-Graded</div><div class="value mono" id="aResolved">0</div></div>
       <div class="card"><div class="label">Open</div><div class="value mono" id="aOpen">0</div></div>
+      <div class="card"><div class="label">Killed Stale</div><div class="value mono" id="aKilled">0</div></div>
+      <div class="card"><div class="label">Oldest Resting</div><div class="value mono" id="aOldest">—</div></div>
     </div>
 
     <div id="gateTally"></div>
+    <div class="conn-note" style="margin-top:9px;">
+      <strong style="color:#ffa726;">Kill switch.</strong> An order that rests too long is a liability, not an
+      opportunity: the move it was placed for has already happened, and when price finally returns it is
+      retesting a zone that is spent rather than offering the setup that was analysed. Filling it there would
+      teach the system from a trade it would never have taken. So a resting order is cancelled after
+      <strong>12h</strong>, a position that never resolves is scratched after <strong>72h</strong>, and either
+      is killed early if price runs <strong>1.5R</strong> further from the entry without tagging it. The clock
+      runs on real time, so a weekend or a stalled data feed expires an order rather than freezing it.
+      Killed trades are logged with the reason and are never counted as a win or a loss — set any field to 0 to
+      disable that arm.
+    </div>
 
     <div class="data-source-note" id="quotaReadout" style="margin-top:9px;margin-bottom:0;">API budget: not connected yet.</div>
 
@@ -235,6 +248,9 @@ canvas { width:100%; background:#12151c; border-radius:12px; border:1px solid #1
         <div class="field"><label>Re-backtest every (h)</label><input type="number" id="aBtHours" value="4" min="1" step="1"></div>
         <div class="field"><label>Meta-score floor</label><input type="number" id="aMinMeta" value="-0.25" step="0.05"></div>
         <div class="field"><label>Daily API credit cap</label><input type="number" id="aDailyCap" value="500" min="50" step="50"></div>
+        <div class="field"><label>Kill resting order (h)</label><input type="number" id="aKillFill" value="12" min="0" step="1"></div>
+        <div class="field"><label>Kill open position (h)</label><input type="number" id="aKillOpen" value="72" min="0" step="1"></div>
+        <div class="field"><label>Kill if price runs (R)</label><input type="number" id="aKillDrift" value="1.5" min="0" step="0.25"></div>
         <div class="field"><label>Minimum grade</label>
           <select id="aMinGrade" style="width:100%;background:#0d0f14;border:1px solid #262a35;color:#e8c37a;padding:7px 8px;border-radius:6px;font-size:12px;">
             <option value="A">A and above — very selective</option>
