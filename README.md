@@ -556,6 +556,23 @@ drawdown. It is the difference between *"62% of signals won"* and *"this would
 have been up 4.3% with an 11% drawdown"*, and only the second tells you whether
 the analysis is worth anything.
 
+### Turning it on for a hand-made trade
+
+The paper panel's switch is the account's master on/off. The **signal panel**
+carries its own toggle — *"Paper-trade the signals I generate here"* — because
+generating a trade by hand should not require going to another panel first.
+
+* Ticking it while the account is off **switches the account on**, and the hint
+  under it says so before you click. A toggle that silently did nothing would
+  read as broken.
+* Unticking it excludes only hand-made signals. Autonomous and worker trades
+  keep opening positions, so turning off your own experiments never silences the
+  unattended account.
+* Either way the signal is still logged, graded and learned from. The toggle
+  decides whether money is simulated against it, not whether it counts.
+
+The choice persists, and the paper panel's status line says which mode it is in.
+
 ### A resting order is not a position
 
 Most plans the engine produces are a **limit** entry — "retrace into order

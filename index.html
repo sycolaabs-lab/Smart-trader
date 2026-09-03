@@ -619,6 +619,13 @@ canvas { width:100%; background:#12151c; border-radius:12px; border:1px solid #1
       <div class="s-item"><div class="v mono" id="sTp">-</div><div class="l" id="sTpPips">Take Profit</div></div>
       <div class="s-item"><div class="v mono" id="sRr">-</div><div class="l">R:R</div></div>
     </div>
+    <!-- Generating a trade by hand should not force a choice made in another
+         panel. This decides whether the signals YOU generate open a paper
+         position; autonomous ones follow the paper panel's own switch. -->
+    <label style="display:flex;align-items:center;gap:8px;font-size:11px;color:#9298a5;cursor:pointer;background:#0d0f14;border-radius:8px;padding:8px 10px;margin-bottom:10px;">
+      <input type="checkbox" id="paperManual" checked style="accent-color:#3ecf8e;transform:scale(1.15);">
+      <span>Paper-trade the signals I generate here<span id="paperManualHint" style="color:#454a56;"></span></span>
+    </label>
     <div class="reason" id="sReason">Press "Generate" to run the full multi-timeframe analysis.</div>
     <div id="metaLabelerBox" class="hidden" style="margin-bottom:10px;">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
