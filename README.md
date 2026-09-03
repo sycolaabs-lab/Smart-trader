@@ -364,6 +364,30 @@ drawdown. It is the difference between *"62% of signals won"* and *"this would
 have been up 4.3% with an 11% drawdown"*, and only the second tells you whether
 the analysis is worth anything.
 
+### A resting order is not a position
+
+Most plans the engine produces are a **limit** entry — "retrace into order
+block" — not a market fill. Such an order has no exposure until price reaches
+the level, so it cannot have a profit or a loss.
+
+Positions therefore mirror the signal's own fill state:
+
+| State | Meaning | Floating P&L |
+|---|---|---|
+| `pending` | limit order resting, price hasn't reached it | **none** |
+| `open` | filled, carrying exposure | live |
+| `closed` | hit target, partial or stop | realised |
+| `cancelled` | expired without ever filling | **exactly zero** |
+
+An unfilled order that expires is **cancelled**, never booked at the current
+mark — inventing a result from a trade that never existed is worse than
+recording nothing. Resting orders still occupy a slot against the concurrency
+cap, since a live order commits you.
+
+A signal with no `entryType` is treated as a limit, matching `resolveSignal`'s
+own default. Assuming "market" would re-create the phantom-P&L bug for any
+record predating the field.
+
 When enabled, every signal the engine logs opens a position sized so that being
 stopped out costs exactly your configured risk percentage of the current
 balance. The account compounds as it goes, so drawdown means something. The

@@ -18,7 +18,7 @@ import {
   computeConditionBreakdown, computeGateAudit, dataInventory, utcDayKey, rollQuota,
   canSpend, spendQuota, quotaSummary, criticalReserveFor, PAPER_DEFAULTS,
   openPaperPosition, closePaperPosition, unrealisedPnl, paperAccountSummary,
-  GATE_LABELS, PARTIAL_TP_DEFAULTS
+  GATE_LABELS, PARTIAL_TP_DEFAULTS, fillPaperPosition
 } from './lib/engine.js';
 
 const LEARNING_KEY = 'smc-factor-stats-v1';
@@ -1675,9 +1675,21 @@ function paperOpenForSignal(sig) {
 }
 function paperCloseForSignal(signalId, outcome, atPrice) {
   if (!paper.positions.length) return;
-  const idx = paper.positions.findIndex(p => p.signalId === signalId && p.status === 'open');
+  // Pending too: an unfilled order still has to be cancelled, or it lingers
+  // forever as a slot nothing can ever close.
+  const idx = paper.positions.findIndex(p => p.signalId === signalId && (p.status === 'open' || p.status === 'pending'));
   if (idx === -1) return;
   paper.positions[idx] = closePaperPosition(paper.positions[idx], outcome, currentMarkPrice(), paperConfig(), atPrice);
+  savePaper();
+  renderPaper();
+}
+
+// The signal's limit entry was tagged — the resting order is now a position.
+function paperFillForSignal(signalId, atTime) {
+  if (!paper.positions.length) return;
+  const idx = paper.positions.findIndex(p => p.signalId === signalId && p.status === 'pending');
+  if (idx === -1) return;
+  paper.positions[idx] = fillPaperPosition(paper.positions[idx], atTime);
   savePaper();
   renderPaper();
 }
@@ -1699,7 +1711,7 @@ function renderPaper() {
     + '<div class="card"><div class="label">Equity</div><div class="value mono ' + pnlCls(a.equity - a.startingBalance) + '">' + money(a.equity) + '</div></div>'
     + '<div class="card"><div class="label">Return</div><div class="value mono ' + pnlCls(a.returnPct) + '">' + (a.returnPct >= 0 ? '+' : '') + a.returnPct.toFixed(2) + '%</div></div>'
     + '<div class="card"><div class="label">Max DD</div><div class="value mono">' + (a.maxDrawdown * 100).toFixed(1) + '%</div></div>'
-    + '<div class="card"><div class="label">Open</div><div class="value mono">' + a.openCount + '</div></div>'
+    + '<div class="card"><div class="label">Open</div><div class="value mono">' + a.openCount + (a.pendingCount ? ' <span style="font-size:10px;color:#5c6270;">+' + a.pendingCount + ' resting</span>' : '') + '</div></div>'
     + '</div>';
 
   html += '<div class="zone-item"><span>Balance (realised)</span><span class="mono ' + pnlCls(a.realised) + '">' + money(a.balance) + ' <span style="color:#454a56;">(' + (a.realised >= 0 ? '+' : '') + money(a.realised).replace('$','$') + ')</span></span></div>';
@@ -1707,6 +1719,14 @@ function renderPaper() {
   html += '<div class="zone-item"><span>Closed trades</span><span class="mono">' + a.closedCount + (a.winRate != null ? ' · ' + (a.winRate * 100).toFixed(0) + '% won' : '') + '</span></div>';
   if (a.profitFactor != null) html += '<div class="zone-item"><span>Profit factor</span><span class="mono ' + pnlCls(a.profitFactor - 1) + '">' + (a.profitFactor === Infinity ? '∞' : a.profitFactor.toFixed(2)) + '</span></div>';
   if (a.avgR != null) html += '<div class="zone-item"><span>Average R per trade</span><span class="mono ' + pnlCls(a.avgR) + '">' + (a.avgR >= 0 ? '+' : '') + a.avgR.toFixed(2) + 'R</span></div>';
+
+  const resting = paper.positions.filter(p => p.status === 'pending');
+  if (resting.length) {
+    html += '<div style="font-size:10px;color:#454a56;margin:10px 0 6px;">Awaiting entry (no exposure yet)</div>';
+    html += resting.map(p =>
+      '<div class="zone-item"><span><span class="dirtag ' + p.dir + '">' + p.dir + '</span> limit @ $' + fmt(p.requestedEntry)
+      + '</span><span class="mono" style="color:#5c6270;">not filled</span></div>').join('');
+  }
 
   const open = paper.positions.filter(p => p.status === 'open');
   if (open.length) {
@@ -1990,6 +2010,8 @@ function resolveOpenSignals(candles, cfg) {
       changed = true; // expired signals never become training data — no outcome to learn from
     } else if (verdict.status === 'open' && sig.status === 'pending') {
       sig.status = 'open'; // limit entry got tagged; it's a live position now
+      sig.filledAt = new Date().toISOString();
+      paperFillForSignal(sig.id, sig.filledAt);
       changed = true;
     }
   });

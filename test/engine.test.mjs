@@ -172,7 +172,7 @@ ok('risk amount is 1% of balance', sz.riskAmount, 100);
 ok('units sized off stop distance', near(sz.units, 10), true);
 ok('zero-width stop refuses to size', paperPositionSize(10000,1,2000,2000), null);
 
-const sigBuy = { id:'s1', dir:'BUY', entry:2000, sl:1990, tp:2040, time:'2026-01-01T00:00:00Z' };
+const sigBuy = { id:'s1', dir:'BUY', entry:2000, sl:1990, tp:2040, entryType:'market', time:'2026-01-01T00:00:00Z' };
 const acct = { balance:10000, positions:[] };
 const pos = openPaperPosition(sigBuy, acct, PCFG);
 ok('entry filled worse than requested', pos.entryFill > pos.requestedEntry, true);
@@ -362,6 +362,59 @@ ok('paper books the partial exit price', partialClose.exitPrice, 2020);
 ok('partial pays less than the full target', partialClose.pnl < fullClose.pnl, true);
 ok('paper flags the partial', partialClose.partial, true);
 ok('full target is not flagged', !!fullClose.partial, false);
+
+
+// ---------------- resting orders have no exposure ----------------
+// Reported live: gold at 4415, a BUY signal with a LIMIT entry at 4405, and the
+// paper account immediately showed ~$51 of floating profit on a trade price had
+// never reached. openPaperPosition hardcoded status 'open' and ignored entryType.
+import { fillPaperPosition } from '../lib/engine.js';
+console.log('\n-- resting orders --');
+const RCFG = { startingBalance:10000, riskPercent:1, spreadPips:3, slippagePips:1, maxConcurrent:3 };
+const limitSig  = { id:'L1', dir:'BUY', entry:4405, sl:4385, tp:4465, entryType:'limit — retrace into order block', time:'2026-01-01T00:00:00Z' };
+const marketSig = { id:'M1', dir:'BUY', entry:4405, sl:4385, tp:4465, entryType:'market', time:'2026-01-01T00:00:00Z' };
+const acctR = { balance:10000, positions:[] };
+
+const limPos = openPaperPosition(limitSig, acctR, RCFG);
+const mktPos = openPaperPosition(marketSig, acctR, RCFG);
+ok('limit entry starts pending', limPos.status, 'pending');
+ok('market entry starts open', mktPos.status, 'open');
+ok('pending has no fill time', limPos.filledAt, null);
+ok('market records a fill time', typeof mktPos.filledAt, 'string');
+
+// the exact reported symptom
+ok('resting order shows NO floating P&L at 4415', unrealisedPnl(limPos, 4415), 0);
+ok('a filled market position does show P&L', unrealisedPnl(mktPos, 4415) > 0, true);
+
+// filling starts exposure
+const filled = fillPaperPosition(limPos, '2026-01-01T02:00:00Z');
+ok('filling opens the position', filled.status, 'open');
+ok('exposure begins only after the fill', unrealisedPnl(filled, 4415) > 0, true);
+ok('filling records when', filled.filledAt, '2026-01-01T02:00:00Z');
+ok('filling an already-open position is a no-op', fillPaperPosition(mktPos,'x').filledAt, mktPos.filledAt);
+
+// an unfilled order is cancelled, never booked
+const cancelled = closePaperPosition(limPos, 'expired', 4415, RCFG);
+ok('unfilled order is cancelled', cancelled.status, 'cancelled');
+ok('cancelled has exactly zero P&L', cancelled.pnl, 0);
+ok('cancelled has no exit price', cancelled.exitPrice, null);
+ok('cancelled has no R', cancelled.rMultiple, null);
+
+// account summary separates the two
+const sumR = paperAccountSummary([limPos, mktPos], 10000, 4415);
+ok('open counts only filled positions', sumR.openCount, 1);
+ok('pending counted separately', sumR.pendingCount, 1);
+ok('floating P&L excludes the resting order', Math.abs(sumR.floating - unrealisedPnl(mktPos, 4415)) < 1e-9, true);
+
+// a resting order still occupies a slot
+const full = { balance:10000, positions:[{status:'pending'},{status:'pending'},{status:'open'}] };
+ok('resting orders count toward the cap', openPaperPosition(marketSig, full, RCFG), null);
+
+// A signal with no entryType is treated as a limit, matching resolveSignal's
+// own default. Assuming 'market' would re-create the phantom-P&L bug for any
+// legacy record that predates the field.
+ok('missing entryType defaults to pending', openPaperPosition({...limitSig, entryType:undefined}, acctR, RCFG).status, 'pending');
+ok('resolveSignal agrees on that default', resolveSignal({...limitSig, entryType:undefined, time:0}, []).status, 'pending');
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail?1:0);
