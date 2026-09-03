@@ -40,7 +40,12 @@ async function loadLearningState() {
       if (!parsed.patterns) parsed.patterns = {};
       if (!parsed.metaExamples) parsed.metaExamples = [];
       if (parsed.metaModel === undefined) parsed.metaModel = null;
-      learningState = parsed;
+      learningState = asPlainObject(parsed);
+      learningState.factors = asPlainObject(learningState.factors);
+      learningState.patterns = asPlainObject(learningState.patterns);
+      learningState.metaExamples = asObjectArray(learningState.metaExamples, ['features']);
+      if (!Array.isArray(learningState.metaModel)) learningState.metaModel = null;
+      if (!isFinite(learningState.totalLogged)) learningState.totalLogged = 0;
       setMetaModel(learningState.metaModel);
     }
   } catch (e) { /* nothing stored yet */ }
@@ -49,7 +54,7 @@ async function loadLearningState() {
 }
 async function saveLearningState() {
   try { localStorage.setItem(LEARNING_KEY, JSON.stringify(learningState)); } catch (e) { /* storage unavailable */ }
-  if (fbReady && fbAuth.currentUser) pushCloudState(fbAuth.currentUser.uid);
+  if (fbReady && fbAuth.currentUser) schedulePushCloudState(fbAuth.currentUser.uid);
 }
 function recordOutcome(dir, factors, won) {
   const dirSign = dir === 'BUY' ? 1 : -1;
@@ -152,7 +157,7 @@ let shadowLog = [];
 async function loadShadowLog() {
   try {
     const raw = localStorage.getItem(SHADOW_LOG_KEY);
-    if (raw) shadowLog = JSON.parse(raw);
+    if (raw) shadowLog = asObjectArray(JSON.parse(raw), ['id']);
   } catch (e) { shadowLog = []; }
 }
 async function saveShadowLog() {
@@ -184,7 +189,7 @@ function addShadowSignal(result, plan, declineReason) {
 async function loadSignalLog() {
   try {
     const raw = localStorage.getItem(SIGNAL_LOG_KEY);
-    if (raw) signalLog = JSON.parse(raw);
+    if (raw) signalLog = asObjectArray(JSON.parse(raw), ['id']);
   } catch (e) { signalLog = []; }
   renderSignalLog();
 }
@@ -196,7 +201,7 @@ const SIGNAL_LOG_MAX = 600;
 async function saveSignalLog() {
   if (signalLog.length > SIGNAL_LOG_MAX) signalLog = signalLog.slice(0, SIGNAL_LOG_MAX);
   try { localStorage.setItem(SIGNAL_LOG_KEY, JSON.stringify(signalLog)); } catch (e) { /* storage unavailable */ }
-  if (fbReady && fbAuth.currentUser) pushCloudState(fbAuth.currentUser.uid);
+  if (fbReady && fbAuth.currentUser) schedulePushCloudState(fbAuth.currentUser.uid);
 }
 function addSignalToLog(result, plan) {
   const sig = {
@@ -365,9 +370,59 @@ async function pullCloudState(uid) {
     }
   } catch (e) { console.warn('Cloud pull failed:', e.message); }
 }
+// Cloud sync is debounced, trimmed, and reports its own failures.
+//
+// It used to fire on every saveSignalLog() AND every saveLearningState(), so
+// resolving ten signals during catch-up produced eleven full-document writes in
+// a burst. Each carried the whole log — around 530KB against Firestore's hard
+// 1MB per-document ceiling — and a failure was a console.warn nobody would ever
+// read. Cross-device learning could stop permanently and look exactly like
+// working.
+let cloudPushTimer = null;
+let cloudPushPending = false;
+
+function schedulePushCloudState(uid) {
+  cloudPushPending = true;
+  if (cloudPushTimer) clearTimeout(cloudPushTimer);
+  cloudPushTimer = setTimeout(() => { cloudPushTimer = null; pushCloudState(uid); }, 3000);
+}
+
+// The reason text is a rendered sentence, regenerable from the signal's own
+// fields, and it is roughly 40% of the payload. It stays local and is stripped
+// from what goes to the cloud.
+function cloudPayload() {
+  return {
+    learningState,
+    signalLog: signalLog.map(({ reason, ...rest }) => rest),
+    updatedAt: Date.now()
+  };
+}
+
+function setSyncNote(text, isError) {
+  const el = document.getElementById('syncStatus');
+  if (!el) return;
+  el.textContent = text;
+  el.style.color = isError ? '#ef4d5f' : '';
+}
+
 async function pushCloudState(uid) {
-  try { await fbDb.collection('users').doc(uid).set({ learningState, signalLog, updatedAt: Date.now() }, { merge: true }); }
-  catch (e) { console.warn('Cloud push failed:', e.message); }
+  cloudPushPending = false;
+  const payload = cloudPayload();
+  const bytes = JSON.stringify(payload).length;
+  // Firestore rejects documents over 1MB outright. Refusing early with a
+  // visible message beats a rejected write that only reaches the console.
+  if (bytes > 900000) {
+    setSyncNote('Cloud sync paused — local history is ' + Math.round(bytes / 1024)
+      + 'KB, near Firestore\'s 1MB document limit. Learning continues on this device.', true);
+    return;
+  }
+  try {
+    await fbDb.collection('users').doc(uid).set(payload, { merge: true });
+    const user = fbAuth && fbAuth.currentUser;
+    if (user) setSyncNote('Synced as ' + user.email + ' · ' + Math.round(bytes / 1024) + 'KB', false);
+  } catch (e) {
+    setSyncNote('Cloud sync failed: ' + (e && e.message ? e.message : 'unknown') + ' — learning continues locally.', true);
+  }
 }
 
 if (fbReady) {
@@ -1626,6 +1681,23 @@ document.getElementById('dataRefresh').addEventListener('click', async () => {
 
 
 
+
+// Persisted state is not trustworthy input. It is written by older versions of
+// this app, survives partial writes, and can be edited by hand. A stored value
+// that is an object where an array is expected, or an array containing nulls,
+// used to throw deep inside a render — "signalLog.filter is not a function" —
+// and take a panel down with it. Every load goes through here instead.
+function asObjectArray(value, requiredKeys) {
+  if (!Array.isArray(value)) return [];
+  return value.filter(v => {
+    if (!v || typeof v !== 'object') return false;
+    return !requiredKeys || requiredKeys.every(k => v[k] !== undefined);
+  });
+}
+function asPlainObject(value) {
+  return (value && typeof value === 'object' && !Array.isArray(value)) ? value : {};
+}
+
 // ============================================================
 // INDEPENDENT AUDITOR PANEL
 // ------------------------------------------------------------
@@ -1700,9 +1772,13 @@ let noveltyState = null;
 async function loadKnowledge() {
   try {
     const raw = localStorage.getItem(KNOWLEDGE_KEY);
-    if (raw) knowledge = JSON.parse(raw);
+    if (raw) knowledge = asPlainObject(JSON.parse(raw));
   } catch (e) { knowledge = emptyKnowledge(); }
-  if (!knowledge || !knowledge.rows) knowledge = emptyKnowledge();
+  if (!knowledge || !Array.isArray(knowledge.rows)) knowledge = emptyKnowledge();
+  // Rows drive regression maths; a null or a non-finite value poisons a whole fit.
+  knowledge.rows = asObjectArray(knowledge.rows, ['day', 'gold'])
+    .filter(r => isFinite(r.day) && isFinite(r.gold) && r.drivers && typeof r.drivers === 'object');
+  knowledge.firstSeen = asPlainObject(knowledge.firstSeen);
 }
 async function saveKnowledge() {
   try { localStorage.setItem(KNOWLEDGE_KEY, JSON.stringify(knowledge)); }
@@ -1982,8 +2058,10 @@ function partialTPConfig() {
 async function loadPaper() {
   try {
     const raw = localStorage.getItem(PAPER_KEY);
-    if (raw) paper = Object.assign(paper, JSON.parse(raw));
+    if (raw) paper = Object.assign(paper, asPlainObject(JSON.parse(raw)));
   } catch (e) { /* fresh account */ }
+  paper.positions = asObjectArray(paper.positions, ['id']);
+  if (!isFinite(paper.startingBalance)) paper.startingBalance = PAPER_DEFAULTS.startingBalance;
   const cb = document.getElementById('paperEnabled');
   if (cb) cb.checked = !!paper.enabled;
 }

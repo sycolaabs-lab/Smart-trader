@@ -142,6 +142,13 @@ ok('still reports a direction', ['BUY','SELL','HOLD'].includes(slowTick.directio
 ok('latestTick was actually written', typeof db._docs.latestTick.time, 'number');
 ok('reports which macro work was skipped', Array.isArray(slowTick.macroSkipped), true);
 
+// --- the worker must not commit an internally broken plan ---
+// It runs unattended, so it is the half that most needs the arithmetic check.
+const auditTick = await runTick({ db, tdKey:'TD', fredKey:'FRED', avKey:'AV' });
+ok('worker reports audit results', typeof auditTick.auditCritical, 'number');
+ok('audit findings are published', Array.isArray(auditTick.auditFindings), true);
+ok('a clean run has no critical findings', auditTick.auditCritical === 0, 'found ' + auditTick.auditCritical + ': ' + JSON.stringify(auditTick.auditFindings));
+
 console.log(`\nnetwork: twelvedata=${tdCalls} fred=${fredCalls} alphavantage=${avCalls}`);
 console.log(`${pass} passed, ${fail} failed`);
 process.exit(fail?1:0);

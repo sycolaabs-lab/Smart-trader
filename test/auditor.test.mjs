@@ -92,5 +92,38 @@ ok('criticals are sorted first', broken.findings[0].severity, 'critical');
 ok('every finding explains itself', broken.findings.every(f=>f.detail && f.detail.length>20), true);
 ok('handles empty input without throwing', typeof auditAnalysis({}).verdict, 'string');
 
+
+console.log('\n-- market hours: the auditor must not cry wolf --');
+// Gold trades 24/5. A coverage check that assumes continuous bars reads ~71%
+// on EVERY window purely from the weekend — a permanent false warning that
+// teaches you to ignore the auditor, and close enough to the critical
+// threshold that a holiday would have blocked trading outright.
+import { expectedBarsExcludingWeekend } from '../lib/auditor.js';
+function weekdayBars(n, startUtc){
+  const out=[]; let t=startUtc; let p=2000;
+  while(out.length<n){
+    const dow=new Date(t).getUTCDay();
+    if(dow!==0&&dow!==6){p+=0.5; out.push({time:t,open:p,high:p+2,low:p-2,close:p});}
+    t+=BAR;
+  }
+  return out;
+}
+const realistic = weekdayBars(500, Date.UTC(2026,7,3,0,0,0)); // Monday
+const realAudit = auditData(realistic, BAR);
+ok('a normal weekday feed raises NOTHING', realAudit.length, 0);
+ok('no false coverage warning', has(realAudit,'thin-coverage'), false);
+ok('no false gap warning', has(realAudit,'gappy-feed'), false);
+ok('weekend-aware count matches the bars received',
+   expectedBarsExcludingWeekend(realistic[0].time, realistic[realistic.length-1].time, BAR), 500);
+
+// starting on a Friday, so the span definitely straddles a weekend
+const fri = weekdayBars(400, Date.UTC(2026,7,7,0,0,0));
+ok('still clean when the span straddles a weekend', auditData(fri, BAR).length, 0);
+
+// a genuinely thinned feed must STILL be caught
+const genuinelyThin = weekdayBars(500, Date.UTC(2026,7,3,0,0,0)).filter((_,i)=>i%2===0);
+ok('real thinning is still detected', has(auditData(genuinelyThin,BAR),'thin-coverage'), true);
+ok('and half-missing is still critical', auditData(genuinelyThin,BAR).find(f=>f.code==='thin-coverage').severity, 'critical');
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail?1:0);

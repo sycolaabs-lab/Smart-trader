@@ -30,6 +30,7 @@ import {
   seriesDeltas, latestChangeOf, ECONOMIC_RELEASES, buildReleaseCalendar,
   newsWindowState, NEWS_WINDOW_DEFAULTS
 } from '../lib/engine.js';
+import { auditAnalysis } from '../lib/auditor.js';
 
 const SYMBOL = 'XAU/USD';
 const LIVE_INTERVAL = '15min';
@@ -390,6 +391,19 @@ export async function runTick({ db, tdKey, fredKey, avKey }) {
     // downgraded again for a ranging market and for disagreeing history, so at
     // the default B floor a ranging market needs 70%+ to qualify at all. Set
     // TICK_GRADE_FLOOR=C while building up a record.
+    // The same independent audit the browser runs. The worker commits signals
+    // unattended, so it is the half that most needs an arithmetic check before
+    // acting — a plan whose stop sits on the wrong side of entry should never
+    // reach Firestore as a live signal.
+    const audit = auditAnalysis({
+      result, plan, candles: ltf,
+      expectedIntervalMs: 15 * 60 * 1000,
+      now: Date.now(),
+      maxAgeMs: 45 * 60 * 1000,
+      knowledgeAssessment: null,
+      calibration: null
+    });
+
     const newsState = newsWindowState(calendar, Date.now(), NEWS_WINDOW_DEFAULTS);
     const gateCfg = Object.assign({}, AUTONOMY_DEFAULTS, {
       newsState,
@@ -398,7 +412,13 @@ export async function runTick({ db, tdKey, fredKey, avKey }) {
         ? parseFloat(process.env.TICK_MIN_CONFIDENCE)
         : AUTONOMY_DEFAULTS.minConfidence
     });
-    const gate = autonomyGate(result, plan, state.signalLog, state.lastSignalAt, gateCfg);
+    let gate;
+    if (audit.blocking) {
+      gate = { take: false, code: 'audit',
+        reason: 'independent audit found ' + audit.critical + ' critical issue(s): ' + audit.findings[0].title };
+    } else {
+      gate = autonomyGate(result, plan, state.signalLog, state.lastSignalAt, gateCfg);
+    }
     let tookSignal = false;
     if (gate.take) {
       state.signalLog.unshift({
@@ -448,6 +468,9 @@ export async function runTick({ db, tdKey, fredKey, avKey }) {
       tookSignal,
       gateReason: gate.reason,
       gateCode: gate.code || null,
+      auditCritical: audit.critical,
+      auditWarnings: audit.warnings,
+      auditFindings: audit.findings.slice(0, 5).map(f => f.severity + ': ' + f.title),
       newsBlocked: !!newsState.blocked,
       newsActive: newsState.active ? newsState.active.name : null,
       nextRelease: newsState.next ? { name: newsState.next.name, at: newsState.next.at, impact: newsState.next.impact } : null,
