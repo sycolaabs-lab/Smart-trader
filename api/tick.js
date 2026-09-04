@@ -30,7 +30,7 @@ import {
   seriesDeltas, latestChangeOf, ECONOMIC_RELEASES, buildReleaseCalendar,
   newsWindowState, NEWS_WINDOW_DEFAULTS
 } from '../lib/engine.js';
-import { auditAnalysis } from '../lib/auditor.js';
+import { auditAnalysis, auditOpenTrades } from '../lib/auditor.js';
 
 const SYMBOL = 'XAU/USD';
 const LIVE_INTERVAL = '15min';
@@ -354,9 +354,34 @@ export async function runTick({ db, tdKey, fredKey, avKey }) {
     });
     let resolvedThisTick = 0;
     let killedThisTick = 0;
+
+    // The auditor, not the worker, decides which live trades are past saving.
+    // Same reasoning as everywhere else it is used: the engine judging whether
+    // its own trade has gone bad is not a check. It re-derives fill state from
+    // raw candles instead of trusting the stored status, so bookkeeping that
+    // has drifted from what price actually did is caught rather than compounded.
+    const tradeAudit = auditOpenTrades(state.signalLog, ltf, {
+      maxHoursToFill: resolveCfg.maxHoursToFill,
+      maxHoursOpen: resolveCfg.maxHoursOpen,
+      maxDriftRToFill: resolveCfg.maxDriftRToFill
+    });
+    const killedBy = new Map(tradeAudit.kills.map(k => [k.id, k]));
+
     state.signalLog.forEach(sig => {
       if (sig.status !== 'pending' && sig.status !== 'open') return;
       const verdict = resolveSignal(sig, ltf, resolveCfg);
+      // A stop or target that genuinely printed is a real outcome and real
+      // evidence; a time limit must not discard it.
+      const kill = killedBy.get(sig.id);
+      if (kill && verdict.status !== 'won' && verdict.status !== 'lost') {
+        sig.status = 'expired';
+        sig.expiryReason = 'auditor: ' + kill.reason;
+        sig.killSwitch = kill.code;
+        sig.resolvedAt = new Date().toISOString();
+        sig.resolvedBy = 'auditor';
+        killedThisTick++;
+        return;
+      }
       if (verdict.status === 'won' || verdict.status === 'lost') {
         const won = verdict.status === 'won';
         sig.status = verdict.status;
@@ -428,7 +453,13 @@ export async function runTick({ db, tdKey, fredKey, avKey }) {
       now: Date.now(),
       maxAgeMs: 45 * 60 * 1000,
       knowledgeAssessment: null,
-      calibration: null
+      calibration: null,
+      // The unattended path is the one that most needs its inputs checked:
+      // nobody is looking at the chart to notice the feed has gone wrong. A
+      // timeframe on a different instrument, a stalled provider or a decimal
+      // shift would otherwise be analysed with full confidence.
+      series: { '15m': ltf, '1H': mtfR.value, '4H': htfR.value, Daily: dayR.value, Weekly: wkR.value },
+      macroSeries: (corr.series || []).map(d => ({ key: d.key, label: d.label, series: d.series }))
     });
 
     const newsState = newsWindowState(calendar, Date.now(), NEWS_WINDOW_DEFAULTS);
@@ -527,11 +558,15 @@ export async function runTick({ db, tdKey, fredKey, avKey }) {
       metaExampleCount: examples.length,
       resolvedThisTick,
       killedThisTick,
+      tradeAuditReviewed: tradeAudit.reviewed,
+      tradeAuditVerdict: tradeAudit.verdict,
       tookSignal,
       gateReason: gate.reason,
       gateCode: gate.code || null,
       auditCritical: audit.critical,
       auditWarnings: audit.warnings,
+      auditDataProblem: !!audit.dataProblem,
+      auditDataFaults: (audit.dataFaults || []).slice(0, 5).map(f => f.code + ': ' + f.title),
       auditFindings: audit.findings.slice(0, 5).map(f => f.severity + ': ' + f.title),
       newsBlocked: !!newsState.blocked,
       newsActive: newsState.active ? newsState.active.name : null,

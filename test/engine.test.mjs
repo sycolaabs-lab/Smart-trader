@@ -1,5 +1,6 @@
-import { resolveSignal, autonomyGate, mergeSignalLogs, newlyResolvedSignals,
-  newlyArrivedOpenSignals, newlyExpiredSignals, signalResolutionRank, signalLiveness, shouldPaperTrade, interpretConfidence, confidenceBand,
+import { auditFeedIntegrity } from '../lib/auditor.js';
+import { genData, resolveSignal, autonomyGate, mergeSignalLogs, newlyResolvedSignals,
+  newlyArrivedOpenSignals, newlyExpiredSignals, signalResolutionRank, signalLiveness, shouldPaperTrade, paperRejectReason, interpretConfidence, confidenceBand,
   confidenceBands, breakevenWinRate, CONFIDENCE_PRACTICAL_MAX, CONFIDENCE_EVIDENCE } from '../lib/engine.js';
 const C=(t,o,h,l,c)=>({time:t,open:o,high:h,low:l,close:c});
 let pass=0,fail=0;
@@ -974,6 +975,62 @@ ok('and is taken when manual trading is on', shouldPaperTrade(sigFrom(undefined)
 ok('a missing account takes nothing', shouldPaperTrade(sigFrom('auto'), null), false);
 ok('an account with no manual flag defaults to taking them',
   shouldPaperTrade(sigFrom('manual'), { enabled: true }), true);
+
+// every refusal has a sentence — a paper trade that never opened used to look
+// exactly like one that was never attempted
+const rjAcct = (n, bal) => ({ balance: bal == null ? 10000 : bal,
+  positions: Array.from({length:n||0}, () => ({ status:'open' })) });
+const rjBuy = { id:'r', dir:'BUY', entry:2000, sl:1990, tp:2040 };
+ok('a tradeable signal is refused for nothing', paperRejectReason(rjBuy, rjAcct(0), {}), null);
+ok('no signal is named as such', /no signal/.test(paperRejectReason(null, rjAcct(0), {})), true);
+ok('a HOLD has no direction to trade',
+  /no direction/.test(paperRejectReason({dir:'HOLD'}, rjAcct(0), {})), true);
+ok('a full book says so', /book is full/.test(paperRejectReason(rjBuy, rjAcct(3), {})), true);
+ok('and counts what is in it', /3 position\(s\)/.test(paperRejectReason(rjBuy, rjAcct(3), {})), true);
+ok('and points at the setting', /Max concurrent/.test(paperRejectReason(rjBuy, rjAcct(3), {})), true);
+ok('a raised cap accepts the trade', paperRejectReason(rjBuy, rjAcct(3), {maxConcurrent:5}), null);
+ok('resting orders count against the cap',
+  /book is full/.test(paperRejectReason(rjBuy, {balance:10000, positions:[{status:'pending'},{status:'pending'},{status:'pending'}]}, {})), true);
+ok('closed ones do not',
+  paperRejectReason(rjBuy, {balance:10000, positions:[{status:'closed'},{status:'cancelled'}]}, {}), null);
+ok('a flat account says so', /no balance left/.test(paperRejectReason(rjBuy, rjAcct(0, 0), {})), true);
+// The spread must not stand in for a missing stop: size is risk / stop
+// distance, so a sliver of spread would size an enormous position off a plainly
+// malformed plan.
+ok('a stop sitting on the entry is refused',
+  /no stop/.test(paperRejectReason({dir:'BUY', entry:2000, sl:2000}, rjAcct(0), {})), true);
+ok('and the account will not open it either',
+  openPaperPosition({id:'z', dir:'BUY', entry:2000, sl:2000, tp:2040}, {balance:10000, positions:[]}, {}), null);
+ok('a real stop still opens', !!openPaperPosition({id:'z2', dir:'BUY', entry:2000, sl:1990, tp:2040}, {balance:10000, positions:[]}, {}), true);
+ok('zero risk cannot be staked',
+  /nothing to stake/.test(paperRejectReason(rjBuy, rjAcct(0), {riskPercent:0})), true);
+
+
+
+// ============================================================
+// THE DEMO FEED MUST PRODUCE POSSIBLE CANDLES
+// ============================================================
+// Found by the auditor, not by a person: the close was an average of the other
+// four prices plus noise with nothing keeping it inside the bar, so on a narrow
+// range it landed outside its own high or low. That is an impossible candle,
+// and the backtest ran on them too.
+let gdImpossible = 0, gdNonFinite = 0, gdBars = 0;
+for (let k = 0; k < 30; k++) {
+  genData(400, 1928, 9e5).forEach(c => {
+    gdBars++;
+    if (![c.open, c.high, c.low, c.close].every(v => isFinite(v))) gdNonFinite++;
+    else if (c.close > c.high || c.close < c.low || c.open > c.high || c.open < c.low) gdImpossible++;
+  });
+}
+ok('no impossible candles across 12k generated bars', gdImpossible, 0);
+ok('and none non-finite', gdNonFinite, 0);
+ok('it generated something to check', gdBars > 10000, true);
+ok('high is never below low', genData(200, 2000, 9e5).every(c => c.high >= c.low), true);
+// A missing start price used to make every bar NaN, silently.
+ok('a missing start price still produces real prices',
+  genData(50).every(c => isFinite(c.close) && c.close > 0), true);
+ok('and the auditor agrees the demo feed is sound',
+  auditFeedIntegrity(genData(300, 1928, 9e5)).filter(f => f.code === 'impossible-bars').length, 0);
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail?1:0);

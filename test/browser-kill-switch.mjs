@@ -4,11 +4,18 @@
 // paper order with it, and never let it count as a win or a loss.
 import { chromium } from 'playwright';
 const PORT = process.env.PORT || '8899';
-// Price sits at 2012 and never trades down to a 2000 limit.
-function candles(n){const o=[];const now=Date.now();
+// Price sits at 2012 and never trades down to a 2000 limit. Each timeframe gets
+// its own spacing — serving 15-minute bars for every interval makes the data
+// auditor (correctly) report a stale, out-of-order feed, which is noise here.
+const STEP = { '15min':9e5, '1h':36e5, '4h':144e5, '1day':864e5, '1week':6048e5 };
+function candles(n, stepMs){const now=Date.now();
  return Array.from({length:n},(_,i)=>{const p=2012+Math.sin(i/11)*1.2;
-  return {datetime:new Date(now-(n-i)*9e5).toISOString().slice(0,19).replace('T',' '),
-   open:p.toFixed(2),high:(p+0.8).toFixed(2),low:(p-0.8).toFixed(2),close:p.toFixed(2)};});}
+  return {datetime:new Date(now-(n-i)*(stepMs||9e5)).toISOString().slice(0,19).replace('T',' '),
+   open:p.toFixed(2),high:(p+0.8).toFixed(2),low:(p-0.8).toFixed(2),close:p.toFixed(2)};})
+  // Twelve Data returns newest-first and the app reverses what it receives, so
+  // an oldest-first fixture arrives backwards — which the data auditor rightly
+  // reports as an out-of-order, stale feed.
+  .reverse();}
 
 const b = await chromium.launch({ executablePath: '/opt/pw-browsers/chromium-1194/chrome-linux/chrome' });
 const p = await b.newPage();
@@ -17,7 +24,9 @@ p.on('console', m => { if (m.type()==='error' && !/ERR_|net::|404/.test(m.text()
 await p.route('https://api.twelvedata.com/**', r => {
   const u = new URL(r.request().url());
   if (u.pathname.includes('/price')) return r.fulfill({status:200,contentType:'application/json',body:JSON.stringify({price:'2012.00'})});
-  r.fulfill({status:200,contentType:'application/json',body:JSON.stringify({values:candles(Math.min(+u.searchParams.get('outputsize')||500,900))})});
+  const iv = u.searchParams.get('interval');
+  r.fulfill({status:200,contentType:'application/json',body:JSON.stringify({
+    values: candles(Math.min(+u.searchParams.get('outputsize')||500, 900), STEP[iv]||9e5) })});
 });
 await p.route('**/api/fred**', r => r.fulfill({status:200,contentType:'application/json',body:JSON.stringify({observations:[]})}));
 await p.goto(`http://localhost:${PORT}/index.html`, { waitUntil:'domcontentloaded' });
@@ -82,7 +91,11 @@ const pStale = after.positions.find(x => x.signalId === 'STALE');
 const pFresh = after.positions.find(x => x.signalId === 'FRESH');
 
 ok('the stale order was killed', stale && stale.status === 'expired', JSON.stringify(stale && stale.status));
-ok('and it says why', !!stale && /without filling|retest|never filled/.test(stale.expiryReason || ''), stale && stale.expiryReason);
+ok('and it says why', !!stale && /past the \d+h limit|retest|ran a further/.test(stale.expiryReason || ''), stale && stale.expiryReason);
+// The auditor is the authority here, not the engine deciding its own trade has
+// gone bad, and the record says which component made the call.
+ok('the auditor is credited with the call', !!stale && /^auditor:/.test(stale.expiryReason || ''), stale && stale.expiryReason);
+ok('and recorded as the resolver', !!stale && stale.resolvedBy === 'auditor', stale && stale.resolvedBy);
 ok('tagged with which arm fired', !!stale && !!stale.killSwitch, stale && stale.killSwitch);
 ok('the fresh order was left alone', fresh && fresh.status === 'pending', JSON.stringify(fresh && fresh.status));
 
@@ -95,6 +108,14 @@ ok('nor a loss', stale && stale.status !== 'lost', '');
 ok('and it fed the learning loop nothing', after.learning.totalLogged === 0, 'totalLogged=' + after.learning.totalLogged);
 ok('the log row calls it killed', after.rows.some(r => /killed/.test(r)), JSON.stringify(after.rows));
 ok('the killed counter moved', after.killed !== '0', after.killed);
+// the audit panel has to show its live-trade review, not just the analysis one
+const auditPanel = await p.evaluate(() => {
+  const el = document.getElementById('auditContent');
+  return el ? el.innerText.replace(/\s+/g,' ') : '';
+});
+ok('the audit panel reviews live trades', /live trades under audit/i.test(auditPanel), auditPanel.slice(0, 300));
+ok('and the analysis audit is clean on good data', !/out of chronological order/.test(auditPanel), auditPanel.slice(0, 300));
+ok('and reports what it found', /live trade\(s\)/i.test(auditPanel), auditPanel.slice(0, 300));
 ok('no page errors', errs.length === 0, JSON.stringify(errs));
 
 console.log(`\n${pass} passed, ${fail} failed`);

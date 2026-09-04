@@ -613,6 +613,10 @@ canvas { width:100%; background:#12151c; border-radius:12px; border:1px solid #1
       <div class="dir hold" id="dirDisplay">⏸ HOLD</div>
       <div class="confidence" id="confidenceLabel">0% confidence</div>
     </div>
+    <!-- What pressing Generate actually did. Silence used to be the answer to
+         "why did nothing happen" — on a HOLD nothing is logged, and even with a
+         direction the paper book can be full. -->
+    <div class="data-source-note" id="genOutcome" style="margin-bottom:10px;">Press Generate to run the full analysis and, if paper trading is on, place the trade.</div>
     <!-- The confidence number on its own is decoration. This is what it means:
          where it sits on the scale this engine actually reaches, and what
          signals at this level have gone on to do. -->

@@ -196,6 +196,46 @@ if (found) {
 ok('the published doc carries no candle cache', db._docs.workerSignals.cache === undefined,
   'keys: ' + Object.keys(db._docs.workerSignals).join(','));
 
+
+// --- the worker must audit what it was FED, not just how it reasoned -------
+// Nobody is watching the chart on the unattended path, so a feed that has gone
+// wrong — a stalled provider, a decimal shift, a timeframe on a different
+// instrument — would otherwise be analysed with full confidence.
+ok('the worker reports whether the data itself is at fault',
+  typeof db._docs.latestTick.auditDataProblem, 'boolean');
+ok('and lists any data faults it found', Array.isArray(db._docs.latestTick.auditDataFaults), true);
+ok('a clean synthetic feed has none', db._docs.latestTick.auditDataFaults.length === 0,
+  JSON.stringify(db._docs.latestTick.auditDataFaults));
+ok('and is not flagged as a data problem', db._docs.latestTick.auditDataProblem === false,
+  JSON.stringify(db._docs.latestTick.auditDataProblem));
+
+// Feed it a decimal-shifted series and the audit must say so rather than
+// analysing a market that does not exist.
+const goodFetch = globalThis.fetch;
+globalThis.fetch = async (url) => {
+  const u = new URL(String(url));
+  if (u.hostname === 'api.twelvedata.com') {
+    const iv = u.searchParams.get('interval');
+    const n = Math.min(+u.searchParams.get('outputsize')||100, 600);
+    const vals = series(n, INTERVAL_MS[iv]||9e5, 2000, 0.08).map(v => ({
+      datetime: v.datetime,
+      open: (+v.open / 10).toFixed(3), high: (+v.high / 10).toFixed(3),
+      low: (+v.low / 10).toFixed(3), close: (+v.close / 10).toFixed(3)
+    }));
+    return { json: async () => ({ values: vals }) };
+  }
+  return goodFetch(url);
+};
+db._docs.worker.cacheMeta = {}; db._docs.worker.cacheSig = {};
+const shiftedTick = await runTick({ db, tdKey:'TD', fredKey:'FRED', avKey:'AV' });
+globalThis.fetch = goodFetch;
+ok('a decimal-shifted feed is caught', shiftedTick.auditDataProblem === true,
+  JSON.stringify({problem: shiftedTick.auditDataProblem, faults: shiftedTick.auditDataFaults}));
+ok('and named', shiftedTick.auditDataFaults.some(f => /price-out-of-band/.test(f)),
+  JSON.stringify(shiftedTick.auditDataFaults));
+ok('and it blocks the trade', shiftedTick.gateCode === 'audit' || shiftedTick.direction === 'HOLD',
+  JSON.stringify({gate: shiftedTick.gateCode, dir: shiftedTick.direction}));
+
 console.log(`\nnetwork: twelvedata=${tdCalls} fred=${fredCalls} alphavantage=${avCalls}`);
 console.log(`${pass} passed, ${fail} failed`);
 process.exit(fail?1:0);

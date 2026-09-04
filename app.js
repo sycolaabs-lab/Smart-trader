@@ -18,6 +18,7 @@ import {
   computeConditionBreakdown, computeGateAudit, dataInventory, utcDayKey, rollQuota,
   canSpend, spendQuota, quotaSummary, criticalReserveFor, PAPER_DEFAULTS,
   openPaperPosition, closePaperPosition, unrealisedPnl, paperAccountSummary, shouldPaperTrade,
+  paperRejectReason,
   GATE_LABELS, PARTIAL_TP_DEFAULTS, fillPaperPosition,
   NEWS_WINDOW_DEFAULTS, newsWindowState, explainMarket,
   fitMacroModel, macroModelScore, describeMacroModel, alignByDay,
@@ -26,7 +27,7 @@ import {
 } from './lib/engine.js';
 import { emptyKnowledge, recordObservation, assessKnowledge, detectNovelty,
   describeKnowledge, KNOWLEDGE_DEFAULTS } from './lib/knowledge.js';
-import { auditAnalysis } from './lib/auditor.js';
+import { auditAnalysis, auditOpenTrades } from './lib/auditor.js';
 
 const LEARNING_KEY = 'smc-factor-stats-v1';
 let learningState = { factors: {}, patterns: {}, totalLogged: 0, metaExamples: [], metaModel: null };
@@ -802,6 +803,12 @@ let simTickHandle = null, pollPriceHandle = null, resyncHandle = null, mtfResync
 // hand opens a paper position. Autonomous and worker trades follow `enabled`
 // alone, so turning hand-made trades off never silences the unattended account.
 let paper = { enabled: false, manual: true, startingBalance: PAPER_DEFAULTS.startingBalance, positions: [] };
+// Set by paperOpenForSignal on its way through, read by whoever triggered the
+// signal. A one-slot channel rather than a return value because the open
+// happens two calls deep inside addSignalToLog.
+let lastPaperOutcome = null;
+// The most recent live-trade audit, for the audit panel to render.
+let lastTradeAudit = null;
 let autonomy = {
   enabled: false,
   cycles: 0,
@@ -1286,6 +1293,9 @@ function startLivePolling() {
   newsResyncHandle = setInterval(() => {
     refreshNewsSentiment(document.getElementById('newsKeyInput').value.trim()).then(refreshAll);
   }, 6 * 60 * 60 * 1000);
+  // The feed just changed wholesale. Whatever the audit said about the previous
+  // one describes nothing that is still on screen.
+  auditAfterFeedChange();
 }
 let lastPriceUpdateTime = null;
 // The dedicated price endpoint costs one credit per call and only nudges the
@@ -1681,14 +1691,63 @@ function updateSignalUI(result, plan, logIt, origin) {
     addSignalToLog(result, plan, origin);
   }
 }
+// Generate is the manual half of the same loop autonomous mode runs: analyse,
+// log the signal, and — with paper trading on — place the trade. It used to do
+// all of that silently, so a pass that took nothing (the engine reading HOLD, a
+// full paper book) was indistinguishable from a broken button.
 document.getElementById('genBtn').addEventListener('click', function () {
   const btn = this; btn.disabled = true; btn.innerText = 'Analyzing...';
   setTimeout(() => {
+    const before = signalLog.length;
+    lastPaperOutcome = null;
     refreshAll();
-    if (lastComposite) { const plan = buildTradePlan(lastComposite, getTargetRR()); updateSignalUI(lastComposite, plan, true); }
+    let plan = null;
+    if (lastComposite) { plan = buildTradePlan(lastComposite, getTargetRR()); updateSignalUI(lastComposite, plan, true); }
+    // Re-audit on every manual pass. The panel used to refresh only on boot and
+    // on autonomous cycles, so pressing Generate against a feed that had gone
+    // wrong showed a clean audit from hours earlier — the one moment the
+    // auditor most needs to be current.
+    runAudit();
+    renderAudit();
+    reportGenerateOutcome(before, plan);
     btn.disabled = false; btn.innerText = 'Generate';
   }, 450);
 });
+
+// Connecting a provider swaps out every series the analysis stands on, so the
+// audit that described the old feed says nothing about the new one.
+function auditAfterFeedChange() {
+  try { runAudit(); renderAudit(); } catch (e) { /* audit must never break the app */ }
+}
+
+function reportGenerateOutcome(logLengthBefore, plan) {
+  const el = document.getElementById('genOutcome');
+  if (!el) return;
+  const took = signalLog.length > logLengthBefore;
+  if (!lastComposite) {
+    setGenOutcome(el, 'No analysis was produced — connect a data provider or load candles first.', 'warn');
+    return;
+  }
+  if (!took) {
+    // The engine holding is a decision, not a failure, and saying so is the
+    // whole point: nothing was logged and nothing was traded.
+    const why = lastComposite.direction === 'HOLD'
+      ? 'the engine reads HOLD — the factors are cancelling, so there is no direction to trade'
+      : 'no trade plan could be built from this read';
+    setGenOutcome(el, 'No trade taken: ' + why + '. Nothing was logged and no paper position was opened.', 'warn');
+    return;
+  }
+  const sig = signalLog[0];
+  const head = 'Logged a ' + sig.dir + ' at $' + fmt(sig.entry) + ' (' + sig.confidence + '% confidence' +
+    (sig.grade ? ', grade ' + sig.grade : '') + ').';
+  setGenOutcome(el, head + ' ' + (lastPaperOutcome || 'Paper trading is off, so no position was opened.'),
+    lastPaperOutcome && /opened|resting/.test(lastPaperOutcome) ? 'ok' : 'warn');
+}
+
+function setGenOutcome(el, text, tone) {
+  el.textContent = text;
+  el.style.color = tone === 'ok' ? '#3ecf8e' : tone === 'warn' ? '#ffa726' : '';
+}
 
 function liveTick() {
   if (dataMode !== 'simulated') return;
@@ -2008,7 +2067,13 @@ function runAudit() {
     now: Date.now(),
     maxAgeMs: provider ? provider.resyncMinutes * 60 * 1000 * 3 : 45 * 60 * 1000,
     knowledgeAssessment,
-    calibration: computeCalibration(signalLog)
+    calibration: computeCalibration(signalLog),
+    // Everything the analysis was fed, so the auditor can check the inputs and
+    // not only the reasoning. Timeframes that disagree about the price are not
+    // the same instrument; a macro series that is frozen or months out of date
+    // is contributing a number that is no longer true.
+    series: { '15m': liveData, '1H': mtfData, '4H': htfData, Daily: dailyData, Weekly: weeklyData },
+    macroSeries: (macroSeries.drivers || []).map(d => ({ key: d.key, label: d.label, series: d.series }))
   });
   return lastAudit;
 }
@@ -2040,6 +2105,29 @@ function renderAudit() {
   } else {
     html += '<div class="zone-empty">Re-derived the price, R:R, stop distance and direction from raw candles — all consistent.</div>';
   }
+
+  // The auditor's second job: policing trades that are already live. Shown
+  // separately because it is a different question — not "is this analysis
+  // sound" but "is this trade still worth having".
+  const t = lastTradeAudit;
+  html += '<div style="margin-top:14px;padding-top:10px;border-top:1px solid #1e222c;">'
+    + '<div style="font-size:10px;color:#454a56;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:6px;">Live trades under audit</div>';
+  if (!t) {
+    html += '<div class="zone-empty">No live-trade review yet — it runs on each analysis pass.</div>';
+  } else {
+    const ttone = t.kills.length ? '#ef4d5f' : t.watch.length ? '#ffa726' : '#3ecf8e';
+    html += '<div class="event-line" style="border-left-color:' + ttone + ';color:' + ttone + ';">'
+      + escapeAttr(t.verdict) + '</div>';
+    if (t.findings.length) {
+      html += t.findings.map(f => {
+        const c = f.severity === 'critical' ? '#ef4d5f' : f.severity === 'warning' ? '#ffa726' : '#5c6270';
+        return '<div style="margin-top:8px;padding-left:8px;border-left:2px solid ' + c + ';">'
+          + '<div style="font-size:11px;color:' + c + ';font-weight:600;">' + escapeAttr(f.title) + '</div>'
+          + '<div style="font-size:11px;color:#9298a5;line-height:1.5;margin-top:2px;">' + escapeAttr(f.detail) + '</div></div>';
+      }).join('');
+    }
+  }
+  html += '</div>';
   root.innerHTML = html;
 }
 
@@ -2386,15 +2474,28 @@ function paperBalance() {
 // the account compounds (or shrinks) as it goes rather than sizing off a
 // constant, which is what makes drawdown meaningful.
 function paperOpenForSignal(sig) {
-  if (!shouldPaperTrade(sig, paper)) return;
+  if (!shouldPaperTrade(sig, paper)) {
+    lastPaperOutcome = !paper.enabled
+      ? 'Paper trading is off, so no position was opened.'
+      : 'Paper trading is on for the engine\'s own signals only — this one was generated by hand and excluded.';
+    return null;
+  }
   const cfg = paperConfig();
-  const pos = openPaperPosition(sig, { balance: paperBalance(), positions: paper.positions }, cfg);
-  if (!pos) return;
+  const account = { balance: paperBalance(), positions: paper.positions };
+  const refusal = paperRejectReason(sig, account, cfg);
+  if (refusal) { lastPaperOutcome = 'No paper position opened: ' + refusal + '.'; return null; }
+  const pos = openPaperPosition(sig, account, cfg);
+  if (!pos) { lastPaperOutcome = 'No paper position opened — the account refused the trade.'; return null; }
+  lastPaperOutcome = (pos.status === 'pending'
+    ? 'Paper order resting at $' + fmt(pos.requestedEntry) + ' — no exposure until price reaches it.'
+    : 'Paper position opened at $' + fmt(pos.entryFill) + '.') +
+    ' Risking $' + (pos.riskAmount || 0).toFixed(2) + ' on ' + pos.units.toFixed(2) + ' units.';
   paper.positions.unshift(pos);
   paper.positions = paper.positions.slice(0, 500);
   savePaper();
   renderPaper();
   renderSignalLog(); // the log row carries this position's state
+  return pos;
 }
 function paperCloseForSignal(signalId, outcome, atPrice) {
   if (!paper.positions.length) return;
@@ -2785,9 +2886,39 @@ function renderAutonomyStats() {
 function resolveOpenSignals(candles, cfg) {
   if (!candles || candles.length < 2) return 0;
   let resolved = 0, killed = 0, changed = false;
+
+  // The auditor decides which live trades are past saving, not the engine.
+  // Letting the engine judge whether its own trade has gone bad is the thing
+  // the auditor exists to avoid — and it re-derives fill state from raw candles
+  // rather than trusting the signal's own status, so a "pending" order price
+  // actually traded through is caught rather than aged as if it never filled.
+  const tradeAudit = auditOpenTrades(signalLog, candles, {
+    maxHoursToFill: cfg.maxHoursToFill,
+    maxHoursOpen: cfg.maxHoursOpen,
+    maxDriftRToFill: cfg.maxDriftRToFill
+  });
+  lastTradeAudit = tradeAudit;
+  const killedBy = new Map(tradeAudit.kills.map(k => [k.id, k]));
+
   signalLog.forEach(sig => {
     if (sig.status !== 'pending' && sig.status !== 'open') return;
+    // An auditor kill outranks whatever the resolver would have said, EXCEPT
+    // when price has already settled the trade: a stop or target that has
+    // genuinely been hit is a real outcome and real evidence, and discarding it
+    // to enforce a time limit would throw away the data the limit exists to
+    // protect.
     const verdict = resolveSignal(sig, candles, cfg);
+    const kill = killedBy.get(sig.id);
+    if (kill && verdict.status !== 'won' && verdict.status !== 'lost') {
+      sig.status = 'expired';
+      sig.expiryReason = 'auditor: ' + kill.reason;
+      sig.killSwitch = kill.code;
+      sig.resolvedAt = new Date().toISOString();
+      sig.resolvedBy = 'auditor';
+      paperCloseForSignal(sig.id, 'expired');
+      killed++; changed = true;
+      return;
+    }
     if (verdict.status === 'won' || verdict.status === 'lost') {
       if (applySignalOutcome(sig, verdict.status === 'won', {
         auto: true, exitPrice: verdict.exitPrice, ambiguousBar: verdict.ambiguousBar, partial: verdict.partial

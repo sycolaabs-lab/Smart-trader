@@ -434,6 +434,61 @@ When nothing passes, the panel says so first, before any coefficient:
 
 ## Independent audit
 
+The auditor's remit is the whole pipeline, not just the reasoning at the end of
+it. Three jobs:
+
+**1. Is the analysis sound?** Price, R:R, stop distance against independently
+recomputed ATR, and the direction implied by the factor weights are all
+re-derived from raw candles and compared. Nothing the engine claims is taken on
+trust — an auditor that reuses the engine's own numbers is the engine agreeing
+with itself.
+
+**2. Was it given the truth?** A feed can be perfectly well-formed and still be
+wrong, and none of these announce themselves:
+
+| Fault | What it looks like without the auditor |
+|---|---|
+| Open/close outside the bar's own range | Impossible bars become swing points |
+| Prices outside anything gold trades at | A wrong symbol, or a decimal shift — chart shape unchanged, every level off by 10x |
+| A jump far beyond the feed's own volatility | A bad tick becomes structure |
+| Many identical consecutive closes | A stalled provider is indistinguishable from a flat market |
+| Most bars with no high-low range | A padded or generated feed read as real |
+| Timeframes disagreeing on the price | One series is a different instrument; MTF alignment is meaningless |
+| A macro series frozen, or months out of date | A constant contributing to the score, or a number that stopped being true |
+
+Every finding names **where**: the bar index, its timestamp, and the offending
+values. And the verdict distinguishes the two cases, because "the analysis has
+errors" would send you looking in the wrong place:
+
+> ⛔ The data feeding this analysis is wrong — prices outside anything this
+> instrument trades at. Nothing downstream can be trusted until the feed is fixed.
+
+The audit re-runs whenever the feed changes — on connect and on every Generate —
+not just at boot, since a stale clean audit is worse than none.
+
+**3. Are the live trades still worth having?** See the kill switch below: the
+auditor, not the engine, decides which resting orders and open positions have
+gone stale, and it re-derives fill state from raw candles rather than trusting
+the signal's stored status. That also catches bookkeeping that has drifted from
+what price actually did — a "pending" order price already traded through, or an
+"open" position that never filled.
+
+It never silently overrides anything. It returns verdicts; applying them is the
+caller's job.
+
+### What it caught
+
+The feed checks found a real bug on their first run. `genData`, the demo feed
+the app shows before you connect and the one the backtest replays, computed each
+candle's close as an average of the other four prices plus noise, with nothing
+keeping it inside the bar. On a narrow range the noise pushed it past the high
+or low, so a few percent of every generated series consisted of candles that
+could not exist — and backtests ran on them. The close is now drawn first and
+the extremes taken around it. (The same fix corrected `genData(n)` with no start
+price silently producing an all-NaN series.)
+
+### The original design
+
 An auditor that reuses the engine's computed values is the engine agreeing with
 itself, so this one takes nothing on trust. Where a claim can be re-derived from
 raw candles, it is re-derived and compared.
@@ -637,6 +692,39 @@ the accounting a signal log cannot show — position sizing, money P&L, equity,
 drawdown. It is the difference between *"62% of signals won"* and *"this would
 have been up 4.3% with an 11% drawdown"*, and only the second tells you whether
 the analysis is worth anything.
+
+### Two ways into the paper account
+
+Autonomous mode and the Generate button run the same loop — analyse, log the
+signal, place the trade. Autonomy just does it on a heartbeat instead of on a
+click. So with paper trading on, pressing **Generate** places the trade exactly
+as an unattended pass would; the only difference is who decided to run it.
+
+Generate now says what it did, because silence used to be the answer to "why
+did nothing happen":
+
+```
+Logged a BUY at $2004.10 (49% confidence, grade C).
+  Paper position opened at $2004.40. Risking $100.00 on 24.39 units.
+
+No trade taken: the engine reads HOLD — the factors are cancelling, so there
+  is no direction to trade. Nothing was logged and no paper position was opened.
+
+Logged a BUY at $2004.10 (49% confidence, grade C).
+  No paper position opened: the book is full — 3 position(s) already open or
+  resting, cap is 3 (raise "Max concurrent" in paper settings).
+```
+
+A HOLD is a decision, not a failure, and the button says so rather than doing
+nothing quietly. There is deliberately no "trade it anyway" on a HOLD: with no
+direction there is no plan — the entry, stop and target shown are a placeholder
+built from ATR around the current price, identical whichever way you would take
+it. Forcing a trade there would invent an outcome and feed it to the learning
+loop, which is the one thing this system must not do. If the engine holds more
+often than you want, the grade floor and confidence threshold are the controls.
+
+Every other refusal is spelled out too — paper trading off, hand-made trades
+excluded, a full book, a flat account, a plan whose stop sits on its entry.
 
 ### Turning it on for a hand-made trade
 
