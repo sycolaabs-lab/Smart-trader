@@ -523,6 +523,26 @@ It now measures each series against its own widest observed publication gap, so
 a daily rate is late after ~12 days and monthly CPI is not late until it has
 missed a print.
 
+### The proxy enforces recency, whatever the caller asks
+
+`/api/fred` returns the **most recent** observations, oldest-first, regardless of
+the `sort_order` the caller sends. That is not a convenience — it is the last
+line of defence against the failure that started all this.
+
+FRED applies `limit` after sorting, so `sort_order=asc&limit=48` returns the 48
+*oldest* observations a series ever had: 1913 for PPI, 1947 for CPI, 1954 for the
+Fed funds rate. It fails silently. The values are real, the arithmetic works, and
+a confident number comes out the other end describing the Eisenhower
+administration.
+
+This proxy exists solely to serve this app, and every caller in it wants
+recency — so recency is the contract rather than a parameter each caller has to
+remember. It also means a **browser still running a cached pre-fix `app.js` gets
+correct data anyway**, without needing to reload first, which matters because
+that tab has no way of knowing it is wrong. When an `asc` request is overridden
+the response says so in `proxy_note`. `oldest=1` opts out, for the rare case
+where the start of a series is genuinely wanted.
+
 ### Why a tab can still show the old numbers
 
 The fix shipping does not mean your open tab is running it. This app is built to
