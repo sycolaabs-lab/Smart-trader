@@ -10,7 +10,7 @@ import {
   genData, calcEMA, fmt, parseUtcDatetime, premiumDiscount, downgradeGrade,
   detectSystemAlert, FRED_INSTRUMENTS, CORRELATION_INSTRUMENTS,
   FUNDAMENTAL_INSTRUMENTS, pearsonCorrelation, toDailyReturns,
-  computeComposite, PIP_SIZE, QUALITY_FEATURE_NAMES, classifyZone,
+  computeComposite, PIP_SIZE, QUALITY_FEATURE_NAMES, classifyZone, correlateByDay,
   trainAdaBoostStumps, buildTradePlan, reasoningText, FACTOR_LABELS,
   patternSignature, computeTunedWeights, runSmcBacktest, setMetaModel,
   AUTONOMY_DEFAULTS, resolveSignal, autonomyGate, macroContribution,
@@ -1024,13 +1024,22 @@ async function fetchFredSeries(seriesId, fredKey, limit) {
   // Routed through /api/fred (same-origin serverless function) instead of calling stlouisfed.org
   // directly from the browser — FRED doesn't set CORS headers for arbitrary sites, so a direct
   // client-side fetch gets silently blocked. The proxy calls FRED server-side, where CORS doesn't apply.
-  const qs = new URLSearchParams({ series_id: seriesId, api_key: fredKey, file_type: 'json', sort_order: 'asc', limit: String(limit * 2) });
+  // sort_order MUST be 'desc'. FRED applies `limit` AFTER sorting, so asking for
+  // 120 ascending returns the 120 OLDEST observations the series ever had — for
+  // DGS2 that is 1976, for VIXCLS 1990, for DTWEXBGS 2006. Every macro number in
+  // this system was computed from those. Nothing failed: the values were finite,
+  // correlations came out, and a plausible number reached the score. Descending
+  // gives the most recent, and the result is reversed back to ascending because
+  // everything downstream assumes oldest-first.
+  const qs = new URLSearchParams({ series_id: seriesId, api_key: fredKey, file_type: 'json', sort_order: 'desc', limit: String(limit * 2) });
   const r = await fetch('/api/fred?' + qs);
   const j = await r.json();
   if (j.error_code) throw new Error(j.error_message || 'FRED error');
   if (!j.observations) throw new Error(j.error || 'No observations returned');
   const obs = j.observations.filter(o => o.value !== '.').map(o => ({ time: new Date(o.date + 'T00:00:00Z').getTime(), close: parseFloat(o.value) }));
   if (!obs.length) throw new Error('No usable data points');
+  // Newest-first from FRED; everything downstream expects oldest-first.
+  obs.sort((a, b) => a.time - b.time);
   return obs.slice(-limit);
 }
 
@@ -1055,7 +1064,6 @@ async function refreshCorrelation(providerId, tdKey, fredKey) {
     try { if (!spendCredit('low')) throw new Error('budget'); xauDaily = await PROVIDERS.twelvedata.timeSeries(tdKey, '1day', 60); await sleep(1200); }
     catch (e) { xauDaily = null; }
   }
-  const xauRets = xauDaily ? toDailyReturns(xauDaily) : null;
   macroSeries = { gold: xauDaily, drivers: [] };
 
   // FRED side — independent of the price provider, no meaningful rate limit, so these always attempt if a key is present.
@@ -1066,8 +1074,10 @@ async function refreshCorrelation(providerId, tdKey, fredKey) {
         macroSeries.drivers.push({ key: inst.key, label: inst.label, kind: inst.kind, series: obs });
         // Yields move in basis points, not percentages of their own level —
         // seriesDeltas picks the right transform per instrument.
-        const rets = seriesDeltas(obs, inst.kind);
-        const corr = xauRets ? pearsonCorrelation(xauRets, rets) : null;
+        // Aligned on the calendar, not by array position: gold trades Sunday
+        // evening to Friday evening, FRED skips US federal holidays, and zipping
+        // the two by index offsets everything before each holiday.
+        const corr = xauDaily ? correlateByDay(xauDaily, obs, inst.kind) : null;
         const pctChange = latestChangeOf(obs, inst.kind);
         // Weight by the ACTUAL measured correlation strength/sign, not the assumed polarity — a genuinely
         // weak or unstable relationship (like oil's has historically been) shrinks toward zero influence on
@@ -1092,8 +1102,7 @@ async function refreshCorrelation(providerId, tdKey, fredKey) {
           if (!spendCredit('low')) throw new Error('Skipped to stay inside the daily API budget.');
           const candles = await PROVIDERS.twelvedata.timeSeries(tdKey, '1day', 60, inst.symbol);
           macroSeries.drivers.push({ key: inst.key, label: inst.label, kind: inst.kind, series: candles });
-          const rets = seriesDeltas(candles, inst.kind);
-          const corr = pearsonCorrelation(xauRets, rets);
+          const corr = correlateByDay(xauDaily, candles, inst.kind);
           const pctChange = latestChangeOf(candles, inst.kind);
           results.push({ key: inst.key, label: inst.label, source: 'Twelve Data', available: true, pctChange, corr, contribution: macroContribution(pctChange, corr, inst.polarity), polarity: inst.polarity, kind: inst.kind });
         } catch (e) {
@@ -2145,16 +2154,33 @@ let knowledge = emptyKnowledge();
 let knowledgeAssessment = null;
 let noveltyState = null;
 
+// Every observation recorded before this marker paired a CURRENT gold day with
+// macro driver values from 1976-2006, because FRED was being asked for the
+// oldest observations in each series rather than the newest. The rows cannot be
+// repaired — the driver values are simply from the wrong decade — and they
+// cannot be told apart by day, because the day was right and only the drivers
+// were wrong. So the accumulated record is discarded once, and rebuilt from
+// data that is actually current.
+const KNOWLEDGE_SCHEMA = 2;
+let knowledgeReset = false;
+
 async function loadKnowledge() {
   try {
     const raw = localStorage.getItem(KNOWLEDGE_KEY);
     if (raw) knowledge = asPlainObject(JSON.parse(raw));
   } catch (e) { knowledge = emptyKnowledge(); }
   if (!knowledge || !Array.isArray(knowledge.rows)) knowledge = emptyKnowledge();
+  if (knowledge.schema !== KNOWLEDGE_SCHEMA) {
+    knowledgeReset = Array.isArray(knowledge.rows) && knowledge.rows.length > 0;
+    knowledge = Object.assign(emptyKnowledge(), { schema: KNOWLEDGE_SCHEMA });
+    await saveKnowledge();
+    return;
+  }
   // Rows drive regression maths; a null or a non-finite value poisons a whole fit.
   knowledge.rows = asObjectArray(knowledge.rows, ['day', 'gold'])
     .filter(r => isFinite(r.day) && isFinite(r.gold) && r.drivers && typeof r.drivers === 'object');
   knowledge.firstSeen = asPlainObject(knowledge.firstSeen);
+  knowledge.schema = KNOWLEDGE_SCHEMA;
 }
 async function saveKnowledge() {
   try { localStorage.setItem(KNOWLEDGE_KEY, JSON.stringify(knowledge)); }
@@ -2202,9 +2228,18 @@ function renderKnowledge() {
   const root = document.getElementById('knowledgeContent');
   if (!root) return;
   const a = knowledgeAssessment;
-  if (!a) { root.innerHTML = '<div class="zone-empty">No observations yet — connect a provider with a FRED key.</div>'; return; }
+  // Say plainly that the record was cleared and why. A knowledge base that
+  // silently went back to zero looks like a bug, and the reason matters more
+  // than the loss.
+  const resetNote = knowledgeReset
+    ? '<div class="event-line" style="border-left-color:#ffa726;color:#ffa726;margin-bottom:10px;">'
+      + 'Accumulated observations were cleared. Every one of them paired a current gold day with macro '
+      + 'values from 1976-2006 — FRED was being asked for the oldest observations in each series instead '
+      + 'of the newest. The record is rebuilding from data that is actually current.</div>'
+    : '';
+  if (!a) { root.innerHTML = resetNote + '<div class="zone-empty">No observations yet — connect a provider with a FRED key.</div>'; return; }
 
-  let html = '<div class="metrics" style="margin-bottom:10px;">'
+  let html = resetNote + '<div class="metrics" style="margin-bottom:10px;">'
     + '<div class="card"><div class="label">Days Observed</div><div class="value mono">' + (a.totalObservations || 0) + '</div></div>'
     + '<div class="card"><div class="label">Established</div><div class="value mono fpos">' + (a.established || 0) + '</div></div>'
     + '<div class="card"><div class="label">Watching</div><div class="value mono">' + (a.watching || 0) + '</div></div>'

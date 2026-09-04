@@ -478,6 +478,53 @@ caller's job.
 
 ### What it caught
 
+**Every macro number in the system was computed from 1976–2006 data.**
+
+FRED applies `limit` *after* sorting, and the request used `sort_order=asc`. So
+asking for 120 observations returned the 120 **oldest** the series had ever
+published:
+
+| Series | What arrived | Should have been |
+|---|---|---|
+| DGS2 (2Y Treasury) | Jun–Nov **1976** | last ~4 months |
+| VIXCLS | Jan–Jun **1990** | last ~4 months |
+| DFII10 (10Y real yield) | Jan–Jun **2003** | last ~4 months |
+| T10YIE (breakeven) | Jan–Jun **2003** | last ~4 months |
+| DTWEXBGS (broad dollar) | Jan–Jun **2006** | last ~4 months |
+
+Nothing failed. The values were finite, correlations came out, the score looked
+reasonable, the reasoning layer wrote confident sentences about the dollar. The
+correlation was between gold's returns *this year* and the dollar's returns *in
+2006*, zipped index by index. Both the browser and the worker had it.
+
+Fixed by requesting `sort_order=desc` and re-sorting to oldest-first. Verified
+against live FRED: every series now arrives 1–7 days old.
+
+**A second fault in the same path:** correlation zipped the two series by array
+position. Gold trades Sunday evening to Friday evening; FRED publishes on US
+business days and skips federal holidays. Every holiday in the window offset the
+pairing by a day for everything before it. On a test series where a single day
+is missing, that turns a true correlation of 0.98 into 0.41. Correlation is now
+aligned on the calendar via `alignByDay`, and refuses (returns null) rather than
+reporting a number when the overlap is too small — or when a series only moves
+at the far end of floating point, where Pearson's denominator is not quite zero
+and it will happily return a correlation made entirely of rounding error.
+
+**The accumulated knowledge was discarded once.** Every observation paired a
+current gold day with driver values from the wrong decade. The rows cannot be
+repaired and cannot be told apart by day — the day was right, only the drivers
+were wrong. The store carries a schema marker so this happens exactly once, and
+the panel says what was cleared and why, because a knowledge base that silently
+returns to zero looks like a bug.
+
+**And the staleness threshold itself was wrong.** It used a flat 45 days, which
+false-alarms on any monthly series and lets a dead daily one run for six weeks.
+It now measures each series against its own widest observed publication gap, so
+a daily rate is late after ~12 days and monthly CPI is not late until it has
+missed a print.
+
+### Earlier finds
+
 The feed checks found a real bug on their first run. `genData`, the demo feed
 the app shows before you connect and the one the backtest replays, computed each
 candle's close as an average of the other four prices plus noise, with nothing

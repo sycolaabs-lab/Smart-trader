@@ -179,6 +179,21 @@ ok('badly stale is critical', findF(auditMacroSeries(staleMacro, MNOW), 'macro-s
 ok('and it says how old', /days ago/.test(findF(auditMacroSeries(staleMacro, MNOW), 'macro-stale').detail), true);
 const mildlyStale = [{ key:'t10', label:'Breakeven', observations: obsFrom(60, 30, i => 2 + i*0.01) }];
 ok('mildly stale is a warning, not a block', findF(auditMacroSeries(mildlyStale, MNOW), 'macro-stale').severity, 'warning');
+// staleness is judged against the series' own rhythm, not a flat number of days
+const monthly = (lagDays, n) => Array.from({length:n}, (_, i) => ({
+  date: new Date(MNOW - (lagDays + (n - i) * 30) * 86400000).toISOString().slice(0,10), value: 2 + i*0.1 }));
+ok('a monthly series 40 days old is normal, not stale',
+  hasF(auditMacroSeries([{ key:'cpi', label:'CPI', observations: monthly(40, 24) }], MNOW), 'macro-stale'), false);
+ok('a daily series 40 days old IS stale',
+  hasF(auditMacroSeries([{ key:'dgs2', label:'2Y', observations: obsFrom(40, 30, i => 4 + i*0.01) }], MNOW), 'macro-stale'), true);
+ok('a daily series a week old is not',
+  hasF(auditMacroSeries([{ key:'dxy', label:'Dollar', observations: obsFrom(7, 30, i => 100 + i*0.1) }], MNOW), 'macro-stale'), false);
+ok('a monthly series that has missed several prints is stale',
+  hasF(auditMacroSeries([{ key:'cpi', label:'CPI', observations: monthly(200, 24) }], MNOW), 'macro-stale'), true);
+ok('the finding states the normal gap',
+  /normal publication gap of/.test(findF(auditMacroSeries([{ key:'dgs2', label:'2Y', observations: obsFrom(40, 30, i => 4 + i*0.01) }], MNOW), 'macro-stale').detail), true);
+ok('an explicit maxAgeDays overrides the inferred cadence',
+  hasF(auditMacroSeries([{ key:'x', label:'X', maxAgeDays: 2, observations: obsFrom(7, 30, i => 100 + i*0.1) }], MNOW), 'macro-stale'), true);
 ok('an empty list is fine', auditMacroSeries([], MNOW).length, 0);
 // the engine keeps {time, close}; FRED returns {date, value}. Both must work,
 // because a conversion at each call site is one more place to get it wrong.

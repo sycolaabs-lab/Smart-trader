@@ -1,5 +1,6 @@
 import { auditFeedIntegrity } from '../lib/auditor.js';
-import { genData, resolveSignal, autonomyGate, mergeSignalLogs, newlyResolvedSignals,
+import { genData, correlateByDay, alignedLatestChange, pearsonCorrelation,
+  resolveSignal, autonomyGate, mergeSignalLogs, newlyResolvedSignals,
   newlyArrivedOpenSignals, newlyExpiredSignals, signalResolutionRank, signalLiveness, shouldPaperTrade, paperRejectReason, interpretConfidence, confidenceBand,
   confidenceBands, breakevenWinRate, CONFIDENCE_PRACTICAL_MAX, CONFIDENCE_EVIDENCE } from '../lib/engine.js';
 const C=(t,o,h,l,c)=>({time:t,open:o,high:h,low:l,close:c});
@@ -1031,6 +1032,64 @@ ok('a missing start price still produces real prices',
   genData(50).every(c => isFinite(c.close) && c.close > 0), true);
 ok('and the auditor agrees the demo feed is sound',
   auditFeedIntegrity(genData(300, 1928, 9e5)).filter(f => f.code === 'impossible-bars').length, 0);
+
+
+// ============================================================
+// CORRELATION MUST ALIGN ON THE CALENDAR, NOT BY ARRAY POSITION
+// ============================================================
+// Gold trades Sunday evening to Friday evening; FRED publishes on US business
+// days and skips federal holidays. Zipping the two by index offsets everything
+// before each holiday, and what comes out still looks like a correlation.
+const CD = 86400000, cdT0 = Date.parse('2026-01-05T00:00:00Z');
+const mkSeries = (n, skip, fn) => {
+  const out = [];
+  for (let i = 0; i < n; i++) { if (skip && skip.indexOf(i) !== -1) continue; out.push({ time: cdT0 + i*CD, close: fn(i) }); }
+  return out;
+};
+const cdGold = mkSeries(40, null, i => 2000 + i*2);
+const cdPerfect = mkSeries(40, null, i => 100 + i*0.5);
+const cdHoliday = mkSeries(40, [10], i => 100 + i*0.5);
+
+ok('a perfectly tracking driver correlates at 1',
+  Math.round(correlateByDay(cdGold, cdPerfect, 'price') * 100) / 100, 1);
+// One missing day is enough to wreck the index-zipped answer.
+ok('a single missing day does not break the aligned correlation',
+  correlateByDay(cdGold, cdHoliday, 'price') > 0.9, true);
+ok('while zipping by index badly understates it',
+  pearsonCorrelation(toDailyReturns(cdGold), seriesDeltas(cdHoliday, 'price')) < 0.6, true);
+// Correlation is between CHANGES, not levels: a driver whose level falls while
+// gold's rises can still have perfectly correlated day-to-day moves. To get -1
+// the driver's moves have to be the negative of gold's, so build it that way.
+const cdGoldChanges = toChanges(cdGold.map(p => p.close), 'price');
+const cdInverse = (() => {
+  const out = [{ time: cdT0, close: 2 }];
+  cdGoldChanges.forEach((ch, i) => out.push({ time: cdT0 + (i+1)*CD, close: out[i].close - ch * 100 }));
+  return out;
+})();
+ok('a driver moving opposite to gold correlates at -1',
+  Math.round(correlateByDay(cdGold, cdInverse, 'yield') * 100) / 100, -1);
+// A yield that ticks up by exactly the same amount every day is not moving in
+// any meaningful sense — and its floating-point residue must not be mistaken
+// for a weak relationship.
+ok('a constant-step yield reports no correlation rather than rounding noise',
+  correlateByDay(cdGold, mkSeries(40, null, i => 2 + i*0.01), 'yield'), null);
+ok('and a genuinely varying yield still correlates',
+  correlateByDay(cdGold, mkSeries(40, null, i => 2 + Math.sin(i/3)*0.2), 'yield') !== null, true);
+
+// refusals rather than bad numbers
+ok('too little overlap yields nothing, not a number',
+  correlateByDay(cdGold, mkSeries(4, null, i => 100 + i), 'price'), null);
+ok('no overlap at all yields nothing',
+  correlateByDay(cdGold, mkSeries(40, null, i => 100 + i).map(p => ({...p, time: p.time + 400*CD})), 'price'), null);
+ok('a missing driver yields nothing', correlateByDay(cdGold, null, 'price'), null);
+ok('a missing gold series yields nothing', correlateByDay(null, cdPerfect, 'price'), null);
+ok('a flat driver has no correlation to report',
+  correlateByDay(cdGold, mkSeries(40, null, () => 100), 'price'), null);
+
+// the aligned latest change comes from the same days the correlation used
+ok('the aligned latest change is the driver\'s own last move',
+  Math.round(alignedLatestChange(cdGold, cdPerfect, 'yield') * 100) / 100, 0.5);
+ok('and is null when there is nothing to align', alignedLatestChange(cdGold, [], 'price'), null);
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail?1:0);

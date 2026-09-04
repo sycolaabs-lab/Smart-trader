@@ -27,7 +27,7 @@ import {
   trainAdaBoostStumps, parseUtcDatetime, pearsonCorrelation, toDailyReturns,
   CORRELATION_INSTRUMENTS, FUNDAMENTAL_INSTRUMENTS, FRED_INSTRUMENTS,
   AUTONOMY_DEFAULTS, macroContribution, aggregateMacroScore, pctChangeOf,
-  seriesDeltas, latestChangeOf, ECONOMIC_RELEASES, buildReleaseCalendar,
+  seriesDeltas, latestChangeOf, correlateByDay, ECONOMIC_RELEASES, buildReleaseCalendar,
   newsWindowState, NEWS_WINDOW_DEFAULTS
 } from '../lib/engine.js';
 import { auditAnalysis, auditOpenTrades } from '../lib/auditor.js';
@@ -127,7 +127,7 @@ async function twelveSeries(key, interval, outputsize, symbol) {
 async function fredSeries(seriesId, fredKey, limit) {
   limit = limit || 60;
   const qs = new URLSearchParams({
-    series_id: seriesId, api_key: fredKey, file_type: 'json', sort_order: 'asc', limit: String(limit * 2)
+    series_id: seriesId, api_key: fredKey, file_type: 'json', sort_order: 'desc', limit: String(limit * 2)
   });
   const r = await fetch('https://api.stlouisfed.org/fred/series/observations?' + qs);
   const j = await r.json();
@@ -137,6 +137,8 @@ async function fredSeries(seriesId, fredKey, limit) {
     .filter(o => o.value !== '.')
     .map(o => ({ time: new Date(o.date + 'T00:00:00Z').getTime(), close: parseFloat(o.value) }));
   if (!obs.length) throw new Error('No usable data points');
+  // Newest-first from FRED; everything downstream expects oldest-first.
+  obs.sort((a, b) => a.time - b.time);
   return obs.slice(-limit);
 }
 
@@ -170,7 +172,6 @@ async function computeCorrelation(tdKey, fredKey, deadlineAt) {
   let xauDaily = null;
   try { xauDaily = await twelveSeries(tdKey, '1day', 60); await sleep(1200); }
   catch (e) { xauDaily = null; }
-  const xauRets = xauDaily ? toDailyReturns(xauDaily) : null;
 
   if (fredKey) {
     for (const inst of FRED_INSTRUMENTS) {
@@ -178,7 +179,9 @@ async function computeCorrelation(tdKey, fredKey, deadlineAt) {
       try {
         const obs = await fredSeries(inst.seriesId, fredKey, 60);
         // Yields use absolute (basis-point) changes; prices use returns.
-        const corr = xauRets ? pearsonCorrelation(xauRets, seriesDeltas(obs, inst.kind)) : null;
+        // Calendar-aligned: gold and FRED keep different holidays, and zipping
+        // by array position offsets everything before each one.
+        const corr = xauDaily ? correlateByDay(xauDaily, obs, inst.kind) : null;
         contributions.push(macroContribution(latestChangeOf(obs, inst.kind), corr, inst.polarity));
         contributors.push(inst.key);
       } catch (e) {
@@ -186,13 +189,13 @@ async function computeCorrelation(tdKey, fredKey, deadlineAt) {
       }
     }
   }
-  if (xauRets) {
+  if (xauDaily) {
     for (let i = 0; i < CORRELATION_INSTRUMENTS.length; i++) {
       const inst = CORRELATION_INSTRUMENTS[i];
       if (outOfTime()) { failures.push(inst.key + ': skipped, out of time'); continue; }
       try {
         const candles = await twelveSeries(tdKey, '1day', 60, inst.symbol);
-        const corr = pearsonCorrelation(xauRets, seriesDeltas(candles, inst.kind));
+        const corr = correlateByDay(xauDaily, candles, inst.kind);
         contributions.push(macroContribution(latestChangeOf(candles, inst.kind), corr, inst.polarity));
         contributors.push(inst.key);
       } catch (e) {
