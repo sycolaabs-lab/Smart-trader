@@ -469,6 +469,8 @@ canvas { width:100%; background:#12151c; border-radius:12px; border:1px solid #1
     <div class="params" style="margin-bottom:8px;">
       <div class="field"><label>Stand aside before (min)</label><input type="number" id="newsBeforeMin" value="30" step="5" min="0"></div>
       <div class="field"><label>And after (min)</label><input type="number" id="newsAfterMin" value="15" step="5" min="0"></div>
+      <div class="field"><label>Close positions before (min)</label><input type="number" id="newsFlattenMin" value="15" step="5" min="0" max="60"></div>
+      <div class="field"><label>Alert ahead (min)</label><input type="number" id="newsAlertMin" value="60" step="15" min="0"></div>
     </div>
     <label style="display:flex;align-items:center;gap:8px;font-size:11px;color:#c9cedb;cursor:pointer;">
       <input type="checkbox" id="newsBlockEnabled" checked style="accent-color:#ffa726;">
@@ -478,6 +480,23 @@ canvas { width:100%; background:#12151c; border-radius:12px; border:1px solid #1
       <input type="checkbox" id="newsBlockMedium" style="accent-color:#ffa726;">
       <span>Also block medium-impact (PPI, retail sales, claims, sentiment)</span>
     </label>
+    <label style="display:flex;align-items:center;gap:8px;font-size:11px;color:#c9cedb;cursor:pointer;margin-top:5px;">
+      <input type="checkbox" id="newsFlattenEnabled" checked style="accent-color:#ef4d5f;">
+      <span><strong>Close open positions before the release</strong> — cancel resting orders too</span>
+    </label>
+    <div class="conn-note" style="margin-top:7px;">
+      <strong style="color:#ef4d5f;">Flattening.</strong> Standing aside from new trades is only half the
+      protection — a position already open rides straight into the print. NFP routinely moves gold further in
+      ninety seconds than a normal stop is wide, and the spread widens at the same moment, so the stop fills
+      well past its level. Whatever comes out of that says nothing about whether the setup was any good.
+      <br><br>
+      So open positions are closed at the market and resting orders cancelled a set number of minutes ahead.
+      The money is booked — the trade really was closed — but the signal is recorded as <em>expired</em>, never
+      as a win or a loss, so a scheduled release can never masquerade as evidence about the analysis. Closed
+      trades cut short this way are counted separately from the win rate for the same reason.
+      <br><br>
+      The alert fires earlier than the close, so positions never simply disappear on someone watching.
+    </div>
     <div id="calendarList" style="margin-top:10px;"></div>
   </div>
 

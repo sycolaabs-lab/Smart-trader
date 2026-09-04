@@ -1,5 +1,6 @@
 import { auditFeedIntegrity } from '../lib/auditor.js';
-import { genData, correlateByDay, alignedLatestChange, pearsonCorrelation,
+import { newsAlertText, signalsToFlatten,
+  genData, correlateByDay, alignedLatestChange, pearsonCorrelation,
   resolveSignal, autonomyGate, mergeSignalLogs, newlyResolvedSignals,
   newlyArrivedOpenSignals, newlyExpiredSignals, signalResolutionRank, signalLiveness, shouldPaperTrade, paperRejectReason, interpretConfidence, confidenceBand,
   confidenceBands, breakevenWinRate, CONFIDENCE_PRACTICAL_MAX, CONFIDENCE_EVIDENCE } from '../lib/engine.js';
@@ -1161,6 +1162,80 @@ ok('the position records its lots', lotPos.lots > 0, true);
 ok('and the contract size it used', lotPos.contractSize, 100);
 ok('and what was originally asked for', lotPos.requestedRisk, 1000);
 ok('units and lots agree', near(lotPos.units, lotPos.lots * 100), true);
+
+
+// ============================================================
+// FLATTENING BEFORE A SCHEDULED RELEASE
+// ============================================================
+// Standing aside from new trades is only half the protection. A position
+// already open rides into the print, and NFP routinely moves gold further in
+// ninety seconds than a normal stop is wide.
+const NF_AT = Date.parse('2026-09-04T12:30:00Z');
+const nfCal = [{ key:'nfp', name:'Nonfarm Payrolls', impact:'high', at: NF_AT }];
+const nfMed = [{ key:'ppi', name:'PPI', impact:'medium', at: NF_AT }];
+const atMin = (m, cal, cfg) => newsWindowState(cal || nfCal, NF_AT - m*60000, cfg || {});
+
+// the escalation, in order
+ok('nothing at 90 minutes', [atMin(90).alert, atMin(90).blocked, atMin(90).flatten], [false, false, false]);
+ok('alert at 60', atMin(60).alert, true);
+ok('still trading at 60', atMin(60).blocked, false);
+ok('new trades blocked at 30', atMin(30).blocked, true);
+ok('but not flattening yet', atMin(30).flatten, false);
+ok('flattening at 15', atMin(15).flatten, true);
+ok('and still at 5', atMin(5).flatten, true);
+ok('nothing left to flatten after the print', atMin(-5).flatten, false);
+ok('the alert also stops after the print', atMin(-5).alert, false);
+ok('but the block window continues', atMin(-5).blocked, true);
+
+// what it says
+ok('the alert names the release', /Nonfarm Payrolls/.test(newsAlertText(atMin(45), {})), true);
+ok('and how long there is', /in 45 minutes/.test(newsAlertText(atMin(45), {})), true);
+ok('and warns what will happen', /Positions will be closed 15 minutes before it/.test(newsAlertText(atMin(45), {})), true);
+ok('at the flatten point it says it is acting now',
+  /closing open positions and cancelling resting orders now/.test(newsAlertText(atMin(10), {})), true);
+ok('with nothing upcoming there is nothing to say', newsAlertText(atMin(-5), {}), null);
+ok('a minute out reads naturally', /in 1 minute\b/.test(newsAlertText(atMin(1), {})), true);
+
+// configuration
+ok('flattening can be turned off', atMin(10, nfCal, { flattenEnabled: false }).flatten, false);
+ok('the lead time is configurable', atMin(25, nfCal, { flattenMin: 30 }).flatten, true);
+ok('a zero lead time disables it', atMin(1, nfCal, { flattenMin: 0 }).flatten, false);
+ok('disabling the calendar disables flattening', atMin(10, nfCal, { enabled: false }).flatten, false);
+ok('medium impact does not flatten by default', atMin(10, nfMed).flatten, false);
+ok('unless it is opted in', atMin(10, nfMed, { flattenImpacts: ['high','medium'] }).flatten, true);
+ok('the alert lead is configurable', atMin(100, nfCal, { alertMin: 120 }).alert, true);
+
+// which signals get closed, and how it is described
+const liveBook = [
+  { id:'open1', status:'open' }, { id:'rest1', status:'pending' },
+  { id:'won1', status:'won' }, { id:'dead1', status:'expired' }
+];
+const due = signalsToFlatten(liveBook, atMin(10));
+ok('only live trades are flattened', due.map(d => d.id), ['open1', 'rest1']);
+ok('an open position is closed at market', /closed at market/.test(due[0].reason), true);
+ok('a resting order is cancelled', /order cancelled/.test(due[1].reason), true);
+ok('the reason names the release', /before Nonfarm Payrolls/.test(due[0].reason), true);
+ok('and refuses to call it a verdict',
+  /not a verdict on the setup/.test(due[0].reason), true);
+ok('it carries the release for the record', due[0].release, 'Nonfarm Payrolls');
+ok('outside the window nothing is flattened', signalsToFlatten(liveBook, atMin(30)).length, 0);
+ok('an empty book flattens nothing', signalsToFlatten([], atMin(10)).length, 0);
+ok('a missing state flattens nothing', signalsToFlatten(liveBook, null).length, 0);
+
+// A flattened trade moved real money but settled no question about the setup,
+// so it must not count in the win rate.
+const acctPositions = [
+  { status:'closed', outcome:'won',  pnl: 300, rMultiple: 3, closedAt:'2026-01-01' },
+  { status:'closed', outcome:'lost', pnl: -100, rMultiple: -1, closedAt:'2026-01-02' },
+  { status:'closed', outcome:'expired', pnl: -20, rMultiple: -0.2, closedAt:'2026-01-03' }
+];
+const acctSum = paperAccountSummary(acctPositions, 10000, 2000);
+ok('every close moves the balance', acctSum.balance, 10180);
+ok('but only graded trades set the win rate', acctSum.winRate, 0.5);
+ok('the cut-short one is counted separately', acctSum.cutShortCount, 1);
+ok('and named in the graded count', acctSum.gradedCount, 2);
+ok('average R excludes it too', acctSum.avgR, 1);
+ok('all three still count as closed', acctSum.closedCount, 3);
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail?1:0);

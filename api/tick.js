@@ -28,7 +28,7 @@ import {
   CORRELATION_INSTRUMENTS, FUNDAMENTAL_INSTRUMENTS, FRED_INSTRUMENTS,
   AUTONOMY_DEFAULTS, macroContribution, aggregateMacroScore, pctChangeOf,
   seriesDeltas, latestChangeOf, correlateByDay, ECONOMIC_RELEASES, buildReleaseCalendar,
-  newsWindowState, NEWS_WINDOW_DEFAULTS
+  newsWindowState, NEWS_WINDOW_DEFAULTS, signalsToFlatten
 } from '../lib/engine.js';
 import { auditAnalysis, auditOpenTrades } from '../lib/auditor.js';
 
@@ -474,7 +474,29 @@ export async function runTick({ db, tdKey, fredKey, avKey }) {
       macroSeries: (corr.series || []).map(d => ({ key: d.key, label: d.label, series: d.series }))
     });
 
-    const newsState = newsWindowState(calendar, Date.now(), NEWS_WINDOW_DEFAULTS);
+    const newsCfg = Object.assign({}, NEWS_WINDOW_DEFAULTS, {
+      flattenEnabled: process.env.TICK_NEWS_FLATTEN !== '0',
+      flattenMin: envNum('TICK_NEWS_FLATTEN_MIN', NEWS_WINDOW_DEFAULTS.flattenMin)
+    });
+    const newsState = newsWindowState(calendar, Date.now(), newsCfg);
+
+    // Close everything ahead of a scheduled release. The unattended side needs
+    // this more than the browser does: nobody is watching to do it by hand, and
+    // a position left open through NFP resolves on a spike that says nothing
+    // about the setup. The signal is recorded as expired rather than won or
+    // lost, so it never reaches the learning loop as a verdict.
+    let flattenedThisTick = 0;
+    signalsToFlatten(state.signalLog, newsState).forEach(item => {
+      const sig = state.signalLog.find(x => x.id === item.id);
+      if (!sig || (sig.status !== 'pending' && sig.status !== 'open')) return;
+      sig.status = 'expired';
+      sig.expiryReason = item.reason;
+      sig.killSwitch = 'news-flatten';
+      sig.flattenedFor = item.release;
+      sig.resolvedAt = new Date().toISOString();
+      sig.resolvedBy = 'news';
+      flattenedThisTick++;
+    });
     const gateCfg = Object.assign({}, AUTONOMY_DEFAULTS, {
       newsState,
       gradeFloor: process.env.TICK_GRADE_FLOOR || AUTONOMY_DEFAULTS.gradeFloor,
@@ -570,6 +592,9 @@ export async function runTick({ db, tdKey, fredKey, avKey }) {
       metaExampleCount: examples.length,
       resolvedThisTick,
       killedThisTick,
+      flattenedThisTick,
+      newsFlatten: !!newsState.flatten,
+      newsFlattenFor: newsState.flattenRelease ? newsState.flattenRelease.name : null,
       tradeAuditReviewed: tradeAudit.reviewed,
       tradeAuditVerdict: tradeAudit.verdict,
       tookSignal,

@@ -360,6 +360,49 @@ against the fill limit, a filled one against the hold limit) and turns amber at
 
 ## Economic release calendar
 
+### Flattening: everything closes before the print
+
+Standing aside from *new* trades was only half the protection. A position
+already open rides straight into the release, and NFP routinely moves gold
+further in ninety seconds than a normal stop is wide — with the spread widening
+at the same moment, so the stop fills well past its level. Whatever comes out of
+that says nothing about whether the setup was sound.
+
+The escalation, for a high-impact release:
+
+| Time before | What happens |
+|---|---|
+| 60 min | **Alert** — banner, and a desktop notification if permitted |
+| 30 min | No new positions taken |
+| **15 min** | **Open positions closed at market, resting orders cancelled** |
+| 0 → +15 min | Still standing aside while the spike settles |
+
+All four are configurable; flattening can be switched off entirely. Nothing is
+flattened once the release has printed — there is no longer anything to get out
+of the way of, and re-closing afterwards would cut short trades taken *since*.
+
+**The money is booked, the verdict is not.** The position really was closed at
+the market, so its P&L is real and belongs in the balance, the equity curve and
+the drawdown. But the *signal* is recorded as `expired`, never won or lost, so a
+scheduled release can never masquerade as evidence about the analysis. Same
+principle as the kill switch.
+
+That distinction reaches the account stats too: **win rate, profit factor and
+average R are computed from graded trades only** — the ones that actually
+reached their stop or target. Trades cut short by a rule are counted separately
+as `cutShortCount`. Counting a flattened trade as a loss would claim the
+analysis was wrong when nothing of the sort was established.
+
+The check runs on its own 30-second timer and **immediately on load**, not only
+inside an analysis cycle. Cycles can be fifteen minutes apart and a release does
+not wait for one; a tab opened ten minutes before NFP must act at once rather
+than on its first heartbeat. The worker does the same on every tick
+(`TICK_NEWS_FLATTEN=0` to disable, `TICK_NEWS_FLATTEN_MIN` to change the lead) —
+it needs this more than the browser does, since nobody is watching to do it by
+hand.
+
+
+
 The fundamental series tracked here are *published* numbers, which arrive with a
 lag — they say what CPI was, never that CPI is out in twenty minutes. NFP, CPI
 and FOMC routinely move gold tens of dollars in seconds: spreads widen, and a

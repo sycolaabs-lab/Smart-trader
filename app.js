@@ -20,7 +20,7 @@ import {
   openPaperPosition, closePaperPosition, unrealisedPnl, paperAccountSummary, shouldPaperTrade,
   paperRejectReason,
   GATE_LABELS, PARTIAL_TP_DEFAULTS, fillPaperPosition,
-  NEWS_WINDOW_DEFAULTS, newsWindowState, explainMarket,
+  NEWS_WINDOW_DEFAULTS, newsWindowState, newsAlertText, signalsToFlatten, explainMarket,
   fitMacroModel, macroModelScore, describeMacroModel, alignByDay,
   mergeSignalLogs, newlyResolvedSignals, newlyArrivedOpenSignals, newlyExpiredSignals,
   interpretConfidence, confidenceBand, CONFIDENCE_PRACTICAL_MAX, signalLiveness
@@ -752,6 +752,10 @@ if (confMoreToggle) confMoreToggle.addEventListener('click', () => {
   const hidden = more.classList.toggle('hidden');
   confMoreToggle.textContent = hidden ? 'what is this number?' : 'hide';
 });
+['newsFlattenEnabled', 'newsBlockEnabled'].forEach(id => {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener('change', () => { requestReleaseNotifications(); renderCalendar(); });
+});
 document.getElementById('bgSetupToggle').addEventListener('click', () => {
   document.getElementById('bgSetupNote').classList.toggle('hidden');
 });
@@ -1320,6 +1324,9 @@ function startLivePolling() {
   // The feed just changed wholesale. Whatever the audit said about the previous
   // one describes nothing that is still on screen.
   auditAfterFeedChange();
+  // A freshly loaded calendar may put a release minutes away that the system
+  // did not know about a moment ago.
+  try { flattenForNews(); } catch (e) { /* the watch will retry */ }
 }
 let lastPriceUpdateTime = null;
 // The dedicated price endpoint costs one credit per call and only nudges the
@@ -2394,21 +2401,132 @@ async function refreshCalendar(force) {
   } catch (e) { /* the calendar is an enhancement; never block analysis on it */ }
   renderCalendar();
 }
-function currentNewsState() {
-  return newsWindowState(releaseCalendar, Date.now(), {
+function newsConfig() {
+  const num = (id, fb) => { const v = parseFloat((document.getElementById(id) || {}).value); return isFinite(v) ? v : fb; };
+  const impacts = ((document.getElementById('newsBlockMedium') || {}).checked) ? ['high', 'medium'] : ['high'];
+  return {
     enabled: (document.getElementById('newsBlockEnabled') || { checked: true }).checked,
-    beforeMin: parseFloat((document.getElementById('newsBeforeMin') || {}).value) || NEWS_WINDOW_DEFAULTS.beforeMin,
-    afterMin: parseFloat((document.getElementById('newsAfterMin') || {}).value) || NEWS_WINDOW_DEFAULTS.afterMin,
-    blockImpacts: ((document.getElementById('newsBlockMedium') || {}).checked) ? ['high', 'medium'] : ['high']
-  });
+    beforeMin: num('newsBeforeMin', NEWS_WINDOW_DEFAULTS.beforeMin),
+    afterMin: num('newsAfterMin', NEWS_WINDOW_DEFAULTS.afterMin),
+    blockImpacts: impacts,
+    flattenEnabled: (document.getElementById('newsFlattenEnabled') || { checked: true }).checked,
+    flattenMin: num('newsFlattenMin', NEWS_WINDOW_DEFAULTS.flattenMin),
+    flattenImpacts: impacts,
+    alertMin: num('newsAlertMin', NEWS_WINDOW_DEFAULTS.alertMin)
+  };
 }
+function currentNewsState() {
+  return newsWindowState(releaseCalendar, Date.now(), newsConfig());
+}
+
+// Close everything ahead of a scheduled release.
+//
+// Standing aside from NEW trades was only half the protection: a position
+// already open rides into the print, and NFP routinely moves gold further in
+// ninety seconds than a normal stop is wide, with the spread widening at the
+// same moment so the stop fills well past its level. Whatever comes out of that
+// says nothing about whether the setup was sound.
+//
+// The money is booked — the position really was closed at the market — but the
+// SIGNAL is marked expired, not won or lost, so it never reaches the learning
+// loop as a verdict. Same principle as the kill switch.
+function flattenForNews() {
+  const st = currentNewsState();
+  const due = signalsToFlatten(signalLog, st);
+  if (!due.length) return 0;
+  const price = currentMarkPrice();
+  let done = 0;
+  due.forEach(item => {
+    const sig = signalLog.find(x => x.id === item.id);
+    if (!sig || (sig.status !== 'pending' && sig.status !== 'open')) return;
+    // A resting order is cancelled; a filled one is closed at the market. Both
+    // go through the same paper path, which already books a pending order as
+    // cancelled with no P&L and an open one at the mark.
+    paperCloseForSignal(sig.id, 'expired', isFinite(price) ? price : undefined);
+    sig.status = 'expired';
+    sig.expiryReason = item.reason;
+    sig.killSwitch = 'news-flatten';
+    sig.flattenedFor = item.release;
+    sig.resolvedAt = new Date().toISOString();
+    sig.resolvedBy = 'news';
+    done++;
+  });
+  if (done) {
+    saveSignalLog();
+    renderSignalLog();
+    renderPaper();
+    renderAutonomyStats();
+    renderDataInventory();
+  }
+  return done;
+}
+// One notification per release, tracked by its timestamp so a re-render or a
+// heartbeat cannot fire it repeatedly.
+let notifiedReleases = {};
+function maybeNotifyRelease(st, text) {
+  const ev = st && (st.flattenRelease || st.alertRelease);
+  if (!ev || !text) return;
+  const key = ev.name + '@' + ev.at + (st.flatten ? ':flatten' : ':alert');
+  if (notifiedReleases[key]) return;
+  notifiedReleases[key] = true;
+  // Keep the map from growing without bound over a long unattended run.
+  const keys = Object.keys(notifiedReleases);
+  if (keys.length > 40) { notifiedReleases = {}; notifiedReleases[key] = true; }
+  try {
+    if (typeof Notification === 'undefined' || Notification.permission !== 'granted') return;
+    new Notification(st.flatten ? 'Closing positions before ' + ev.name : 'Upcoming: ' + ev.name, { body: text });
+  } catch (e) { /* notifications unavailable or blocked — the banner still shows */ }
+}
+
+// Checked on its own timer rather than only inside an analysis cycle. The cycle
+// can be 15 minutes apart, and a release does not wait for it; a position must
+// not still be open because the next heartbeat had not come round yet.
+const NEWS_WATCH_MS = 30 * 1000;
+let newsWatchHandle = null;
+// Browser notifications need a user gesture to ask. Ticking the box that makes
+// the system close positions on its own is exactly the moment to offer it.
+function requestReleaseNotifications() {
+  try {
+    if (typeof Notification === 'undefined') return;
+    if (Notification.permission === 'default') Notification.requestPermission();
+  } catch (e) { /* not available in this context */ }
+}
+
+function startNewsWatch() {
+  if (newsWatchHandle) clearInterval(newsWatchHandle);
+  const pass = () => {
+    try {
+      flattenForNews();
+      renderCalendar();
+    } catch (e) { /* never let the watch die on one bad pass */ }
+  };
+  // Immediately, not in thirty seconds. A release can already be minutes away
+  // when the page opens — the tab may have been closed through the whole
+  // approach — and waiting for the first tick would leave positions exposed
+  // through exactly the window this exists to clear.
+  pass();
+  newsWatchHandle = setInterval(pass, NEWS_WATCH_MS);
+}
+
 function renderCalendar() {
   const banner = document.getElementById('newsBanner');
   const list = document.getElementById('calendarList');
   if (!banner || !list) return;
   const st = currentNewsState();
 
-  if (st.active) {
+  // The alert comes first and reaches furthest out. Positions being closed is
+  // the most consequential thing this system does on its own, so it is
+  // announced before it happens rather than discovered afterwards.
+  const alertTxt = newsAlertText(st, newsConfig());
+  if (st.flatten || st.alert) {
+    const live = signalLog.filter(x => x.status === 'pending' || x.status === 'open').length;
+    banner.classList.remove('hidden');
+    banner.innerHTML = (st.flatten ? '🚨 ' : '⏳ ') + '<strong>' + escapeAttr(alertTxt) + '</strong>'
+      + (live ? '<br><span style="font-size:10px;">' + live + ' live trade(s) ' + (st.flatten ? 'being closed now.' : 'will be closed.') + '</span>' : '');
+    banner.style.background = st.flatten ? '#2a0d10' : '#2a1408';
+    banner.style.borderColor = st.flatten ? '#6a1f26' : '#5a3a12';
+    banner.style.color = st.flatten ? '#ef4d5f' : '#ffa726';
+  } else if (st.active) {
     const mins = Math.round(Math.abs(st.active.minutesUntil));
     const when = st.active.phase === 'before' ? 'in ' + mins + ' min' : mins + ' min ago';
     banner.classList.remove('hidden');
@@ -2420,6 +2538,11 @@ function renderCalendar() {
   } else {
     banner.classList.add('hidden');
   }
+
+  // A desktop notification for the alert, once per release. The banner is no
+  // use to someone who has left the tab running in the background, which is
+  // precisely how this app is meant to be used.
+  maybeNotifyRelease(st, alertTxt);
 
   if (!releaseCalendar.length) {
     list.innerHTML = '<div class="zone-empty">No calendar loaded — needs a FRED key (the same one the correlation engine uses).</div>';
@@ -3306,7 +3429,8 @@ const SETTINGS_IDS = [
   // signal + backtest
   'targetRR', 'pBars', 'pCapital', 'pRisk', 'pCostPips', 'pMinConf', 'pTargetRR',
   // news window and macro model
-  'newsBeforeMin', 'newsAfterMin', 'newsBlockEnabled', 'newsBlockMedium', 'useMacroModel'
+  'newsBeforeMin', 'newsAfterMin', 'newsBlockEnabled', 'newsBlockMedium',
+  'newsFlattenEnabled', 'newsFlattenMin', 'newsAlertMin', 'useMacroModel'
 ];
 
 function saveSettings() {
@@ -3431,6 +3555,7 @@ async function bootstrap() {
   renderSignalLog();   // first render happened before the paper account loaded
   startLivenessTicker();
   startUpdateWatch();
+  startNewsWatch();
   renderQuota();
   renderAutonomyStats();
   renderAnalysisQuality();
