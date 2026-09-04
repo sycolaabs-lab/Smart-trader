@@ -3,7 +3,8 @@
 // clean case checks it does not invent problems that are not there.
 import { auditAnalysis, auditData, auditPlan, auditEvidence, auditFreshness,
   auditTrade, auditOpenTrades, TRADE_AUDIT_DEFAULTS,
-  auditFeedIntegrity, auditCrossSeries, auditMacroSeries } from '../lib/auditor.js';
+  auditFeedIntegrity, auditCrossSeries, auditMacroSeries, auditSeriesFreshness,
+  SERIES_FRESHNESS } from '../lib/auditor.js';
 
 let pass=0, fail=0;
 const ok=(n,a,e)=>{const g=JSON.stringify(a)===JSON.stringify(e);console.log((g?'PASS':'FAIL')+' '+n+(g?'':`  got=${JSON.stringify(a)} want=${JSON.stringify(e)}`));g?pass++:fail++;};
@@ -207,6 +208,80 @@ ok('with a readable date', /\d{4}-\d{2}-\d{2}/.test(findF(auditMacroSeries(engin
 ok('a series with one observation is not judged',
   auditMacroSeries([{ key:'x', label:'X', observations: obsFrom(0, 1, 5) }], MNOW).length, 0);
 
+
+// ============================================================
+// EACH TIMEFRAME MUST BE CURRENT BY ITS OWN CLOCK
+// ============================================================
+// auditFreshness watches the 15-minute feed. Nothing watched the higher ones —
+// and weekly, daily, 4H and 1H carry roughly 45 of the composite's ~109 weight.
+// A 4H series frozen nine days ago still holds a plausible gold price, so the
+// level check passes and the analysis runs at full confidence.
+const SF_NOW = Date.parse('2026-09-04T12:00:00Z');   // a Friday
+const sfSeries = (n, stepMs, endAt) => Array.from({length:n}, (_, i) => {
+  const p = 2000 + Math.sin(i/7)*4;
+  return { time: endAt - (n-1-i)*stepMs, open:p-0.4, high:p+1, low:p-1, close:p };
+});
+const H = 3600000, DAY = 86400000;
+const sf = (series) => auditSeriesFreshness(series, SF_NOW);
+const hasSF = (arr) => arr.some(f => f.code === 'series-stale');
+const findSF = (arr) => arr.find(f => f.code === 'series-stale');
+
+// current series raise nothing
+ok('a current 4H series is fine', sf({ '4H': sfSeries(60, 4*H, SF_NOW) }).length, 0);
+ok('a current daily series is fine', sf({ Daily: sfSeries(60, DAY, SF_NOW) }).length, 0);
+ok('a current weekly series is fine', sf({ Weekly: sfSeries(40, 7*DAY, SF_NOW) }).length, 0);
+ok('a current 15m series is fine', sf({ '15m': sfSeries(200, 9e5, SF_NOW) }).length, 0);
+
+// the failure this exists for
+const frozen4H = { '4H': sfSeries(60, 4*H, SF_NOW - 9*DAY) };
+ok('a 4H series frozen nine days ago is caught', hasSF(sf(frozen4H)), true);
+ok('and it is critical', findSF(sf(frozen4H)).severity, 'critical');
+ok('the finding names the timeframe', /The 4H series has stopped updating/.test(findSF(sf(frozen4H)).title), true);
+ok('and says the structure is frozen', /Structure on this timeframe is frozen/.test(findSF(sf(frozen4H)).detail), true);
+ok('and that it still counts in the score', /still carries its full weight/.test(findSF(sf(frozen4H)).detail), true);
+ok('and gives the newest bar', /newest bar is 20\d\d-/.test(findSF(sf(frozen4H)).detail), true);
+
+// a shorter gap warns rather than blocks
+const lag4H = { '4H': sfSeries(60, 4*H, SF_NOW - 36*H) };
+ok('a day and a half behind is a warning', findSF(sf(lag4H)).severity, 'warning');
+
+// weekends must not read as staleness
+// Friday 21:00 UTC close, checked Sunday 12:00 UTC — no trading in between.
+const FRI_CLOSE = Date.parse('2026-09-04T21:00:00Z');
+const SUN = Date.parse('2026-09-06T12:00:00Z');
+ok('a Friday close is not stale on Sunday',
+  auditSeriesFreshness({ '15m': sfSeries(300, 9e5, FRI_CLOSE) }, SUN).length, 0);
+ok('nor is a 4H series over the weekend',
+  auditSeriesFreshness({ '4H': sfSeries(60, 4*H, FRI_CLOSE) }, SUN).length, 0);
+ok('nor a daily one',
+  auditSeriesFreshness({ Daily: sfSeries(60, DAY, FRI_CLOSE) }, SUN).length, 0);
+
+// each series is judged on its own cadence, not a shared clock
+const mixed = { '15m': sfSeries(200, 9e5, SF_NOW), '4H': sfSeries(60, 4*H, SF_NOW - 9*DAY), Weekly: sfSeries(40, 7*DAY, SF_NOW) };
+ok('only the stale one is reported', sf(mixed).length, 1);
+ok('and it is the right one', /4H/.test(findSF(sf(mixed)).title), true);
+// Three hours is nothing for a weekly series and an outage for a 15-minute one.
+ok('three hours does not trouble a weekly series',
+  auditSeriesFreshness({ Weekly: sfSeries(40, 7*DAY, SF_NOW - 3*H) }, SF_NOW).length, 0);
+ok('but it does trouble a 15-minute one',
+  hasSF(auditSeriesFreshness({ '15m': sfSeries(200, 9e5, SF_NOW - 3*H) }, SF_NOW)), true);
+
+// robustness
+ok('no series at all is fine', sf({}).length, 0);
+ok('a null series is skipped', sf({ '4H': null }).length, 0);
+ok('too few bars to infer a cadence is skipped', sf({ '4H': sfSeries(2, 4*H, SF_NOW - 9*DAY) }).length, 0);
+ok('the thresholds are ordered', SERIES_FRESHNESS.warnBars < SERIES_FRESHNESS.criticalBars, true);
+
+// and it reaches the assembled audit as a DATA fault, not a reasoning one
+const stalled = auditAnalysis({
+  result: { direction:'BUY', confidence:40, price:2000, atr:5, factors:{htf:1}, weights:{htf:10} },
+  plan: { entry:2000, sl:1990, tp:2040, rr:4, entryType:'market' },
+  candles: sfSeries(200, 9e5, SF_NOW), expectedIntervalMs: 9e5, now: SF_NOW, maxAgeMs: 45*60000,
+  series: { '15m': sfSeries(200, 9e5, SF_NOW), '4H': sfSeries(60, 4*H, SF_NOW - 9*DAY) }
+});
+ok('a stalled timeframe blocks', stalled.blocking, true);
+ok('and is blamed on the data', stalled.dataProblem, true);
+ok('and named in the verdict', /series has stopped updating/.test(stalled.verdict), true);
 console.log('\n-- assembly --');
 const broken = auditAnalysis({ result:{...buyResult, factors:{htf:-1}, weights:{htf:10}}, plan:{...buyPlan, sl:2010, rr:99},
   candles:unordered, expectedIntervalMs:BAR, now:Date.now(), maxAgeMs:30*MIN });
@@ -233,12 +308,14 @@ console.log('\n-- market hours: the auditor must not cry wolf --');
 // on EVERY window purely from the weekend — a permanent false warning that
 // teaches you to ignore the auditor, and close enough to the critical
 // threshold that a holiday would have blocked trading outright.
-import { expectedBarsExcludingWeekend } from '../lib/auditor.js';
+import { expectedBarsExcludingWeekend, isMarketOpen, MARKET_WEEK } from '../lib/auditor.js';
+// Bars only when gold is actually open: Sunday 22:00 UTC through Friday 21:00.
+// Generating Friday-evening bars made this fixture unrealistic in exactly the
+// way the coverage check now measures.
 function weekdayBars(n, startUtc){
   const out=[]; let t=startUtc; let p=2000;
   while(out.length<n){
-    const dow=new Date(t).getUTCDay();
-    if(dow!==0&&dow!==6){p+=0.5; out.push({time:t,open:p,high:p+2,low:p-2,close:p});}
+    if(isMarketOpen(t)){p+=0.5; out.push({time:t,open:p,high:p+2,low:p-2,close:p});}
     t+=BAR;
   }
   return out;
@@ -248,8 +325,22 @@ const realAudit = auditData(realistic, BAR);
 ok('a normal weekday feed raises NOTHING', realAudit.length, 0);
 ok('no false coverage warning', has(realAudit,'thin-coverage'), false);
 ok('no false gap warning', has(realAudit,'gappy-feed'), false);
-ok('weekend-aware count matches the bars received',
+ok('session-aware count matches the bars received',
    expectedBarsExcludingWeekend(realistic[0].time, realistic[realistic.length-1].time, BAR), 500);
+
+// The trading week is Sunday 22:00 UTC to Friday 21:00 UTC. Counting whole
+// weekend DAYS only left Friday evening and Sunday evening looking tradeable,
+// which was enough to make a normal Friday close read as a stalled feed.
+ok('midweek is open', isMarketOpen(Date.UTC(2026,8,2,12,0,0)), true);
+ok('Saturday is shut', isMarketOpen(Date.UTC(2026,8,5,12,0,0)), false);
+ok('Sunday morning is shut', isMarketOpen(Date.UTC(2026,8,6,12,0,0)), false);
+ok('Sunday evening is open', isMarketOpen(Date.UTC(2026,8,6,23,0,0)), true);
+ok('Friday afternoon is open', isMarketOpen(Date.UTC(2026,8,4,20,0,0)), true);
+ok('Friday night is shut', isMarketOpen(Date.UTC(2026,8,4,22,0,0)), false);
+ok('a Friday close to Sunday midday is a single bar',
+   expectedBarsExcludingWeekend(Date.UTC(2026,8,4,21,0,0), Date.UTC(2026,8,6,12,0,0), BAR), 1);
+ok('the session hours are stated once',
+   [MARKET_WEEK.closesFridayUtcHour, MARKET_WEEK.opensSundayUtcHour], [21, 22]);
 
 // starting on a Friday, so the span definitely straddles a weekend
 const fri = weekdayBars(400, Date.UTC(2026,7,7,0,0,0));

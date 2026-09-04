@@ -1016,23 +1016,41 @@ document.getElementById('rememberKeysCheckbox').addEventListener('change', () =>
   else if (apiKey) saveKeysIfRemembered();
 });
 
+// Fetch each higher timeframe, and record what happened to it.
+//
+// A failure here used to set the series to [] and say nothing. That is not
+// inert: with no real 4H bars the engine AGGREGATES 4H structure from 15-minute
+// candles instead. It is a reasonable fallback and it is not the same thing —
+// the score still reports 4H trend with full weight while reading synthesised
+// bars — so it has to be visible rather than assumed.
 async function fetchHigherTimeframes(provider, key) {
-  if (provider.mtfInterval && spendCredit('normal')) {
-    try { mtfData = await provider.timeSeries(key, provider.mtfInterval, 300); }
-    catch (e) { mtfData = []; }
-  } else mtfData = [];
-  if (provider.htfInterval && spendCredit('normal')) {
-    try { htfData = await provider.timeSeries(key, provider.htfInterval, 200); }
-    catch (e) { htfData = []; }
-  } else htfData = [];
-  if (provider.dailyInterval && spendCredit('normal')) {
-    try { dailyData = await provider.timeSeries(key, provider.dailyInterval, 200); }
-    catch (e) { dailyData = []; }
-  } else dailyData = [];
-  if (provider.weeklyInterval && spendCredit('normal')) {
-    try { weeklyData = await provider.timeSeries(key, provider.weeklyInterval, 104); } // ~2 years of weekly bars
-    catch (e) { weeklyData = []; }
-  } else weeklyData = [];
+  const one = async (label, interval, bars, assign) => {
+    if (!interval) { assign([]); timeframeHealth[label] = { ok: true, skipped: 'provider has no such interval' }; return; }
+    if (!spendCredit('normal')) {
+      assign([]);
+      timeframeHealth[label] = { ok: false, reason: 'skipped to stay inside the daily API budget', aggregated: true, at: Date.now() };
+      return;
+    }
+    try {
+      const d = await provider.timeSeries(key, interval, bars);
+      if (!Array.isArray(d) || !d.length) throw new Error('provider returned no candles');
+      assign(d);
+      timeframeHealth[label] = { ok: true, at: Date.now() };
+    } catch (e) {
+      assign([]);
+      timeframeHealth[label] = {
+        ok: false,
+        reason: (e && e.message) || String(e),
+        aggregated: true,
+        at: Date.now()
+      };
+    }
+  };
+  await one('1H', provider.mtfInterval, 300, d => { mtfData = d; });
+  await one('4H', provider.htfInterval, 200, d => { htfData = d; });
+  await one('Daily', provider.dailyInterval, 200, d => { dailyData = d; });
+  await one('Weekly', provider.weeklyInterval, 104, d => { weeklyData = d; }); // ~2 years
+  renderTimeframeHealth();
 }
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
@@ -1302,12 +1320,12 @@ function startLivePolling() {
   resyncHandle = setInterval(() => { if (!autonomy.enabled) resyncCandles(); }, provider.resyncMinutes * 60 * 1000);
   // Higher timeframes resync on their own natural cadence — no point re-fetching a 4H
   // candle that hasn't closed yet, and it's cheaper on the API quota than constant polling.
-  if (provider.mtfInterval) mtfResyncHandle = setInterval(() => { if (!spendCredit('normal')) return; PROVIDERS[activeProvider].timeSeries(apiKey, provider.mtfInterval, 300).then(d => { mtfData = d; refreshAll(); }).catch(() => {}); }, 60 * 60 * 1000);
-  if (provider.htfInterval) htfResyncHandle = setInterval(() => { if (!spendCredit('normal')) return; PROVIDERS[activeProvider].timeSeries(apiKey, provider.htfInterval, 200).then(d => { htfData = d; refreshAll(); }).catch(() => {}); }, 4 * 60 * 60 * 1000);
+  if (provider.mtfInterval) mtfResyncHandle = setInterval(() => resyncTimeframe('1H', provider.mtfInterval, 300, d => { mtfData = d; }), 60 * 60 * 1000);
+  if (provider.htfInterval) htfResyncHandle = setInterval(() => resyncTimeframe('4H', provider.htfInterval, 200, d => { htfData = d; }), 4 * 60 * 60 * 1000);
   // Daily/weekly candles barely move intraday — resyncing a few times a day (daily) or once a day
   // (weekly) is plenty and keeps this well clear of any provider's rate limit.
-  if (provider.dailyInterval) dailyResyncHandle = setInterval(() => { if (!spendCredit('normal')) return; PROVIDERS[activeProvider].timeSeries(apiKey, provider.dailyInterval, 200).then(d => { dailyData = d; refreshAll(); }).catch(() => {}); }, 12 * 60 * 60 * 1000);
-  if (provider.weeklyInterval) weeklyResyncHandle = setInterval(() => { if (!spendCredit('normal')) return; PROVIDERS[activeProvider].timeSeries(apiKey, provider.weeklyInterval, 104).then(d => { weeklyData = d; refreshAll(); }).catch(() => {}); }, 24 * 60 * 60 * 1000);
+  if (provider.dailyInterval) dailyResyncHandle = setInterval(() => resyncTimeframe('Daily', provider.dailyInterval, 200, d => { dailyData = d; }), 12 * 60 * 60 * 1000);
+  if (provider.weeklyInterval) weeklyResyncHandle = setInterval(() => resyncTimeframe('Weekly', provider.weeklyInterval, 104, d => { weeklyData = d; }), 24 * 60 * 60 * 1000);
   // Correlation uses daily bars — no point checking more than a few times a day.
   if (corrResyncHandle) clearInterval(corrResyncHandle);
   corrResyncHandle = setInterval(() => {
@@ -1328,6 +1346,59 @@ function startLivePolling() {
   // did not know about a moment ago.
   try { flattenForNews(); } catch (e) { /* the watch will retry */ }
 }
+// Higher-timeframe resyncs used to end in `.catch(() => {})`. A failure was
+// therefore completely silent: the series simply stopped updating while the
+// engine kept scoring structure off it. Weekly, daily, 4H and 1H together carry
+// roughly 45 of the composite's ~109 weight, so the largest block of the score
+// could be describing a market from days ago with nothing on screen to say so.
+//
+// Failures are now counted, surfaced, and left where the auditor can see them —
+// it checks each series against its own cadence and reports one that has
+// stopped moving.
+const timeframeHealth = {};
+
+async function resyncTimeframe(label, interval, bars, assign) {
+  if (!spendCredit('normal')) {
+    timeframeHealth[label] = { ok: false, reason: 'skipped to stay inside the daily API budget', at: Date.now() };
+    renderTimeframeHealth();
+    return;
+  }
+  try {
+    const d = await PROVIDERS[activeProvider].timeSeries(apiKey, interval, bars);
+    if (!Array.isArray(d) || !d.length) throw new Error('provider returned no candles');
+    assign(d);
+    timeframeHealth[label] = { ok: true, at: Date.now() };
+    renderTimeframeHealth();
+    refreshAll();
+  } catch (e) {
+    const prev = timeframeHealth[label] || {};
+    timeframeHealth[label] = {
+      ok: false,
+      reason: (e && e.message) || String(e),
+      failures: (prev.failures || 0) + 1,
+      at: Date.now()
+    };
+    renderTimeframeHealth();
+  }
+}
+
+function renderTimeframeHealth() {
+  const el = document.getElementById('timeframeHealth');
+  if (!el) return;
+  const bad = Object.keys(timeframeHealth).filter(k => !timeframeHealth[k].ok);
+  if (!bad.length) { el.textContent = ''; el.classList.add('hidden'); return; }
+  el.classList.remove('hidden');
+  const aggregated = bad.filter(k => timeframeHealth[k].aggregated);
+  el.innerHTML = '⚠️ <strong>Higher-timeframe data is not loading.</strong> '
+    + bad.map(k => k + ' — ' + escapeAttr(timeframeHealth[k].reason)
+        + (timeframeHealth[k].failures > 1 ? ' (' + timeframeHealth[k].failures + ' attempts)' : '')).join('; ')
+    + '. '
+    + (aggregated.length
+        ? escapeAttr(aggregated.join(' and ')) + ' structure is being AGGREGATED from 15-minute candles rather than read from real bars, '
+          + 'and still carries its full weight in the score.'
+        : 'Structure on those timeframes is frozen and still carries its full weight in the score.');
+}
+
 let lastPriceUpdateTime = null;
 // The dedicated price endpoint costs one credit per call and only nudges the
 // last candle's close — which the candle resync already refreshes properly. At
@@ -3508,6 +3579,7 @@ function wireSettingsPersistence() {
 // must-revalidate, so this is cheap.
 const UPDATE_CHECK_MS = 30 * 60 * 1000;
 let loadedBuildTag = null;
+let updateWatchHandle = null;
 
 async function currentBuildTag() {
   try {
@@ -3531,7 +3603,8 @@ function startUpdateWatch() {
   const reload = document.getElementById('updateReload');
   if (reload) reload.addEventListener('click', () => window.location.reload());
   checkForNewBuild();
-  setInterval(checkForNewBuild, UPDATE_CHECK_MS);
+  if (updateWatchHandle) clearInterval(updateWatchHandle);
+  updateWatchHandle = setInterval(checkForNewBuild, UPDATE_CHECK_MS);
 }
 
 async function bootstrap() {

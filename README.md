@@ -612,6 +612,44 @@ And every macro row — correlation and fundamental alike — now carries the
 publication date of its newest observation, amber past 45 days and red past 120.
 The whole episode was possible because nothing on screen carried a date.
 
+### The higher timeframes could freeze without a word
+
+Two faults that only mattered together, and together were the most consequential
+thing in the system.
+
+**The resyncs swallowed their own failures.** The 1H, 4H, daily and weekly
+refetches each ended in `.catch(() => {})`. A failure was completely silent: the
+series stopped updating while the engine went on scoring structure off it.
+
+**Nothing audited their age.** `auditFreshness` watches the 15-minute feed;
+`auditCrossSeries` compares the timeframes' price *levels* but never their
+*ages*. A 4H series frozen nine days ago still holds a perfectly plausible gold
+price, so it passed. Verified before fixing: a nine-day-stale 4H series produced
+`No problems found`.
+
+Weekly, daily, 4H and 1H carry roughly **45 of the composite's ~109 weight**, so
+the largest block of the score could be describing a market from days ago at
+full confidence.
+
+Now: every resync reports its failures, and the audit checks each series against
+**its own cadence** — staleness measured in *bars missed*, so three hours is
+nothing for a weekly series and an outage for a 15-minute one.
+
+There is also a quieter case on the connect path, which did not fail silently so
+much as fail *invisibly*: when a higher timeframe cannot be fetched the series is
+set empty, and the engine then **aggregates** that timeframe from 15-minute
+candles. That is a reasonable fallback and it is not the same thing — the score
+still reports 4H trend at full weight while reading synthesised bars. The banner
+now says which is happening.
+
+### The trading week, properly
+
+Fixing the above surfaced a third: the weekend model excluded whole UTC *days*,
+but gold trades Sunday ~22:00 UTC to Friday ~21:00 UTC. Those few hours of
+phantom Friday evening were enough to make a normal Friday close read as a
+stalled feed all weekend. `isMarketOpen` now models the real session, which also
+makes the data-coverage percentage correct rather than approximately correct.
+
 ### Earlier finds
 
 The feed checks found a real bug on their first run. `genData`, the demo feed
