@@ -158,7 +158,7 @@ ok('summary calm when low', /Within budget/.test(quotaSummary({day:'d',used:50},
 
 
 // ---------------- paper trading ----------------
-import { PAPER_DEFAULTS, worsePrice, paperPositionSize, openPaperPosition,
+import { roundToLotStep, PAPER_DEFAULTS, worsePrice, paperPositionSize, openPaperPosition,
          closePaperPosition, unrealisedPnl, paperAccountSummary } from '../lib/engine.js';
 console.log('\n-- paper trading --');
 const PCFG = { startingBalance:10000, riskPercent:1, spreadPips:3, slippagePips:1, maxConcurrent:3 };
@@ -170,17 +170,25 @@ ok('sell entry pays the spread', worsePrice(2000,'SELL','entry',3,0.1), 1999.7);
 ok('buy stop exit slips down', worsePrice(1990,'BUY','exit',1,0.1), 1989.9);
 ok('sell stop exit slips up', worsePrice(2010,'SELL','exit',1,0.1), 2010.1);
 
-// sizing makes the stop cost exactly the configured risk
+// Sizing is in LOTS, so the risk taken is the requested risk rounded to a size a
+// broker would actually accept. Both numbers are reported; the taken one is what
+// the P&L is built from.
 const sz = paperPositionSize(10000, 1, 2000, 1990);
-ok('risk amount is 1% of balance', sz.riskAmount, 100);
-ok('units sized off stop distance', near(sz.units, 10), true);
+ok('the requested risk is 1% of balance', sz.requestedRisk, 100);
+ok('it sizes in lots', sz.lots, 0.1);
+ok('a lot is 100 oz', sz.units, 10);
+ok('and the risk taken matches that size', near(sz.riskAmount, sz.units * 10), true);
+ok('which lands within one lot step of the request',
+  Math.abs(sz.riskAmount - sz.requestedRisk) <= 0.01 * 100 * 10 + 1e-9, true);
 ok('zero-width stop refuses to size', paperPositionSize(10000,1,2000,2000), null);
 
 const sigBuy = { id:'s1', dir:'BUY', entry:2000, sl:1990, tp:2040, entryType:'market', time:'2026-01-01T00:00:00Z' };
 const acct = { balance:10000, positions:[] };
 const pos = openPaperPosition(sigBuy, acct, PCFG);
 ok('entry filled worse than requested', pos.entryFill > pos.requestedEntry, true);
-ok('stop loss costs exactly the risk', near(closePaperPosition(pos,'lost',null,PCFG).pnl, -(100 + 0.1*pos.units)), true);
+// The stop costs what the position actually risks, not what was asked for.
+ok('stop loss costs exactly the position\'s own risk',
+  near(closePaperPosition(pos,'lost',null,PCFG).pnl, -(pos.riskAmount + 0.1*pos.units)), true);
 ok('a loss is negative', closePaperPosition(pos,'lost',null,PCFG).pnl < 0, true);
 ok('a win is positive', closePaperPosition(pos,'won',null,PCFG).pnl > 0, true);
 // spread + slippage means realised R comes in under the nominal 4:1
@@ -1090,6 +1098,69 @@ ok('a flat driver has no correlation to report',
 ok('the aligned latest change is the driver\'s own last move',
   Math.round(alignedLatestChange(cdGold, cdPerfect, 'yield') * 100) / 100, 0.5);
 ok('and is null when there is nothing to align', alignedLatestChange(cdGold, [], 'price'), null);
+
+
+// ============================================================
+// LOTS, NOT OUNCES
+// ============================================================
+// A broker quotes XAUUSD in lots: one standard lot is 100 oz and orders move in
+// 0.01-lot steps. "5.26 units" is not a size you can place anywhere.
+// $10,000 of risk over a $10 stop is 1,000 oz, which is 10 standard lots.
+ok('it converts ounces to lots at 100 per lot', paperPositionSize(100000, 10, 2000, 1990).lots, 10);
+ok('and reports the ounces too', paperPositionSize(100000, 10, 2000, 1990).units, 1000);
+ok('one lot exactly', paperPositionSize(100000, 1, 2000, 1990).lots, 1);
+ok('sizes round DOWN to the step, never up',
+  paperPositionSize(10000, 1, 2000, 1993).lots <= (10000 * 0.01) / (7 * 100) + 1e-9, true);
+ok('rounding down means risk never exceeds the request',
+  paperPositionSize(10000, 1, 2000, 1993).riskAmount <= 100 + 1e-9, true);
+ok('the step is configurable',
+  paperPositionSize(100000, 1, 2000, 1990, { lotStep: 0.1 }).lots, 1);
+ok('a coarser step rounds harder',
+  paperPositionSize(100000, 1, 2000, 1990, { lotStep: 1 }).lots, 1);
+ok('a different contract size changes the ounces',
+  paperPositionSize(100000, 10, 2000, 1990, { contractSize: 10 }).units, 1000);
+
+// below the broker minimum there is no trade to place
+ok('a size under the minimum refuses rather than inventing a fraction',
+  paperPositionSize(1000, 1, 4400, 4380), null);
+ok('and the account says why',
+  /below the 0.01 minimum/.test(paperRejectReason({dir:'BUY', entry:4400, sl:4380}, {balance:1000, positions:[]}, {})), true);
+ok('naming the stop and the balance as the cause',
+  /stop is too wide for this balance/.test(paperRejectReason({dir:'BUY', entry:4400, sl:4380}, {balance:1000, positions:[]}, {})), true);
+// $10 of risk over a $20 stop is 0.5 oz = 0.005 lots — placeable only if the
+// broker's step is finer than the default.
+ok('a lower minimum and finer step let it through',
+  paperPositionSize(1000, 1, 4400, 4380, { minLots: 0.001, lotStep: 0.001 }).lots, 0.005);
+
+// fixed sizing: the lot count is constant and the risk moves instead
+const fixedCfg = { sizingMode: 'fixed', fixedLots: 0.25 };
+ok('fixed sizing places the stated lots', paperPositionSize(10000, 1, 2000, 1990, fixedCfg).lots, 0.25);
+ok('regardless of the stop', paperPositionSize(10000, 1, 2000, 1950, fixedCfg).lots, 0.25);
+ok('and regardless of the balance', paperPositionSize(500, 1, 2000, 1990, fixedCfg).lots, 0.25);
+// A five-times-wider stop on the same lot size risks five times as much — which
+// is precisely the trade-off fixed sizing makes.
+ok('so a five-times-wider stop risks five times as much',
+   paperPositionSize(10000, 1, 2000, 1950, fixedCfg).riskAmount,
+   paperPositionSize(10000, 1, 2000, 1990, fixedCfg).riskAmount * 5);
+ok('fixed lots are still rounded to the step',
+  paperPositionSize(10000, 1, 2000, 1990, { sizingMode: 'fixed', fixedLots: 0.257 }).lots, 0.25);
+ok('and still refused below the minimum',
+  paperPositionSize(10000, 1, 2000, 1990, { sizingMode: 'fixed', fixedLots: 0.004 }), null);
+
+// the rounding helper itself
+ok('rounds down to the step', roundToLotStep(0.3049, 0.01), 0.3);
+ok('leaves an exact step alone', roundToLotStep(0.30, 0.01), 0.3);
+ok('does not leave floating-point residue', roundToLotStep(0.1 + 0.2, 0.01), 0.3);
+ok('below one step is zero', roundToLotStep(0.009, 0.01), 0);
+ok('a missing step falls back to 0.01', roundToLotStep(0.257), 0.25);
+
+// a position carries its lot count so the UI never has to guess
+const lotPos = openPaperPosition({ id:'L', dir:'BUY', entry:2000, sl:1990, tp:2040, entryType:'market' },
+  { balance: 100000, positions: [] }, {});
+ok('the position records its lots', lotPos.lots > 0, true);
+ok('and the contract size it used', lotPos.contractSize, 100);
+ok('and what was originally asked for', lotPos.requestedRisk, 1000);
+ok('units and lots agree', near(lotPos.units, lotPos.lots * 100), true);
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail?1:0);

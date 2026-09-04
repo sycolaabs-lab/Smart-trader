@@ -786,6 +786,54 @@ drawdown. It is the difference between *"62% of signals won"* and *"this would
 have been up 4.3% with an 11% drawdown"*, and only the second tells you whether
 the analysis is worth anything.
 
+### Sizing is in lots
+
+A broker quotes XAUUSD in lots: one standard lot is **100 troy oz** and orders
+move in **0.01-lot steps**. The account used to size in raw ounces — "5.26
+units" — which is not a size you can place anywhere.
+
+Rounding to a real step also makes the simulation honest. A position cannot be
+sized to arbitrary precision, so the risk actually taken differs slightly from
+the risk requested, exactly as on a live account. Both numbers are recorded, and
+the P&L and R-multiples are built from the **taken** one. Sizes round *down*, so
+the account never risks more than asked.
+
+| Setting | Meaning |
+|---|---|
+| Sizing | `Risk %` — lots follow the stop, every trade risks the same percentage. `Fixed lots` — size is constant, risk varies with the stop. |
+| Fixed lot size | The size placed in fixed mode |
+| Contract size | Ounces per standard lot (100 for XAUUSD) |
+| Lot step | Smallest increment the broker accepts |
+| Minimum lots | Below this there is no trade to place |
+
+Below the minimum the account refuses and says why, rather than inventing a
+fractional position no venue would fill:
+
+> No paper position opened: the trade would need 0.0049 lots, below the 0.01
+> minimum — the stop is too wide for this balance at 1% risk (raise the risk
+> percentage or the starting balance).
+
+Positions opened before lots existed still render: their lot count is derived
+from the ounces rather than assumed present.
+
+### Settings persist
+
+Only the paper account's balance and the autonomy thresholds were ever saved.
+Everything else a person could change — risk per trade, spread, slippage, max
+concurrent, the partial-take-profit rules, all fourteen factor weights, the
+target R:R, every backtest parameter, the news-window settings — was read
+straight off the DOM and lost the moment the page reloaded. Tuning was something
+you had to redo from memory each session, and an autonomous run reverted to
+defaults after any refresh without saying so.
+
+They now save as you change them and are restored **before the first analysis
+runs**, so the weights are in force when it does. A short "Settings saved."
+confirms it. Resetting the weights persists too, so the reset is not undone by
+the next reload.
+
+API keys are deliberately not swept up here — they stay opt-in through
+*Remember keys*.
+
 ### Two ways into the paper account
 
 Autonomous mode and the Generate button run the same loop — analyse, log the

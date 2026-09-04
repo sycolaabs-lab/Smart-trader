@@ -73,7 +73,12 @@ ok('and it placed the paper trade', on.positions.length === 1, JSON.stringify(on
 ok('tied to that signal', !!on.positions[0] && on.positions[0].signalId === on.signals[0].id, JSON.stringify(on.positions[0]));
 ok('the panel says what it did', /Logged a (BUY|SELL)/.test(on.outcome), on.outcome);
 ok('including the paper side', /Paper (position opened|order resting)/.test(on.outcome), on.outcome);
-ok('and the risk it took', /Risking \$\d/.test(on.outcome), on.outcome);
+ok('the size is quoted in lots', /\d+\.\d\d lots \(\d+\.\d\d oz\)/.test(on.outcome), on.outcome);
+ok('and the risk actually taken', /risking \$\d/.test(on.outcome), on.outcome);
+// When the lot step moves the risk away from what was asked for, say so — that
+// gap is real on every live account.
+ok('a rounded risk names the gap',
+  !/asked for/.test(on.outcome) || /the [\d.]+-lot step moved it/.test(on.outcome), on.outcome);
 
 // --- paper trading OFF: logged, but nothing opened -------------------------
 await p.uncheck('#paperEnabled'); await p.waitForTimeout(300);

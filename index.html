@@ -514,6 +514,16 @@ canvas { width:100%; background:#12151c; border-radius:12px; border:1px solid #1
       <div class="params">
         <div class="field"><label>Starting balance ($)</label><input type="number" id="pStartBalance" value="10000" step="500" min="100"></div>
         <div class="field"><label>Risk per trade (%)</label><input type="number" id="pRiskPct" value="1" step="0.1" min="0.1" max="10"></div>
+        <div class="field"><label>Sizing</label>
+          <select id="pSizingMode" style="width:100%;background:#0d0f14;border:1px solid #262a35;color:#e8c37a;padding:7px 8px;border-radius:6px;font-size:12px;">
+            <option value="risk" selected>Risk % — lots follow the stop</option>
+            <option value="fixed">Fixed lots — risk follows the stop</option>
+          </select>
+        </div>
+        <div class="field"><label>Fixed lot size</label><input type="number" id="pFixedLots" value="0.10" step="0.01" min="0.01"></div>
+        <div class="field"><label>Contract size (oz/lot)</label><input type="number" id="pContractSize" value="100" step="1" min="1"></div>
+        <div class="field"><label>Lot step</label><input type="number" id="pLotStep" value="0.01" step="0.01" min="0.01"></div>
+        <div class="field"><label>Minimum lots</label><input type="number" id="pMinLots" value="0.01" step="0.01" min="0.01"></div>
         <div class="field"><label>Spread (pips)</label><input type="number" id="pSpread" value="3" step="0.5" min="0"></div>
         <div class="field"><label>Stop slippage (pips)</label><input type="number" id="pSlippage" value="1" step="0.5" min="0"></div>
         <div class="field"><label>Max open positions</label><input type="number" id="pMaxPos" value="3" step="1" min="1" max="10"></div>
@@ -524,6 +534,21 @@ canvas { width:100%; background:#12151c; border-radius:12px; border:1px solid #1
         <input type="checkbox" id="pPartialEnabled" checked style="accent-color:#3ecf8e;">
         <span>Bank profit part-way to target instead of waiting for the full run</span>
       </label>
+      <div class="data-source-note" id="settingsSavedNote" style="margin-top:8px;margin-bottom:0;min-height:14px;"></div>
+      <div class="conn-note" style="margin-top:6px;">
+        <strong style="color:#e8c37a;">Settings are saved as you change them.</strong> Every control in this
+        panel, the factor weights, the target R:R and the backtest parameters persist on this device and are
+        restored before the first analysis runs — so a reload, or a browser restart mid-way through an
+        autonomous run, no longer silently reverts your tuning to the defaults.
+      </div>
+      <div class="conn-note" style="margin-top:6px;">
+        <strong style="color:#e8c37a;">Lots, not ounces.</strong> Sizing is quoted the way a broker quotes it:
+        one standard lot is 100 troy oz of XAUUSD and orders move in 0.01-lot steps. "5.26 units" is not a size
+        you can place anywhere. Rounding to a real step also keeps the account honest — the risk actually taken
+        differs slightly from the risk requested, exactly as it does on a live account, and the P&amp;L is built
+        from what was taken. On <strong>Risk %</strong> the lot size follows the stop so every trade risks the
+        same percentage; on <strong>Fixed lots</strong> the size is constant and the risk varies with the stop.
+      </div>
       <div class="conn-note" style="margin-top:6px;">
         <strong style="color:#e8c37a;">Partial take-profit.</strong> A 1:4 target on 15-minute structure can
         sit open for days, and an unrealised target is not a profit — the trade is exposed the whole time it

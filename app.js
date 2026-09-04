@@ -782,6 +782,8 @@ weightIds.forEach(id => {
 document.getElementById('resetWeights').addEventListener('click', () => {
   weightIds.forEach(id => { document.getElementById(id).value = weightDefaults[id]; document.getElementById(id + 'V').textContent = weightDefaults[id]; });
   document.getElementById('targetRR').value = 4; document.getElementById('targetRRV').textContent = '1:4';
+  // Persist the reset, or the next reload restores the weights just cleared.
+  if (typeof saveSettings === 'function') { saveSettings(); flagSettingsSaved(); }
   refreshAll();
 });
 function getWeights() {
@@ -2465,12 +2467,18 @@ function paperConfig() {
     const v = el ? parseFloat(el.value) : NaN;
     return isFinite(v) ? v : fb;
   };
+  const mode = (document.getElementById('pSizingMode') || {}).value;
   return Object.assign({}, PAPER_DEFAULTS, {
     startingBalance: num('pStartBalance', PAPER_DEFAULTS.startingBalance),
     riskPercent: num('pRiskPct', PAPER_DEFAULTS.riskPercent),
     spreadPips: num('pSpread', PAPER_DEFAULTS.spreadPips),
     slippagePips: num('pSlippage', PAPER_DEFAULTS.slippagePips),
-    maxConcurrent: num('pMaxPos', PAPER_DEFAULTS.maxConcurrent)
+    maxConcurrent: num('pMaxPos', PAPER_DEFAULTS.maxConcurrent),
+    sizingMode: mode === 'fixed' ? 'fixed' : PAPER_DEFAULTS.sizingMode,
+    fixedLots: num('pFixedLots', PAPER_DEFAULTS.fixedLots),
+    contractSize: num('pContractSize', PAPER_DEFAULTS.contractSize),
+    lotStep: num('pLotStep', PAPER_DEFAULTS.lotStep),
+    minLots: num('pMinLots', PAPER_DEFAULTS.minLots)
   });
 }
 // Partial take-profit config, read from the same panel. Lives on the resolver
@@ -2544,10 +2552,16 @@ function paperOpenForSignal(sig) {
   if (refusal) { lastPaperOutcome = 'No paper position opened: ' + refusal + '.'; return null; }
   const pos = openPaperPosition(sig, account, cfg);
   if (!pos) { lastPaperOutcome = 'No paper position opened — the account refused the trade.'; return null; }
+  // Report the risk actually taken, and say so when the lot step moved it away
+  // from what was asked for — that gap is real on every live account.
+  const asked = pos.requestedRisk;
+  const gap = (isFinite(asked) && Math.abs(asked - pos.riskAmount) > 0.01)
+    ? ' (asked for $' + asked.toFixed(2) + '; the ' + paperConfig().lotStep + '-lot step moved it)'
+    : '';
   lastPaperOutcome = (pos.status === 'pending'
     ? 'Paper order resting at $' + fmt(pos.requestedEntry) + ' — no exposure until price reaches it.'
     : 'Paper position opened at $' + fmt(pos.entryFill) + '.') +
-    ' Risking $' + (pos.riskAmount || 0).toFixed(2) + ' on ' + pos.units.toFixed(2) + ' units.';
+    ' ' + lotLabel(pos) + ' (' + pos.units.toFixed(2) + ' oz), risking $' + (pos.riskAmount || 0).toFixed(2) + gap + '.';
   paper.positions.unshift(pos);
   paper.positions = paper.positions.slice(0, 500);
   savePaper();
@@ -2576,6 +2590,15 @@ function paperFillForSignal(signalId, atTime) {
   savePaper();
   renderPaper();
   renderSignalLog();
+}
+
+// Size as a broker would quote it. Positions opened before lots existed carry
+// only ounces, so the lot count is derived rather than assumed present.
+function lotLabel(p) {
+  const contract = p.contractSize > 0 ? p.contractSize : PAPER_DEFAULTS.contractSize;
+  const lots = isFinite(p.lots) ? p.lots : (isFinite(p.units) ? p.units / contract : null);
+  if (lots == null) return '';
+  return lots.toFixed(2) + ' lot' + (Math.abs(lots - 1) < 1e-9 ? '' : 's');
 }
 
 function money(v) {
@@ -2608,7 +2631,7 @@ function renderPaper() {
   if (resting.length) {
     html += '<div style="font-size:10px;color:#454a56;margin:10px 0 6px;">Awaiting entry (no exposure yet)</div>';
     html += resting.map(p =>
-      '<div class="zone-item"><span><span class="dirtag ' + p.dir + '">' + p.dir + '</span> limit @ $' + fmt(p.requestedEntry)
+      '<div class="zone-item"><span><span class="dirtag ' + p.dir + '">' + p.dir + '</span> ' + lotLabel(p) + ' limit @ $' + fmt(p.requestedEntry)
       + '</span><span class="mono" style="color:#5c6270;">not filled</span></div>').join('');
   }
 
@@ -2617,7 +2640,7 @@ function renderPaper() {
     html += '<div style="font-size:10px;color:#454a56;margin:10px 0 6px;">Open positions</div>';
     html += open.map(p => {
       const u = unrealisedPnl(p, price);
-      return '<div class="zone-item"><span><span class="dirtag ' + p.dir + '">' + p.dir + '</span> ' + fmt(p.units) + ' u @ $' + fmt(p.entryFill) + '</span>'
+      return '<div class="zone-item"><span><span class="dirtag ' + p.dir + '">' + p.dir + '</span> ' + lotLabel(p) + ' @ $' + fmt(p.entryFill) + '</span>'
         + '<span class="mono ' + pnlCls(u) + '">' + money(u) + '</span></div>';
     }).join('');
   }
@@ -2627,7 +2650,7 @@ function renderPaper() {
     html += '<div style="font-size:10px;color:#454a56;margin:10px 0 6px;">Recent closed</div>';
     html += closed.map(p =>
       '<div class="zone-item"><span><span class="dirtag ' + p.dir + '">' + p.dir + '</span> ' + (p.outcome === 'won' ? (p.partial ? '◐' : '✓') : p.outcome === 'lost' ? '✗' : '–')
-      + ' <span style="color:#454a56;">exit $' + fmt(p.exitPrice) + '</span></span>'
+      + ' <span style="color:#454a56;">' + lotLabel(p) + ' · exit $' + fmt(p.exitPrice) + '</span></span>'
       + '<span class="mono ' + pnlCls(p.pnl) + '">' + money(p.pnl) + (p.rMultiple != null ? ' <span style="color:#454a56;">' + (p.rMultiple >= 0 ? '+' : '') + fmt(p.rMultiple) + 'R</span>' : '') + '</span></div>'
     ).join('');
   }
@@ -3256,6 +3279,97 @@ document.addEventListener('visibilitychange', () => {
 // up this file has to exist before anything reads it.
 // ============================================================
 // ============================================================
+// SETTINGS THAT SURVIVE A RELOAD
+// ------------------------------------------------------------
+// Only the paper account's balance and the autonomy thresholds were ever
+// persisted. Everything else a person could change — risk per trade, spread,
+// slippage, max concurrent, the partial-take-profit rules, all fourteen factor
+// weights, the target R:R, every backtest parameter, the news-window settings —
+// was read straight off the DOM and lost the moment the page reloaded. Tuning
+// the system was therefore something you had to redo from memory each session,
+// and an autonomous run would quietly revert to defaults after any refresh.
+//
+// One store, one list, restored before the first analysis so the weights are in
+// force when it runs. Ids that already have an owner are deliberately absent —
+// autonomy keeps its own (AUTONOMY_KEY), the paper on/off switches live with the
+// account, and the API keys are opt-in through "remember keys" rather than
+// swept up here.
+const SETTINGS_KEY = 'smc-settings-v1';
+const SETTINGS_IDS = [
+  // paper account
+  'pStartBalance', 'pRiskPct', 'pSpread', 'pSlippage', 'pMaxPos',
+  'pSizingMode', 'pFixedLots', 'pContractSize', 'pLotStep', 'pMinLots',
+  'pPartialPct', 'pHoldMeta', 'pPartialEnabled',
+  // factor weights
+  'wWeekly', 'wDaily', 'wHtf', 'wMtf', 'wLtf', 'wOb', 'wFvg', 'wLiq',
+  'wPd', 'wPriceAction', 'wClassic', 'wCorrelation', 'wFundamental', 'wNews',
+  // signal + backtest
+  'targetRR', 'pBars', 'pCapital', 'pRisk', 'pCostPips', 'pMinConf', 'pTargetRR',
+  // news window and macro model
+  'newsBeforeMin', 'newsAfterMin', 'newsBlockEnabled', 'newsBlockMedium', 'useMacroModel'
+];
+
+function saveSettings() {
+  const out = {};
+  SETTINGS_IDS.forEach(id => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    out[id] = el.type === 'checkbox' ? !!el.checked : el.value;
+  });
+  try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(out)); }
+  catch (e) { return false; }
+  return true;
+}
+
+function loadSettings() {
+  let saved;
+  try { saved = JSON.parse(localStorage.getItem(SETTINGS_KEY) || 'null'); }
+  catch (e) { return; }
+  if (!saved || typeof saved !== 'object') return;
+  SETTINGS_IDS.forEach(id => {
+    if (!(id in saved)) return;
+    const el = document.getElementById(id);
+    if (!el) return;
+    if (el.type === 'checkbox') el.checked = !!saved[id];
+    else if (saved[id] != null) el.value = saved[id];
+  });
+  // Sliders carry a printed value beside them that does not follow a
+  // programmatic change, so a restored weight would show the old number.
+  syncSliderLabels();
+}
+
+function syncSliderLabels() {
+  weightIds.forEach(id => {
+    const el = document.getElementById(id), out = document.getElementById(id + 'V');
+    if (el && out) out.textContent = el.value;
+  });
+  const rr = document.getElementById('targetRR'), rrOut = document.getElementById('targetRRV');
+  if (rr && rrOut) rrOut.textContent = '1:' + rr.value;
+}
+
+let settingsSaveTimer = null;
+function flagSettingsSaved() {
+  const el = document.getElementById('settingsSavedNote');
+  if (!el) return;
+  el.textContent = 'Settings saved.';
+  el.style.color = '#3ecf8e';
+  clearTimeout(settingsSaveTimer);
+  settingsSaveTimer = setTimeout(() => { el.textContent = ''; }, 2500);
+}
+
+function wireSettingsPersistence() {
+  SETTINGS_IDS.forEach(id => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    const handler = () => { if (saveSettings()) flagSettingsSaved(); };
+    el.addEventListener('change', handler);
+    // Sliders and number spinners fire `input` continuously; `change` alone
+    // would miss a drag that never blurs.
+    if (el.type === 'range' || el.type === 'number') el.addEventListener('input', handler);
+  });
+}
+
+// ============================================================
 // IS THIS TAB STILL RUNNING THE CURRENT CODE?
 // ------------------------------------------------------------
 // This app is built to be left open for days doing unattended analysis, which
@@ -3297,6 +3411,10 @@ function startUpdateWatch() {
 }
 
 async function bootstrap() {
+  // Before anything reads a control: the weights, risk settings and thresholds
+  // have to be the saved ones by the time the first analysis runs.
+  loadSettings();
+  wireSettingsPersistence();
   await loadLearningState();
   await loadSignalLog();
   await loadShadowLog();
