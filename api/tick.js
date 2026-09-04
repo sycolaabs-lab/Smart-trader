@@ -273,8 +273,17 @@ async function cached(state, key, maxAgeMs, fetcher, signature) {
 // Identifies the instrument set a cached macro score was computed from. Change
 // an instrument, its polarity or its kind and the signature changes with it.
 const describe = list => list.map(i => [i.key, i.seriesId || i.symbol, i.polarity, i.kind].join(':')).join('|');
-const CORRELATION_SIG = describe(FRED_INSTRUMENTS) + '||' + describe(CORRELATION_INSTRUMENTS);
-const FUNDAMENTAL_SIG = describe(FUNDAMENTAL_INSTRUMENTS);
+
+// The signature has to cover HOW the data was fetched, not only WHICH
+// instruments were asked for. Cached macro values outlive a deploy — they sit
+// in Firestore for hours — so a fix to the retrieval itself would otherwise
+// keep being ignored while the worker served results the old code collected.
+// That is exactly what happened with the FRED sort order: the instrument set
+// was unchanged, so the signature matched, so the 1976-2006 values stayed in
+// service after the fix shipped. Bump this whenever the fetching changes.
+const MACRO_FETCH_VERSION = 'fred-desc-v2';
+const CORRELATION_SIG = MACRO_FETCH_VERSION + '||' + describe(FRED_INSTRUMENTS) + '||' + describe(CORRELATION_INSTRUMENTS);
+const FUNDAMENTAL_SIG = MACRO_FETCH_VERSION + '||' + describe(FUNDAMENTAL_INSTRUMENTS);
 
 // The whole tick, with its two external dependencies — Firestore and the API
 // keys — passed in rather than reached for. handler() below wires up the real

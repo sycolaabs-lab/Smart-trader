@@ -523,6 +523,32 @@ It now measures each series against its own widest observed publication gap, so
 a daily rate is late after ~12 days and monthly CPI is not late until it has
 missed a print.
 
+### Why a tab can still show the old numbers
+
+The fix shipping does not mean your open tab is running it. This app is built to
+be left open for days doing unattended analysis, so a tab goes on running the ES
+modules it loaded when it was opened — including whatever bug the new version
+fixes. That is not hypothetical: it is exactly how the 1976–2006 macro data
+could still be on screen after the fix deployed.
+
+Two things now guard that:
+
+* **The tab checks its own build.** It compares the ETag of `app.js` against the
+  one it saw at startup, at boot and every 30 minutes. When they differ, a
+  banner says the running code is superseded and offers a reload. No version
+  constant to keep in sync and no build step — the server already sends
+  `must-revalidate`, so the check is a conditional HEAD.
+* **The worker's cache signature covers how data was fetched, not just which
+  instruments were asked for.** Cached macro values live in Firestore for hours,
+  so a fix to the *retrieval* would otherwise keep being ignored while the
+  worker served results the old code had collected. The FRED sort order was
+  precisely that case: the instrument set never changed, so the signature
+  matched, so the 1976–2006 values stayed in service after the fix shipped.
+
+And every macro row — correlation and fundamental alike — now carries the
+publication date of its newest observation, amber past 45 days and red past 120.
+The whole episode was possible because nothing on screen carried a date.
+
 ### Earlier finds
 
 The feed checks found a real bug on their first run. `genData`, the demo feed

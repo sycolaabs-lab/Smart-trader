@@ -458,6 +458,17 @@ function startLivenessTicker() {
   }, 60000);
 }
 
+function vintageHtml(t) {
+  if (!t) return '';
+  const d = new Date(t);
+  if (!isFinite(d.getTime())) return '';
+  const days = (Date.now() - d.getTime()) / 86400000;
+  const colour = days > 120 ? '#ef4d5f' : days > 45 ? '#ffa726' : '#454a56';
+  const txt = d.toLocaleDateString([], { month: 'short', year: 'numeric' });
+  return ' <span style="color:' + colour + ';font-size:9px;" title="Newest observation in this series. '
+    + Math.round(days) + ' day(s) old.">(' + txt + ')</span>';
+}
+
 function renderSignalLog() {
   const log = document.getElementById('tradeLog');
   if (!signalLog.length) { log.innerHTML = '<div class="log-empty">No signals generated yet.</div>'; return; }
@@ -1079,11 +1090,12 @@ async function refreshCorrelation(providerId, tdKey, fredKey) {
         // the two by index offsets everything before each holiday.
         const corr = xauDaily ? correlateByDay(xauDaily, obs, inst.kind) : null;
         const pctChange = latestChangeOf(obs, inst.kind);
+        const latestDate = obs.length ? obs[obs.length - 1].time : null;
         // Weight by the ACTUAL measured correlation strength/sign, not the assumed polarity — a genuinely
         // weak or unstable relationship (like oil's has historically been) shrinks toward zero influence on
         // its own instead of me having to guess the right number. Falls back to the assumed polarity only
         // when correlation can't be measured yet (no gold daily history available to compare against).
-        results.push({ key: inst.key, label: inst.label, source: 'FRED', available: true, pctChange, corr, contribution: macroContribution(pctChange, corr, inst.polarity), polarity: inst.polarity, kind: inst.kind });
+        results.push({ key: inst.key, label: inst.label, source: 'FRED', available: true, pctChange, corr, contribution: macroContribution(pctChange, corr, inst.polarity), polarity: inst.polarity, kind: inst.kind, latestDate });
       } catch (e) {
         results.push({ key: inst.key, label: inst.label, source: 'FRED', available: false, reason: e.message });
       }
@@ -1104,7 +1116,8 @@ async function refreshCorrelation(providerId, tdKey, fredKey) {
           macroSeries.drivers.push({ key: inst.key, label: inst.label, kind: inst.kind, series: candles });
           const corr = correlateByDay(xauDaily, candles, inst.kind);
           const pctChange = latestChangeOf(candles, inst.kind);
-          results.push({ key: inst.key, label: inst.label, source: 'Twelve Data', available: true, pctChange, corr, contribution: macroContribution(pctChange, corr, inst.polarity), polarity: inst.polarity, kind: inst.kind });
+          const latestDate = candles.length ? candles[candles.length - 1].time : null;
+          results.push({ key: inst.key, label: inst.label, source: 'Twelve Data', available: true, pctChange, corr, contribution: macroContribution(pctChange, corr, inst.polarity), polarity: inst.polarity, kind: inst.kind, latestDate });
         } catch (e) {
           results.push({ key: inst.key, label: inst.label, source: 'Twelve Data', available: false, reason: e.message });
         }
@@ -1538,11 +1551,21 @@ function refreshAll() {
         const corrTxt = d.corr == null ? 'n/a' : (d.corr >= 0.4 ? 'strong +' : d.corr <= -0.4 ? 'strong −' : Math.abs(d.corr) >= 0.15 ? (d.corr > 0 ? 'weak +' : 'weak −') : 'flat') + (d.corr != null ? ' (' + fmt(d.corr) + ')' : '');
         const confirms = d.contribution !== 0 && lastComposite && lastComposite.direction !== 'HOLD' && Math.sign(d.contribution) === (lastComposite.direction === 'BUY' ? 1 : -1);
         const flagTxt = lastComposite && lastComposite.direction !== 'HOLD' ? (confirms ? ' <span class="fpos">✓ confirms</span>' : ' <span class="fneg">✗ contradicts</span>') : '';
-        return '<div class="zone-item ' + (d.pctChange < 0 ? 'bearish' : '') + '"><span>' + d.label + srcTag + ' <span style="color:#454a56;">(' + corrTxt + ')</span></span><span class="mono ' + changeCls + '">' + (d.pctChange >= 0 ? '+' : '') + fmt(d.pctChange) + (d.kind === 'yield' ? ' pp' : '%') + flagTxt + '</span></div>';
+        // The vintage of the data, alongside the reading. This whole engine once
+        // ran for weeks on 1976-2006 observations and nothing on screen said so.
+        return '<div class="zone-item ' + (d.pctChange < 0 ? 'bearish' : '') + '"><span>' + d.label + srcTag
+          + ' <span style="color:#454a56;">(' + corrTxt + ')</span>' + vintageHtml(d.latestDate)
+          + '</span><span class="mono ' + changeCls + '">' + (d.pctChange >= 0 ? '+' : '') + fmt(d.pctChange) + (d.kind === 'yield' ? ' pp' : '%') + flagTxt + '</span></div>';
       }).join('');
     }
   }
 
+  // The publication date of the newest observation, coloured by how old it is.
+  // Not decoration: the entire macro stack once ran on 1976-2006 data, every
+  // number it produced looked plausible, and nothing on screen carried a date.
+  //
+  // The scale is deliberately generous — these are daily rates and monthly
+  // prints, so a week is normal and a quarter is not.
   // Fundamental Intelligence Engine
   const fundList = document.getElementById('fundamentalList');
   if (fundList) {
@@ -1554,8 +1577,8 @@ function refreshAll() {
         const changeCls = d.pctChange >= 0 ? 'fpos' : 'fneg';
         const confirms = d.contribution !== 0 && lastComposite && lastComposite.direction !== 'HOLD' && Math.sign(d.contribution) === (lastComposite.direction === 'BUY' ? 1 : -1);
         const flagTxt = lastComposite && lastComposite.direction !== 'HOLD' ? (confirms ? ' <span class="fpos">✓ confirms</span>' : ' <span class="fneg">✗ contradicts</span>') : '';
-        const dateTxt = d.latestDate ? new Date(d.latestDate).toLocaleDateString([], { month: 'short', year: 'numeric' }) : '';
-        return '<div class="zone-item ' + (d.pctChange < 0 ? 'bearish' : '') + '"><span>' + d.label + ' <span style="color:#454a56;font-size:9px;">(' + dateTxt + ')</span></span><span class="mono ' + changeCls + '">' + (d.pctChange >= 0 ? '+' : '') + fmt(d.pctChange) + (d.kind === 'yield' ? ' pp' : '%') + flagTxt + '</span></div>';
+        return '<div class="zone-item ' + (d.pctChange < 0 ? 'bearish' : '') + '"><span>' + d.label + vintageHtml(d.latestDate)
+          + '</span><span class="mono ' + changeCls + '">' + (d.pctChange >= 0 ? '+' : '') + fmt(d.pctChange) + (d.kind === 'yield' ? ' pp' : '%') + flagTxt + '</span></div>';
       }).join('');
     }
   }
@@ -3232,6 +3255,47 @@ document.addEventListener('visibilitychange', () => {
 // its weights applied) before the first analysis, and every DOM const further
 // up this file has to exist before anything reads it.
 // ============================================================
+// ============================================================
+// IS THIS TAB STILL RUNNING THE CURRENT CODE?
+// ------------------------------------------------------------
+// This app is built to be left open for days doing unattended analysis, which
+// means a tab can go on running the modules it loaded at open time long after a
+// fix has shipped. That is not hypothetical: the macro engine ran on 1976-2006
+// FRED data, the fix deployed, and an open tab would have carried on producing
+// confident, wrong numbers with nothing on screen to say so.
+//
+// The check compares the ETag of app.js now against the one seen at startup, so
+// it needs no version constant to keep in sync and no build step. `no-store`
+// forces the request past the browser cache; the server already sends
+// must-revalidate, so this is cheap.
+const UPDATE_CHECK_MS = 30 * 60 * 1000;
+let loadedBuildTag = null;
+
+async function currentBuildTag() {
+  try {
+    const r = await fetch('app.js', { method: 'HEAD', cache: 'no-store' });
+    return r.headers.get('etag') || r.headers.get('last-modified') || null;
+  } catch (e) {
+    return null; // offline, or the check is blocked — try again next time
+  }
+}
+
+async function checkForNewBuild() {
+  const tag = await currentBuildTag();
+  if (!tag) return;
+  if (loadedBuildTag == null) { loadedBuildTag = tag; return; }
+  if (tag === loadedBuildTag) return;
+  const banner = document.getElementById('updateBanner');
+  if (banner) banner.classList.remove('hidden');
+}
+
+function startUpdateWatch() {
+  const reload = document.getElementById('updateReload');
+  if (reload) reload.addEventListener('click', () => window.location.reload());
+  checkForNewBuild();
+  setInterval(checkForNewBuild, UPDATE_CHECK_MS);
+}
+
 async function bootstrap() {
   await loadLearningState();
   await loadSignalLog();
@@ -3248,6 +3312,7 @@ async function bootstrap() {
   flushPendingIngest();
   renderSignalLog();   // first render happened before the paper account loaded
   startLivenessTicker();
+  startUpdateWatch();
   renderQuota();
   renderAutonomyStats();
   renderAnalysisQuality();
