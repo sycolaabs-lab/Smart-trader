@@ -438,6 +438,86 @@ calendar and could open a position straight into a release.
 
 ---
 
+## What the meta-labeler remembers
+
+One cap of 500, shared between two completely different kinds of example, was
+quietly destroying the valuable half.
+
+A backtest cycle contributes about **22 out-of-sample trades** and runs every
+four hours — roughly **132 a day**. Live resolved trades arrive at maybe a
+dozen. Sharing one 500-slot window, the arithmetic is brutal. Simulated over two
+weeks of running:
+
+| | recorded | still in the store |
+|---|---|---|
+| Live outcomes | 168 | **36** |
+| Backtest examples | 1,848 | 464 |
+
+Ninety-three per cent of what the model trained on was synthetic, and every
+hard-won live result was evicted within days by trades that can be regenerated
+on demand.
+
+**They now have separate budgets, and the live one has no stopping point.**
+Backtest examples get a 1,500-slot rolling window — replaying the same window
+reproduces them exactly, so there is nothing to preserve. Live outcomes are
+scarce and irreplaceable and are never evicted by them. Re-running the same
+90-day simulation: 1,080 live outcomes recorded, **1,080 kept**.
+
+### It never stops accumulating
+
+The only hard limit within reach is physical: browser storage is about 5 MB,
+shared with the signal log and the knowledge base, and at ~12 live outcomes a
+day a verbose store crosses 1 MB somewhere around year three.
+
+So when the store grows large it is **thinned, never truncated**. Truncating
+drops the oldest history and the system forgets its own beginning. Thinning
+halves the resolution of the oldest half and leaves the newest intact, so the
+record still spans every day it has ever run — just coarser the further back you
+look, the way memory actually works. Ten years simulated at twelve outcomes a
+day:
+
+| | |
+|---|---|
+| Outcomes recorded | 43,800 |
+| Held in the store | ~10,800 |
+| Oldest example still held | **day 1** |
+
+There is no count and no date after which learning stops. New outcomes are
+always accepted; only the granularity of distant history degrades, and only when
+storage physically requires it.
+
+### The remaining limit is on training, not memory
+
+Boosting here costs roughly quadratic time. Measured:
+
+| examples | store | one training pass |
+|---|---|---|
+| 500 | 39 KB | 0.5 s |
+| 2,000 | 157 KB | 1.5 s |
+| 5,000 | 391 KB | 5.6 s |
+| 20,000 | 1.5 MB | 50 s |
+
+So a training pass takes a bounded **sample** of an unbounded store. Live
+examples claim the slots first and backtest data fills only what is left, so the
+model shifts from synthetic to real as the record builds — and once there are
+2,000 live outcomes it trains on nothing else. Within the live examples, 75% of
+slots go to recent history and the rest are spread evenly across everything
+older, so the accumulated record keeps informing the model instead of being
+discarded the moment it scrolls out of the recent window.
+
+Retraining is coalesced. A pass costs ~2.3s at the cap, and catch-up can resolve
+a dozen signals at once — retraining on each would lock the page for half a
+minute to reach a model one pass produces identically.
+
+The panel says what was actually trained on, rather than a total that hid the
+mix: *"Trained on 1,080 live + 920 backtest examples, 20 stumps. Stored: 1,080
+live / 1,500 backtest — live outcomes have their own budget and are never
+evicted by backtest data."*
+
+Only the recent live history goes to the cloud (Firestore caps a document at
+1 MB and it already carries the signal log); the backtest store is regenerable
+on any device and is not shipped at all. Nothing is trimmed locally.
+
 ## Separating signal from noise
 
 This is the part most likely to produce confident nonsense, so it is defended

@@ -24,7 +24,7 @@
 // ============================================================
 import {
   computeComposite, buildTradePlan, resolveSignal, autonomyGate, setMetaModel,
-  trainAdaBoostStumps, parseUtcDatetime, pearsonCorrelation, toDailyReturns,
+  trainAdaBoostStumps, buildMetaTrainingSet, META_LIMITS, thinExamples, parseUtcDatetime, pearsonCorrelation, toDailyReturns,
   CORRELATION_INSTRUMENTS, FUNDAMENTAL_INSTRUMENTS, FRED_INSTRUMENTS,
   AUTONOMY_DEFAULTS, macroContribution, aggregateMacroScore, pctChangeOf,
   seriesDeltas, latestChangeOf, correlateByDay, ECONOMIC_RELEASES, buildReleaseCalendar,
@@ -414,7 +414,12 @@ export async function runTick({ db, tdKey, fredKey, avKey }) {
           if (won) ls.factors[k].wins++;
         });
         if (sig.qualityFeatures) {
-          ls.metaExamples = (ls.metaExamples || []).concat([{ features: sig.qualityFeatures, label: won ? 1 : -1 }]).slice(-500);
+          // Live outcomes get their own budget on the unattended side too. They
+          // shared a 500-slot window with backtest examples arriving ten times
+          // faster, so a real result survived days at best.
+          ls.metaExamples = (ls.metaExamples || [])
+            .concat([{ features: sig.qualityFeatures, label: won ? 1 : -1 }]);
+          ls.metaExamples = thinExamples(ls.metaExamples, META_LIMITS.liveSoftLimit);
         }
       } else if (verdict.status === 'expired') {
         sig.status = 'expired';
@@ -435,9 +440,13 @@ export async function runTick({ db, tdKey, fredKey, avKey }) {
     });
 
     // ---- 2. retrain the meta-labeler on real outcomes --------------------
+    // Boosting costs roughly quadratic time and this function has a 42s budget,
+    // so the training set is capped while the store is not. The worker holds no
+    // backtest examples of its own, so this is live data throughout.
     const examples = state.learningState.metaExamples || [];
-    if (examples.length >= 15) {
-      state.learningState.metaModel = trainAdaBoostStumps(examples, 20);
+    const metaSet = buildMetaTrainingSet(examples, state.learningState.metaBacktestExamples);
+    if (metaSet.examples.length >= 15) {
+      state.learningState.metaModel = trainAdaBoostStumps(metaSet.examples, 20);
       setMetaModel(state.learningState.metaModel);
     }
 
@@ -590,6 +599,7 @@ export async function runTick({ db, tdKey, fredKey, avKey }) {
       metaScore: plan.metaScore || 0,
       metaTrained: !!(state.learningState.metaModel && state.learningState.metaModel.length),
       metaExampleCount: examples.length,
+      metaTrainedOn: metaSet.examples.length,
       resolvedThisTick,
       killedThisTick,
       flattenedThisTick,

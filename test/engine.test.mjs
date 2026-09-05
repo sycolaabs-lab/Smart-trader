@@ -1,5 +1,5 @@
 import { auditFeedIntegrity } from '../lib/auditor.js';
-import { newsAlertText, signalsToFlatten,
+import { newsAlertText, signalsToFlatten, buildMetaTrainingSet, META_LIMITS, thinExamples,
   genData, correlateByDay, alignedLatestChange, pearsonCorrelation,
   resolveSignal, autonomyGate, mergeSignalLogs, newlyResolvedSignals,
   newlyArrivedOpenSignals, newlyExpiredSignals, signalResolutionRank, signalLiveness, shouldPaperTrade, paperRejectReason, interpretConfidence, confidenceBand,
@@ -1236,6 +1236,89 @@ ok('the cut-short one is counted separately', acctSum.cutShortCount, 1);
 ok('and named in the graded count', acctSum.gradedCount, 2);
 ok('average R excludes it too', acctSum.avgR, 1);
 ok('all three still count as closed', acctSum.closedCount, 3);
+
+
+// ============================================================
+// WHAT THE META-LABELER IS ALLOWED TO REMEMBER
+// ============================================================
+// One 500-slot cap shared between live outcomes and backtest examples was
+// destroying the valuable half. A backtest contributes ~22 examples every four
+// hours (~132/day); live resolved trades arrive at maybe a dozen. Simulated
+// over two weeks, 168 real outcomes were recorded and 36 survived.
+const mex = (n, tag) => Array.from({length:n}, (_, i) =>
+  ({ features:[.5,.5,.5,.5,.5,.5,.5,.5], label: i%2?1:-1, tag, i }));
+const countTag = (arr, t) => arr.filter(x => x.tag === t).length;
+
+// budgets are separate, so backtest data can never evict a live outcome
+ok('the live store is far larger than the old shared cap', META_LIMITS.liveSoftLimit >= 5000, true);
+ok('backtest gets its own budget', META_LIMITS.backtestStore > 0, true);
+ok('and training is capped separately from memory',
+  META_LIMITS.trainingSet < META_LIMITS.liveSoftLimit, true);
+
+// Learning never stops, and the record never loses its beginning. When the
+// store gets large the OLDEST half is halved in resolution and the newest half
+// is left intact, so the span is preserved even as detail thins.
+ok('under the soft limit nothing is touched', thinExamples(mex(100,'L'), 1000).length, 100);
+ok('over it, the store shrinks', thinExamples(mex(1001,'L'), 1000).length < 1001, true);
+ok('but the oldest example survives', thinExamples(mex(2000,'L'), 1000)[0].i, 0);
+ok('and the newest half is untouched',
+  thinExamples(mex(2000,'L'), 1000).slice(-1000).map(x=>x.i).every((v,k)=>v===1000+k), true);
+ok('the old half is halved, not dropped', thinExamples(mex(2000,'L'), 1000).length, 1500);
+// Ten years of daily outcomes, thinned repeatedly, must still reach day one.
+let decade = [];
+for (let day = 1; day <= 3650; day++) {
+  for (let k = 0; k < 12; k++) decade.push({ day });
+  decade = thinExamples(decade, META_LIMITS.liveSoftLimit);
+}
+ok('after ten years the store is still bounded', decade.length < META_LIMITS.liveSoftLimit * 1.2, true);
+ok('and it still remembers day one', decade[0].day, 1);
+ok('while holding the most recent day too', decade[decade.length-1].day, 3650);
+ok('a non-array is tolerated', thinExamples(null, 100).length, 0);
+
+// early on, backtest data bootstraps the model
+let set = buildMetaTrainingSet([], mex(1500, 'B'));
+ok('with no live history it trains on backtest data', set.backtestUsed, 1500);
+ok('and reports no live examples used', set.liveUsed, 0);
+
+// as live outcomes accumulate they take the slots
+set = buildMetaTrainingSet(mex(500, 'L'), mex(1500, 'B'));
+ok('every live example is used', set.liveUsed, 500);
+ok('backtest fills only what is left', set.backtestUsed, META_LIMITS.trainingSet - 500);
+ok('the training set never exceeds its cap', set.examples.length, META_LIMITS.trainingSet);
+
+// once there is enough live data, synthetic examples are dropped entirely
+set = buildMetaTrainingSet(mex(META_LIMITS.trainingSet, 'L'), mex(1500, 'B'));
+ok('a full live set displaces backtest data completely', set.backtestUsed, 0);
+ok('and trains purely on real outcomes', countTag(set.examples, 'L'), META_LIMITS.trainingSet);
+
+// a large store is sampled, not truncated
+set = buildMetaTrainingSet(mex(6000, 'L'), []);
+ok('a big store still trains within the cap', set.examples.length, META_LIMITS.trainingSet);
+ok('and reports how much it is holding', set.liveStored, 6000);
+const idxs = set.examples.map(x => x.i);
+ok('the sample reaches back to the oldest history', Math.min.apply(null, idxs) < 100, true);
+ok('and includes the most recent example', Math.max.apply(null, idxs), 5999);
+// recentShare of the slots are the most recent examples, the rest spread over history
+const recentCount = Math.floor(META_LIMITS.trainingSet * META_LIMITS.recentShare);
+ok('most slots go to recent history', idxs.filter(i => i >= 6000 - recentCount).length, recentCount);
+ok('older history is sampled rather than dropped',
+  idxs.filter(i => i < 6000 - recentCount).length, META_LIMITS.trainingSet - recentCount);
+ok('the older sample is spread, not one contiguous block',
+  new Set(idxs.filter(i => i < 6000 - recentCount)).size > 100, true);
+
+// the regression this exists to prevent
+const liveOnly = mex(200, 'L');
+const lots = mex(5000, 'B');
+ok('5,000 backtest examples cannot evict 200 live ones',
+  buildMetaTrainingSet(liveOnly, lots).liveUsed, 200);
+
+// robustness
+ok('no data at all is handled', buildMetaTrainingSet([], []).examples.length, 0);
+ok('non-arrays are tolerated', buildMetaTrainingSet(null, undefined).examples.length, 0);
+ok('a custom budget is respected',
+  buildMetaTrainingSet(mex(900, 'L'), []).examples.length <= META_LIMITS.trainingSet, true);
+ok('a tiny budget still returns something',
+  buildMetaTrainingSet(mex(900, 'L'), [], { trainingSet: 10 }).examples.length, 10);
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail?1:0);

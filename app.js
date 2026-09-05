@@ -11,7 +11,7 @@ import {
   detectSystemAlert, FRED_INSTRUMENTS, CORRELATION_INSTRUMENTS,
   FUNDAMENTAL_INSTRUMENTS, pearsonCorrelation, toDailyReturns,
   computeComposite, PIP_SIZE, QUALITY_FEATURE_NAMES, classifyZone, correlateByDay,
-  trainAdaBoostStumps, buildTradePlan, reasoningText, FACTOR_LABELS,
+  trainAdaBoostStumps, buildMetaTrainingSet, META_LIMITS, thinExamples, buildTradePlan, reasoningText, FACTOR_LABELS,
   patternSignature, computeTunedWeights, runSmcBacktest, setMetaModel,
   AUTONOMY_DEFAULTS, resolveSignal, autonomyGate, macroContribution,
   aggregateMacroScore, pctChangeOf, seriesDeltas, latestChangeOf, computeCalibration,
@@ -42,11 +42,13 @@ async function loadLearningState() {
       Object.keys(FACTOR_LABELS).forEach(k => { if (!parsed.factors[k]) parsed.factors[k] = { votes: 0, wins: 0 }; });
       if (!parsed.patterns) parsed.patterns = {};
       if (!parsed.metaExamples) parsed.metaExamples = [];
+      if (!parsed.metaBacktestExamples) parsed.metaBacktestExamples = [];
       if (parsed.metaModel === undefined) parsed.metaModel = null;
       learningState = asPlainObject(parsed);
       learningState.factors = asPlainObject(learningState.factors);
       learningState.patterns = asPlainObject(learningState.patterns);
       learningState.metaExamples = asObjectArray(learningState.metaExamples, ['features']);
+      learningState.metaBacktestExamples = asObjectArray(learningState.metaBacktestExamples, ['features']);
       if (!Array.isArray(learningState.metaModel)) learningState.metaModel = null;
       if (!isFinite(learningState.totalLogged)) learningState.totalLogged = 0;
       setMetaModel(learningState.metaModel);
@@ -252,14 +254,71 @@ function applySignalOutcome(sig, won, opts) {
 // The flag lives on the signal itself rather than in a side list so it survives
 // a reload, a cloud pull and a worker merge — the three ways the same resolved
 // trade can come back around.
+// Train on a bounded sample of a store that is not bounded to match.
+//
+// Boosting costs roughly quadratic time here — 1.5s at 2,000 examples, 50s at
+// 20,000 — so the training set is capped for speed while the record keeps
+// everything. Live examples claim the slots first; backtest data only fills
+// what live has not.
+// Say what the model was actually trained on. "500 labeled trades" hid the fact
+// that nearly all of them were synthetic.
+function metaTrainingSummary() {
+  const live = (learningState.metaExamples || []).length;
+  const bt = (learningState.metaBacktestExamples || []).length;
+  const set = lastMetaTraining;
+  const stumps = learningState.metaModel ? learningState.metaModel.length : 0;
+  const used = set
+    ? set.liveUsed + ' live + ' + set.backtestUsed + ' backtest'
+    : 'all available';
+  const held = live > (set ? set.liveUsed : 0)
+    ? ' A training pass samples ' + META_LIMITS.trainingSet + ' of them for speed — weighted to recent ' +
+      'history, with the rest spread across everything older — so the whole record keeps informing the model.'
+    : '';
+  return 'Trained on ' + used + ' examples, ' + stumps + ' stumps. ' +
+    'Holding ' + live + ' live outcomes and ' + bt + ' backtest examples. ' +
+    'There is no point at which this stops accumulating: live outcomes have their own budget, are never ' +
+    'evicted by backtest data, and once the store grows large the oldest history is kept at lower ' +
+    'resolution rather than discarded — so the record always reaches back to the first trade.' + held;
+}
+
+let lastMetaTraining = null;
+let metaRetrainTimer = null;
+
+function retrainMetaLabeler() {
+  const set = buildMetaTrainingSet(learningState.metaExamples, learningState.metaBacktestExamples);
+  lastMetaTraining = set;
+  learningState.metaModel = set.examples.length ? trainAdaBoostStumps(set.examples, 20) : null;
+  setMetaModel(learningState.metaModel);
+  return set;
+}
+
+// Coalesce retraining. A training pass costs about 1.5s at the 2,000-example
+// cap, and catch-up can resolve a dozen signals in one go — retraining on each
+// would lock the page for twenty seconds to reach a model that one pass at the
+// end produces identically.
+function scheduleMetaRetrain() {
+  if (metaRetrainTimer) clearTimeout(metaRetrainTimer);
+  metaRetrainTimer = setTimeout(() => {
+    metaRetrainTimer = null;
+    try { retrainMetaLabeler(); saveLearningState(); }
+    catch (e) { /* the next resolution will try again */ }
+  }, 1200);
+}
+
 function learnFromResolvedSignal(sig) {
   if (!sig || sig.learned) return false;
   if (sig.status !== 'won' && sig.status !== 'lost') return false;
   const won = sig.status === 'won';
   recordOutcome(sig.dir, sig.factors || {}, won);
   if (sig.qualityFeatures) {
+    // Live outcomes are scarce and irreplaceable, and they get their own budget.
+    // They used to share a 500-slot window with backtest examples arriving ten
+    // times faster, so a real result survived days at best.
     learningState.metaExamples = (learningState.metaExamples || [])
-      .concat([{ features: sig.qualityFeatures, label: won ? 1 : -1 }]).slice(-500);
+      .concat([{ features: sig.qualityFeatures, label: won ? 1 : -1 }]);
+    // Thinned, never truncated: the record keeps spanning every day it has run.
+    learningState.metaExamples = thinExamples(learningState.metaExamples, META_LIMITS.liveSoftLimit);
+    scheduleMetaRetrain();
     saveLearningState();
   }
   sig.learned = true;
@@ -582,6 +641,7 @@ async function pullCloudState(uid) {
         Object.keys(FACTOR_LABELS).forEach(k => { if (!parsed.factors[k]) parsed.factors[k] = { votes: 0, wins: 0 }; });
         if (!parsed.patterns) parsed.patterns = {};
         if (!parsed.metaExamples) parsed.metaExamples = [];
+      if (!parsed.metaBacktestExamples) parsed.metaBacktestExamples = [];
         if (parsed.metaModel === undefined) parsed.metaModel = null;
         learningState = parsed;
         setMetaModel(learningState.metaModel);
@@ -617,8 +677,18 @@ function schedulePushCloudState(uid) {
 // fields, and it is roughly 40% of the payload. It stays local and is stripped
 // from what goes to the cloud.
 function cloudPayload() {
+  // Firestore caps a document at 1MB and this one already carries the signal
+  // log. The full live store can reach ~280KB on its own and the backtest store
+  // is regenerable on any device, so what goes to the cloud is the recent live
+  // history only — enough to carry a trained model across devices without
+  // risking the write. Nothing is dropped locally.
+  const CLOUD_LIVE_EXAMPLES = 1500;
+  const trimmedLearning = Object.assign({}, learningState, {
+    metaExamples: (learningState.metaExamples || []).slice(-CLOUD_LIVE_EXAMPLES),
+    metaBacktestExamples: []
+  });
   return {
-    learningState,
+    learningState: trimmedLearning,
     signalLog: signalLog.map(({ reason, ...rest }) => rest),
     updatedAt: Date.now()
   };
@@ -1781,7 +1851,7 @@ function updateSignalUI(result, plan, logIt, origin) {
     scoreEl.textContent = (s >= 0 ? '+' : '') + s.toFixed(2);
     scoreEl.className = 'mono ' + (s > 0.15 ? 'fpos' : s < -0.15 ? 'fneg' : 'fneu');
     document.getElementById('metaScoreStatus').textContent = trained
-      ? 'Trained on ' + (learningState.metaExamples ? learningState.metaExamples.length : 0) + ' labeled trades, ' + learningState.metaModel.length + ' stumps.'
+      ? metaTrainingSummary()
       : 'Not enough labeled trades yet (need 15+) — score is neutral until trained.';
     document.getElementById('metaFeatureTable').innerHTML = QUALITY_FEATURE_NAMES.map((name, i) => {
       const v = plan.qualityFeatures[i];
@@ -1944,10 +2014,13 @@ async function runBacktestCycle(isAuto) {
 
     // Meta-labeler: same out-of-sample discipline. Each out-of-sample trade with a real quality-feature
     // vector becomes a labeled example (win=1, loss=-1), capped so the training set doesn't grow unbounded.
+    // Backtest examples are regenerable — the same window can be replayed any
+    // time — so a rolling store is enough, and crucially they live apart from
+    // the live outcomes and can never evict one.
     const newExamples = testTrades.filter(t => t.qualityFeatures).map(t => ({ features: t.qualityFeatures, label: t.result === 'win' ? 1 : -1 }));
-    learningState.metaExamples = (learningState.metaExamples || []).concat(newExamples).slice(-500);
-    learningState.metaModel = trainAdaBoostStumps(learningState.metaExamples, 20);
-    setMetaModel(learningState.metaModel);
+    learningState.metaBacktestExamples = (learningState.metaBacktestExamples || [])
+      .concat(newExamples).slice(-META_LIMITS.backtestStore);
+    retrainMetaLabeler();
     saveLearningState();
 
     lastWalkForward = { tuned, baseWeights };

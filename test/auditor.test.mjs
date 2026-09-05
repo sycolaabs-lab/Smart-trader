@@ -11,8 +11,14 @@ const ok=(n,a,e)=>{const g=JSON.stringify(a)===JSON.stringify(e);console.log((g?
 const has=(findings,code)=>findings.some(f=>f.code===code);
 
 const MIN=60000, BAR=15*MIN;
+// Pinned to a fixed Wednesday rather than Date.now(). Defaulting to the current
+// time made every coverage assertion depend on the day it was run: on a weekend
+// the market is shut, a window ending "now" expects one bar, and nothing can be
+// judged thin. A test that passes Monday to Friday and fails on Saturday is
+// telling you about the calendar, not the code.
+const FIXTURE_NOW = Date.UTC(2026, 8, 2, 12, 0, 0);   // Wednesday midday UTC
 function candles(n, start){
-  const out=[]; const t0=(start||Date.now())-n*BAR;
+  const out=[]; const t0=(start||FIXTURE_NOW)-n*BAR;
   let p=2000;
   for(let i=0;i<n;i++){p+=Math.sin(i/6)*2; out.push({time:t0+i*BAR, open:p, high:p+3, low:p-3, close:p});}
   return out;
