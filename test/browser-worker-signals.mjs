@@ -17,6 +17,11 @@ await p.route('https://api.twelvedata.com/**', r => {
   if (u.pathname.includes('/price')) return r.fulfill({status:200,contentType:'application/json',body:JSON.stringify({price:'2000.00'})});
   r.fulfill({status:200,contentType:'application/json',body:JSON.stringify({values:candles(Math.min(+u.searchParams.get('outputsize')||500,900))})});
 });
+// Pinned inside the trading week and clear of the Friday-close window. These
+// fixtures seed live trades relative to "now", and the weekend flatten clears
+// the book on sight — run on a Saturday this suite would be testing the
+// calendar rather than the code.
+await p.clock.setFixedTime(new Date('2026-09-02T12:00:00Z'));
 await p.goto(`http://localhost:${PORT}/index.html`, { waitUntil:'domcontentloaded' });
 await p.waitForTimeout(800);
 

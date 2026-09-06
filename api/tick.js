@@ -28,7 +28,8 @@ import {
   CORRELATION_INSTRUMENTS, FUNDAMENTAL_INSTRUMENTS, FRED_INSTRUMENTS,
   AUTONOMY_DEFAULTS, macroContribution, aggregateMacroScore, pctChangeOf,
   seriesDeltas, latestChangeOf, correlateByDay, ECONOMIC_RELEASES, buildReleaseCalendar,
-  newsWindowState, NEWS_WINDOW_DEFAULTS, signalsToFlatten
+  newsWindowState, NEWS_WINDOW_DEFAULTS, signalsToFlatten,
+  weekendFlattenState, signalsToFlattenForWeekend, WEEKEND_FLATTEN_DEFAULTS
 } from '../lib/engine.js';
 import { auditAnalysis, auditOpenTrades, isMarketOpen, marketClock } from '../lib/auditor.js';
 
@@ -288,6 +289,29 @@ const FUNDAMENTAL_SIG = MACRO_FETCH_VERSION + '||' + describe(FUNDAMENTAL_INSTRU
 // The whole tick, with its two external dependencies — Firestore and the API
 // keys — passed in rather than reached for. handler() below wires up the real
 // ones; the test suite passes fakes and exercises the same code path.
+// Clearing the book for the weekend, used from two places: the normal tick when
+// it lands inside the window, and the closed-market path when a tick was missed
+// and something is still live with the market already shut.
+function sweepForWeekend(signalLog, at) {
+  const cfg = Object.assign({}, WEEKEND_FLATTEN_DEFAULTS, {
+    enabled: process.env.TICK_WEEKEND_FLATTEN !== '0',
+    beforeMin: envNum('TICK_WEEKEND_FLATTEN_MIN', WEEKEND_FLATTEN_DEFAULTS.beforeMin)
+  });
+  const state = weekendFlattenState(at, cfg);
+  let swept = 0;
+  signalsToFlattenForWeekend(signalLog, state).forEach(item => {
+    const sig = signalLog.find(x => x.id === item.id);
+    if (!sig || (sig.status !== 'pending' && sig.status !== 'open')) return;
+    sig.status = 'expired';
+    sig.expiryReason = item.reason;
+    sig.killSwitch = 'weekend-flatten';
+    sig.resolvedAt = new Date(at).toISOString();
+    sig.resolvedBy = 'weekend';
+    swept++;
+  });
+  return { swept, state };
+}
+
 export async function runTick({ db, tdKey, fredKey, avKey, now }) {
   const started = Date.now();
   // Gold is shut Friday ~21:00 UTC to Sunday ~22:00 UTC. Nothing new can arrive
@@ -298,12 +322,31 @@ export async function runTick({ db, tdKey, fredKey, avKey, now }) {
   const clockNow = isFinite(now) ? now : Date.now();
   if (!isMarketOpen(clockNow)) {
     const clock = marketClock(clockNow);
+    // No analysis and no provider calls — but the book still has to be checked.
+    // If a tick was missed through Friday evening, something is live with the
+    // market shut, and leaving it there is exactly the weekend exposure the
+    // flatten exists to prevent. One read, and a write only if there is
+    // something to clear.
+    let swept = 0;
+    try {
+      const workerRef = db.collection('system').doc(WORKER_DOC);
+      const snap = await workerRef.get();
+      const stored = snap.exists ? (snap.data() || {}) : {};
+      const log = stored.signalLog ? JSON.parse(stored.signalLog) : [];
+      const res = sweepForWeekend(log, clockNow);
+      swept = res.swept;
+      if (swept) await workerRef.set({ signalLog: JSON.stringify(log) }, { merge: true });
+    } catch (e) {
+      // A failed sweep must not turn a quiet weekend tick into a failing run.
+      swept = -1;
+    }
     return {
       skipped: 'market-closed',
       marketOpen: false,
       closedSince: new Date(clock.closedSince).toISOString(),
       opensAt: new Date(clock.opensAt).toISOString(),
       hoursUntilOpen: Math.round(clock.hoursUntilOpen * 10) / 10,
+      weekendSwept: swept,
       note: 'Gold is closed for the weekend. No analysis run and no provider quota spent.',
       durationMs: Date.now() - started
     };
@@ -524,6 +567,11 @@ export async function runTick({ db, tdKey, fredKey, avKey, now }) {
       sig.resolvedBy = 'news';
       flattenedThisTick++;
     });
+
+    // Same sweep on the other trigger. Runs after the news pass so a signal
+    // caught by both is attributed to the release that actually closed it.
+    const weekend = sweepForWeekend(state.signalLog, Date.now());
+    const weekendFlattened = weekend.swept;
     const gateCfg = Object.assign({}, AUTONOMY_DEFAULTS, {
       newsState,
       gradeFloor: process.env.TICK_GRADE_FLOOR || AUTONOMY_DEFAULTS.gradeFloor,
@@ -621,6 +669,9 @@ export async function runTick({ db, tdKey, fredKey, avKey, now }) {
       resolvedThisTick,
       killedThisTick,
       flattenedThisTick,
+      weekendFlattened,
+      weekendClosingIn: weekend.state.closesAt
+        ? Math.round(weekend.state.minutesUntilClose) : null,
       newsFlatten: !!newsState.flatten,
       newsFlattenFor: newsState.flattenRelease ? newsState.flattenRelease.name : null,
       tradeAuditReviewed: tradeAudit.reviewed,

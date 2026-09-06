@@ -256,6 +256,40 @@ ok('and produces no analysis at all', closedTick.direction === undefined, String
 const reopened = await runTick({ db, tdKey:'TD', fredKey:'FRED', avKey:'AV', now: Date.UTC(2026, 8, 6, 23, 0, 0) });
 ok('Sunday after the open runs normally', reopened.skipped === undefined, String(reopened.skipped));
 
+// A tick missed through Friday evening leaves the book live with the market
+// shut. The closed-market path does no analysis, but it still has to clear it —
+// that exposure is the whole reason the flatten exists.
+console.log('\n-- the weekend sweep --');
+{
+  const live = JSON.parse(db._docs.worker.signalLog);
+  live.push({ id:'STRANDED', dir:'BUY', entry:2000, sl:1990, tp:2040, entryType:'market',
+    status:'open', time:'2026-09-04T18:00:00.000Z', filledAt:'2026-09-04T18:05:00.000Z',
+    confidence:40, grade:'C', source:'worker', factors:{htf:1},
+    qualityFeatures:[.5,.5,.5,.5,.5,.5,.5], metaScore:0 });
+  live.push({ id:'STRANDED2', dir:'SELL', entry:2100, sl:2110, tp:2060, entryType:'limit',
+    status:'pending', time:'2026-09-04T18:00:00.000Z',
+    confidence:40, grade:'C', source:'worker', factors:{htf:1},
+    qualityFeatures:[.5,.5,.5,.5,.5,.5,.5], metaScore:0 });
+  db._docs.worker.signalLog = JSON.stringify(live);
+
+  const before = tdCalls;
+  const swept = await runTick({ db, tdKey:'TD', fredKey:'FRED', avKey:'AV',
+    now: Date.UTC(2026, 8, 6, 12, 0, 0) });
+  ok('it still skips the analysis', swept.skipped === 'market-closed', String(swept.skipped));
+  ok('and spends no provider quota doing it', tdCalls === before, 'calls=' + (tdCalls - before));
+  ok('but it clears both stranded trades', swept.weekendSwept === 2, String(swept.weekendSwept));
+
+  const cleared = JSON.parse(db._docs.worker.signalLog);
+  const one = cleared.find(x => x.id === 'STRANDED');
+  ok('the open position is expired, not graded', one.status === 'expired', one.status);
+  ok('and tagged so the reason survives', one.killSwitch === 'weekend-flatten', one.killSwitch);
+  ok('the resting order goes too',
+     cleared.find(x => x.id === 'STRANDED2').status === 'expired', '');
+  ok('a second closed-market tick has nothing left to do',
+     (await runTick({ db, tdKey:'TD', fredKey:'FRED', avKey:'AV',
+       now: Date.UTC(2026, 8, 6, 13, 0, 0) })).weekendSwept === 0, '');
+}
+
 console.log(`\nnetwork: twelvedata=${tdCalls} fred=${fredCalls} alphavantage=${avCalls}`);
 console.log(`${pass} passed, ${fail} failed`);
 process.exit(fail?1:0);

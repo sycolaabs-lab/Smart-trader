@@ -1371,5 +1371,104 @@ ok('midweek it says nothing of the sort',
    /market shut/.test(signalLiveness({ ...WKSIG, time: WK_WED - 3600000, status:'pending' }, {}, { now: WK_WED }).label), false);
 
 
+import { weekendFlattenState, signalsToFlattenForWeekend, weekendFlattenText,
+  resetPaperAccount, lifetimeRecord, thinPositions, PAPER_HISTORY_SOFT_LIMIT,
+  WEEKEND_FLATTEN_DEFAULTS } from '../lib/engine.js';
+
+// ============================================================
+// NOTHING IS CARRIED THROUGH THE WEEKEND
+// ============================================================
+console.log('\n-- the weekend flatten window --');
+const wfAt = (d, h, m) => weekendFlattenState(Date.UTC(2026, 8, d, h, m || 0, 0));
+ok('midweek there is nothing to do', wfAt(2, 12).flatten, false);
+ok('two hours before the close there is still time', wfAt(4, 19).flatten, false);
+ok('thirty minutes out is still outside the window', wfAt(4, 20, 30).flatten, false);
+ok('twenty minutes out it fires', wfAt(4, 20, 40).flatten, true);
+ok('and it names the minutes left', Math.round(wfAt(4, 20, 45).minutesUntilClose), 15);
+ok('once shut it still fires, for anything that slipped through', wfAt(5, 12).flatten, true);
+ok('and says the market is closed rather than counting down', wfAt(5, 12).closed, true);
+ok('the default window is 20 minutes', WEEKEND_FLATTEN_DEFAULTS.beforeMin, 20);
+ok('turning it off stops it', weekendFlattenState(Date.UTC(2026,8,4,20,45,0), { enabled: false }).flatten, false);
+ok('and a wider window can be set',
+   weekendFlattenState(Date.UTC(2026,8,4,19,0,0), { beforeMin: 180 }).flatten, true);
+
+console.log('\n-- what gets cleared --');
+const wfLog = [
+  { id:'OPEN', status:'open' }, { id:'REST', status:'pending' },
+  { id:'WON', status:'won' }, { id:'DEAD', status:'expired' }
+];
+const wfDue = signalsToFlattenForWeekend(wfLog, wfAt(4, 20, 45));
+ok('both live trades are cleared', wfDue.map(d => d.id).sort(), ['OPEN','REST']);
+ok('a resolved trade is left alone', wfDue.some(d => d.id === 'WON'), false);
+ok('an open position is closed at market', /closed at market/.test(wfDue.find(d=>d.id==='OPEN').reason), true);
+ok('a resting order is cancelled', /order cancelled/.test(wfDue.find(d=>d.id==='REST').reason), true);
+ok('and the reason says it is not a verdict',
+   /not a verdict on the setup/.test(wfDue[0].reason), true);
+ok('nothing is due midweek', signalsToFlattenForWeekend(wfLog, wfAt(2, 12)).length, 0);
+ok('the banner counts down before the close',
+   /Weekly close in 15 min/.test(weekendFlattenText(wfAt(4, 20, 45))), true);
+ok('and states the position once shut',
+   /book is flat/.test(weekendFlattenText(wfAt(5, 12))), true);
+ok('and says nothing midweek', weekendFlattenText(wfAt(2, 12)), null);
+
+// ============================================================
+// A RESET MOVES A LINE, IT DOES NOT DELETE THE RECORD
+// ============================================================
+console.log('\n-- resetting the paper account --');
+const rpPos = (id, pnl, closedAt, outcome, status) => ({ id, status: status || 'closed', pnl,
+  closedAt, openedAt: closedAt, outcome, rMultiple: pnl / 100, dir:'BUY',
+  entryFill: 2000, sl: 1990, units: 10, contractSize: 100 });
+const rpHistory = [
+  rpPos('a', 200, '2026-09-01T00:00:00Z', 'won'),
+  rpPos('b', -100, '2026-09-02T00:00:00Z', 'lost'),
+  rpPos('c', 300, '2026-09-03T00:00:00Z', 'won')
+];
+const RESET_AT = Date.parse('2026-09-03T12:00:00Z');
+const rpReset = resetPaperAccount(rpHistory, 2000, RESET_AT);
+
+ok('no position is deleted', rpReset.positions.length, 3);
+ok('the epoch lands just past the reset', rpReset.epoch, RESET_AT + 1);
+const rpAfter = paperAccountSummary(rpReset.positions, 10000, 2000, rpReset.epoch);
+ok('the balance is back to the starting figure', rpAfter.balance, 10000);
+ok('the return reads zero', rpAfter.returnPct, 0);
+ok('the current era has no closed trades', rpAfter.closedCount, 0);
+ok('and no drawdown to speak of', rpAfter.maxDrawdown, 0);
+ok('but the archived trades are counted as archived', rpAfter.archivedCount, 3);
+ok('the lifetime record survives intact', rpAfter.lifetime.gradedCount, 3);
+ok('with its win rate', Math.round(rpAfter.lifetime.winRate * 100), 67);
+ok('and its net P&L', rpAfter.lifetime.netPnl, 400);
+ok('the current-era win rate is not borrowed from it', rpAfter.winRate, null);
+
+// A live book cannot straddle a rpReset.
+const withLive = rpHistory.concat([
+  Object.assign(rpPos('open', 0, '2026-09-03T06:00:00Z', null, 'open'), { closedAt: null, openedAt: '2026-09-03T06:00:00Z' }),
+  Object.assign(rpPos('rest', 0, '2026-09-03T06:00:00Z', null, 'pending'), { closedAt: null, openedAt: '2026-09-03T06:00:00Z' })
+]);
+const reset2 = resetPaperAccount(withLive, 2010, RESET_AT);
+ok('the live book is settled by the reset', reset2.settled, 2);
+ok('the open position is closed at the mark',
+   reset2.positions.find(p => p.id === 'open').status, 'closed');
+ok('and marked as a reset rather than an outcome',
+   [reset2.positions.find(p => p.id === 'open').closeReason,
+    reset2.positions.find(p => p.id === 'open').outcome], ['account reset', null]);
+ok('the resting order is cancelled, not closed',
+   reset2.positions.find(p => p.id === 'rest').status, 'cancelled');
+ok('the new era starts genuinely empty',
+   paperAccountSummary(reset2.positions, 10000, 2010, reset2.epoch).balance, 10000);
+ok('and a reset-closed trade never counts as a win or a loss',
+   lifetimeRecord(reset2.positions).gradedCount, 3);
+
+ok('without an epoch nothing changes for existing accounts',
+   paperAccountSummary(rpHistory, 10000, 2000).balance, 10400);
+
+console.log('\n-- the position history is thinned, never truncated --');
+const rpMany = []; for (let i = 0; i < 43800; i++) rpMany.unshift({ id: 'p' + i, status: 'closed' });
+const rpThinned = thinPositions(rpMany);
+ok('a decade of trades is held down to something storable',
+   rpThinned.length < rpMany.length && rpThinned.length > PAPER_HISTORY_SOFT_LIMIT, true);
+ok('the very first trade is still there', rpThinned[rpThinned.length - 1].id, 'p0');
+ok('and the newest is untouched', rpThinned[0].id, 'p43799');
+ok('a small book is left exactly as it is', thinPositions(rpMany.slice(0, 10)).length, 10);
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail?1:0);

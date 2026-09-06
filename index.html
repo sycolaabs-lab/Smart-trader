@@ -490,6 +490,14 @@ canvas { width:100%; background:#12151c; border-radius:12px; border:1px solid #1
       <input type="checkbox" id="newsFlattenEnabled" checked style="accent-color:#ef4d5f;">
       <span><strong>Close open positions before the release</strong> — cancel resting orders too</span>
     </label>
+    <label style="display:flex;align-items:center;gap:8px;font-size:11px;color:#c9cedb;cursor:pointer;margin-top:5px;">
+      <input type="checkbox" id="weekendFlattenEnabled" checked style="accent-color:#ef4d5f;">
+      <span><strong>Close everything before the weekly close</strong> — nothing carried through the weekend</span>
+    </label>
+    <div class="params" style="margin-top:8px;">
+      <div class="field"><label>Close before weekly close (min)</label><input type="number" id="weekendFlattenMin" value="20" step="5" min="0" max="240"></div>
+    </div>
+    <div style="font-size:10px;color:#454a56;margin-top:6px;line-height:1.4;">Gold reopens with a gap often enough that a position held across it is graded by the gap rather than by the setup, and a resting order would fill at its limit price in simulation when the real fill was far worse. Both are cleared while there is still liquidity, and both are logged as cut short — not as wins or losses.</div>
     <div class="conn-note" style="margin-top:7px;">
       <strong style="color:#ef4d5f;">Flattening.</strong> Standing aside from new trades is only half the
       protection — a position already open rides straight into the print. NFP routinely moves gold further in
@@ -520,7 +528,10 @@ canvas { width:100%; background:#12151c; border-radius:12px; border:1px solid #1
   <div class="panel" id="paperPanel" style="border-color:#20332a;">
     <div class="panel-title">
       Paper Trading
-      <span class="collapse-toggle" id="paperAdvancedToggle">settings</span>
+      <span>
+        <span class="collapse-toggle" id="paperReset" style="margin-right:8px;">reset balance</span>
+        <span class="collapse-toggle" id="paperAdvancedToggle">settings</span>
+      </span>
     </div>
     <label style="display:flex;align-items:center;gap:9px;font-size:12px;color:#c9cedb;cursor:pointer;">
       <input type="checkbox" id="paperEnabled" style="accent-color:#3ecf8e;transform:scale(1.25);">
@@ -589,7 +600,12 @@ canvas { width:100%; background:#12151c; border-radius:12px; border:1px solid #1
         Fills are deliberately pessimistic: entries pay the spread and stops take slippage, so a
         nominal 1:4 winner returns slightly under 4R. A simulator that assumes perfect execution
         produces training data that teaches the wrong lesson.
-        <span class="collapse-toggle" id="paperReset" style="margin-left:6px;">reset account</span>
+        <br><br>
+        <strong>Resetting the balance keeps the record.</strong> "reset balance" in the panel header puts
+        the account back to its starting figure and clears the live book, but every completed trade stays
+        on file — they are what the meta-labeler, the journal and the win rate are built from, so deleting
+        them to zero a number would cost the system its evidence. They simply stop counting towards the
+        balance and drawdown, and the lifetime record is shown separately underneath.
       </div>
     </div>
 

@@ -6,11 +6,15 @@
 // having ignored the trade.
 import { chromium } from 'playwright';
 const PORT = process.env.PORT || '8899';
+// The page clock is pinned below; the candle fixture is built in Node, so it
+// has to use the same instant or the bars arrive dated days from where the
+// page thinks it is.
+const PIN = Date.parse('2026-09-02T12:00:00Z');
 const STEP = { '15min':9e5, '1h':36e5, '4h':144e5, '1day':864e5, '1week':6048e5 };
 // Price sits above 4400 and then dips THROUGH it inside the last few hours —
 // after the signal was taken, which is the only window resolveSignal looks at.
 function build(n, stepMs) {
-  const now = Date.now();
+  const now = PIN;
   const dipFrom = n - 12;   // 12 bars back: three hours on the 15m series
   return Array.from({length:n}, (_, i) => {
     const p = i < dipFrom ? 4420 + Math.sin(i / 9) * 3
@@ -30,6 +34,11 @@ await p.route('https://api.twelvedata.com/**', r => {
   r.fulfill({status:200,contentType:'application/json',body:JSON.stringify({ values: build(Math.min(+u.searchParams.get('outputsize')||500,900), STEP[iv]||9e5) })});
 });
 await p.route('**/api/fred**', r => r.fulfill({status:200,contentType:'application/json',body:JSON.stringify({observations:[]})}));
+// Pinned inside the trading week and clear of the Friday-close window. These
+// fixtures seed live trades relative to "now", and the weekend flatten clears
+// the book on sight — run on a Saturday this suite would be testing the
+// calendar rather than the code.
+await p.clock.setFixedTime(new Date(PIN));
 await p.goto(`http://localhost:${PORT}/index.html`, { waitUntil:'domcontentloaded' });
 await p.waitForTimeout(1000);
 

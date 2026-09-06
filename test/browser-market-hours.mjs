@@ -47,12 +47,14 @@ async function pageAt(iso) {
   await p.close();
 }
 
-// ---- the liveness chip says the clock is paused ----------------------------
-// A limit placed two hours before Friday's close. Elapsed, it is 41 hours old
-// by Sunday lunchtime — three times past the 12h fill limit — but the market
-// was open for only two of them.
-{
-  const { p, errs } = await pageAt('2026-09-06T12:00:00Z');
+// ---- nothing survives the weekend, and the clock is paused for whatever does -
+// Two behaviours that have to be read together. The weekend flatten is the
+// policy: a Friday-evening limit is cancelled before the close, because filling
+// it on Monday's gap would put a fabricated entry into the record. The paused
+// stale-order clock is the fallback for when that policy is switched off — then
+// the order does survive, and must not be killed for 49 hours in which it had no
+// opportunity to fill.
+async function seedFridayOrder(p) {
   await p.evaluate(() => {
     localStorage.clear();
     localStorage.setItem('smc-signal-log-v1', JSON.stringify([{
@@ -62,17 +64,50 @@ async function pageAt(iso) {
       factors:{htf:1}, qualityFeatures:[.5,.5,.5,.5,.5,.5,.5], metaScore:0
     }]));
   });
-  await p.reload({ waitUntil:'domcontentloaded' });
-  await p.waitForTimeout(1800);
+}
+async function logRow(p) {
   const row = await p.evaluate(() => {
     const el = document.querySelector('#tradeLog .log-item');
     if (!el) return null;
     const chips = Array.from(el.querySelectorAll('.mono[title]'));
     return { text: el.innerText.replace(/\s+/g,' ').trim(), titles: chips.map(c => c.getAttribute('title')) };
   });
-  const all = row ? row.text + ' ' + row.titles.join(' ') : '';
-  ok('the Friday order is still resting, not killed', /resting/i.test(all) && /killed as stale/i.test(all) === false, all.slice(0, 160));
-  ok('it is aged in tradeable hours, not elapsed ones', /resting 2\.0h/.test(all), all.slice(0, 160));
+  return row ? row.text + ' ' + row.titles.join(' ') : '';
+}
+
+// With the flatten on — the default — the order is gone by Sunday.
+{
+  const { p, errs } = await pageAt('2026-09-06T12:00:00Z');
+  await seedFridayOrder(p);
+  await p.reload({ waitUntil:'domcontentloaded' });
+  await p.waitForTimeout(1800);
+  const all = await logRow(p);
+  ok('by default the Friday order does not survive the weekend', /killed/i.test(all), all.slice(0, 140));
+  ok('and it is the weekly close that cleared it, not the stale-order limit',
+     /weekly close/i.test(all), all.slice(0, 200));
+  ok('no page errors', errs.length === 0, errs.join(' | '));
+  await p.close();
+}
+
+// With the flatten off, the order survives — and the stale clock is paused.
+{
+  const { p, errs } = await pageAt('2026-09-06T12:00:00Z');
+  await p.evaluate(() => {
+    const box = document.getElementById('weekendFlattenEnabled');
+    if (box) { box.checked = false; box.dispatchEvent(new Event('change', { bubbles: true })); }
+  });
+  await seedFridayOrder(p);
+  await p.evaluate(() => {
+    // Persist the setting across the reload the way the UI does.
+    const s = JSON.parse(localStorage.getItem('smc-settings-v1') || '{}');
+    s.weekendFlattenEnabled = false;
+    localStorage.setItem('smc-settings-v1', JSON.stringify(s));
+  });
+  await p.reload({ waitUntil:'domcontentloaded' });
+  await p.waitForTimeout(1800);
+  const all = await logRow(p);
+  ok('with the flatten off the order is still resting', /resting/i.test(all) && /killed/i.test(all) === false, all.slice(0, 160));
+  ok('aged in tradeable hours, not the 41 elapsed ones', /resting 2\.0h/.test(all), all.slice(0, 160));
   ok('and the chip says the market is shut', /market shut/i.test(all), all.slice(0, 160));
   ok('no page errors', errs.length === 0, errs.join(' | '));
   await p.close();

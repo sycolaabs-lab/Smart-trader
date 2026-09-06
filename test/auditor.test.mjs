@@ -494,5 +494,17 @@ ok('but the same gap midweek is', has(auditFreshness(candles(30, MW_WED - 6*3600
   ok('the week shortcut matches an hour-by-hour count over 400 days', mismatched, []);
 }
 
+const { nextMarketClose } = await import('../lib/auditor.js');
+ok('the week closes Friday 21:00 UTC',
+   new Date(nextMarketClose(Date.UTC(2026,8,2,12,0,0))).toISOString(), '2026-09-04T21:00:00.000Z');
+ok('an hour before the close it is still that close',
+   new Date(nextMarketClose(Date.UTC(2026,8,4,20,0,0))).toISOString(), '2026-09-04T21:00:00.000Z');
+ok('from Sunday evening it is the following Friday',
+   new Date(nextMarketClose(Date.UTC(2026,8,6,23,0,0))).toISOString(), '2026-09-11T21:00:00.000Z');
+ok('a shut instant is its own next close', nextMarketClose(MW_SUN), MW_SUN);
+ok('the clock reports minutes to the close while open',
+   Math.round(marketClock(Date.UTC(2026,8,4,20,15,0)).minutesUntilClose), 45);
+ok('and nothing to count down to while shut', marketClock(MW_SUN).closesAt, null);
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail?1:0);
