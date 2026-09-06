@@ -2,8 +2,9 @@
 // system's own trade, with its outcome and its paper result — not as a blank
 // row waiting for someone to click Won or Lost.
 import { chromium } from 'playwright';
+import { NOW, agoMinutes, pinPage } from './clock.mjs';
 const PORT = process.env.PORT || '8899';
-function candles(n){const o=[];const now=Date.now();let p=2000;
+function candles(n){const o=[];const now=NOW;let p=2000;
  for(let i=n;i>=0;i--){p=2000+Math.sin(i/9)*6;const h=p+2,l=p-2;
  o.push({datetime:new Date(now-i*9e5).toISOString().slice(0,19).replace('T',' '),open:p.toFixed(2),high:h.toFixed(2),low:l.toFixed(2),close:p.toFixed(2)});}
  return o.reverse();}
@@ -21,11 +22,11 @@ await p.route('https://api.twelvedata.com/**', r => {
 // fixtures seed live trades relative to "now", and the weekend flatten clears
 // the book on sight — run on a Saturday this suite would be testing the
 // calendar rather than the code.
-await p.clock.setFixedTime(new Date('2026-09-02T12:00:00Z'));
+await pinPage(p);
 await p.goto(`http://localhost:${PORT}/index.html`, { waitUntil:'domcontentloaded' });
 await p.waitForTimeout(800);
 
-const ago = m => new Date(Date.now() - m*60000).toISOString();
+const ago = m => new Date(agoMinutes(m)).toISOString();
 await p.evaluate((t) => {
   localStorage.clear();
   localStorage.setItem('smc-signal-log-v1', JSON.stringify([

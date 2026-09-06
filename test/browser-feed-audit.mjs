@@ -3,10 +3,11 @@
 // instrument, a decimal shift, or a provider that stopped updating — and none
 // of those announce themselves.
 import { chromium } from 'playwright';
+import { NOW, pinPage } from './clock.mjs';
 const PORT = process.env.PORT || '8899';
 const STEP = { '15min':9e5, '1h':36e5, '4h':144e5, '1day':864e5, '1week':6048e5 };
 function build(n, stepMs, shape) {
-  const now = Date.now();
+  const now = NOW;
   return Array.from({length:n}, (_, i) => {
     const p = shape(i);
     return { datetime: new Date(now - (n - i) * stepMs).toISOString().slice(0,19).replace('T',' '),
@@ -41,6 +42,7 @@ const panel = () => p.evaluate(() => {
   return el ? el.innerText.replace(/\s+/g,' ') : '';
 });
 async function load() {
+  await pinPage(p);
   await p.goto(`http://localhost:${PORT}/index.html`, { waitUntil:'domcontentloaded' });
   await p.waitForTimeout(1000);
   await p.evaluate(() => localStorage.clear());

@@ -3,13 +3,14 @@
 // than the setup that was analysed. The kill switch must cancel it, cancel the
 // paper order with it, and never let it count as a win or a loss.
 import { chromium } from 'playwright';
+import { LATE_WEEK, pinPage } from './clock.mjs';
 const PORT = process.env.PORT || '8899';
 // Price sits at 2012 and never trades down to a 2000 limit. Each timeframe gets
 // its own spacing — serving 15-minute bars for every interval makes the data
 // auditor (correctly) report a stale, out-of-order feed, which is noise here.
 // The page's clock is pinned below; the fixture must use the same instant or
 // the candles arrive dated two days after the page thinks it is.
-const PIN = Date.parse('2026-09-04T20:00:00Z');
+const PIN = LATE_WEEK;
 const STEP = { '15min':9e5, '1h':36e5, '4h':144e5, '1day':864e5, '1week':6048e5 };
 function candles(n, stepMs){const now=PIN;
  return Array.from({length:n},(_,i)=>{const p=2012+Math.sin(i/11)*1.2;
@@ -36,7 +37,7 @@ await p.route('**/api/fred**', r => r.fulfill({status:200,contentType:'applicati
 // "N hours ago", and the stale-order clock now counts tradeable hours only — so
 // run on a weekend, every age collapses to zero and the suite tests the
 // calendar rather than the code.
-await p.clock.setFixedTime(new Date(PIN));
+await pinPage(p, PIN);
 await p.goto(`http://localhost:${PORT}/index.html`, { waitUntil:'domcontentloaded' });
 await p.waitForTimeout(800);
 

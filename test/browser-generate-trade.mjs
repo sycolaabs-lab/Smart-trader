@@ -3,6 +3,7 @@
 // all of that silently, so a pass that took nothing was indistinguishable from
 // a broken button.
 import { chromium } from 'playwright';
+import { NOW, pinPage } from './clock.mjs';
 const PORT = process.env.PORT || '8899';
 const STEP = { '15min':9e5, '1h':36e5, '4h':144e5, '1day':864e5, '1week':6048e5 };
 // A stepped advance the engine reads as a clear BUY on every timeframe. A plain
@@ -12,7 +13,7 @@ const trend = (i) => 1900 + Math.floor(i / 12) * 4 + Math.sin(i / 3) * 1.2;
 // Flat noise: the engine holds on this, by design.
 const flat  = (i) => 2000 + Math.sin(i / 5) * 0.6;
 function candles(n, stepMs, shape) {
-  const now = Date.now();
+  const now = NOW;
   return Array.from({length:n}, (_, i) => {
     const p = shape(i);
     return { datetime: new Date(now - (n - i) * stepMs).toISOString().slice(0,19).replace('T',' '),
@@ -45,6 +46,7 @@ const state = () => p.evaluate(() => ({
   positions: (JSON.parse(localStorage.getItem('smc-paper-v1') || '{}').positions) || []
 }));
 async function connect() {
+  await pinPage(p);
   await p.goto(`http://localhost:${PORT}/index.html`, { waitUntil:'domcontentloaded' });
   await p.waitForTimeout(1200);
   await p.fill('#apiKeyInput', 'TESTKEY');

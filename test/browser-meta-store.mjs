@@ -2,11 +2,13 @@
 // contributes ~22 examples every four hours; live trades arrive at maybe a
 // dozen a day. Simulated over two weeks: 168 real outcomes recorded, 36 kept.
 import { chromium } from 'playwright';
+import { pinPage } from './clock.mjs';
 const PORT = process.env.PORT || '8899';
 const b = await chromium.launch({ executablePath: '/opt/pw-browsers/chromium-1194/chrome-linux/chrome' });
 const p = await b.newPage();
 const errs = []; p.on('pageerror', e => errs.push(e.message));
 p.on('console', m => { if (m.type()==='error' && !/ERR_|net::|404|Failed to load/.test(m.text())) errs.push('CONSOLE: '+m.text()); });
+await pinPage(p);
 await p.goto(`http://localhost:${PORT}/index.html`, { waitUntil:'domcontentloaded' });
 await p.waitForTimeout(1000);
 

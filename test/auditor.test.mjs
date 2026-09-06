@@ -1,3 +1,4 @@
+import { LATE_WEEK, NOW } from './clock.mjs';
 // The auditor is only worth having if it catches deliberately broken input.
 // Every test here plants a specific fault and checks it is found — and the
 // clean case checks it does not invent problems that are not there.
@@ -16,7 +17,7 @@ const MIN=60000, BAR=15*MIN;
 // the market is shut, a window ending "now" expects one bar, and nothing can be
 // judged thin. A test that passes Monday to Friday and fails on Saturday is
 // telling you about the calendar, not the code.
-const FIXTURE_NOW = Date.UTC(2026, 8, 2, 12, 0, 0);   // Wednesday midday UTC
+const FIXTURE_NOW = NOW;
 function candles(n, start){
   const out=[]; const t0=(start||FIXTURE_NOW)-n*BAR;
   let p=2000;
@@ -170,7 +171,7 @@ ok('nothing at all is fine', auditCrossSeries(null).length, 0);
 
 // macro inputs that are stale or constant
 console.log('\n-- macro inputs --');
-const MNOW = Date.parse('2026-03-10T00:00:00Z');
+const MNOW = NOW - 12 * 3600000;   // midnight before the shared Wednesday
 const obsFrom = (daysAgo, n, val) => Array.from({length:n}, (_, i) => ({
   date: new Date(MNOW - (daysAgo + n - i) * 86400000).toISOString().slice(0,10),
   value: typeof val === 'function' ? val(i) : val }));
@@ -222,7 +223,7 @@ ok('a series with one observation is not judged',
 // and weekly, daily, 4H and 1H carry roughly 45 of the composite's ~109 weight.
 // A 4H series frozen nine days ago still holds a plausible gold price, so the
 // level check passes and the analysis runs at full confidence.
-const SF_NOW = Date.parse('2026-09-04T12:00:00Z');   // a Friday
+const SF_NOW = LATE_WEEK - 8 * 3600000;   // the shared Friday, midday
 const sfSeries = (n, stepMs, endAt) => Array.from({length:n}, (_, i) => {
   const p = 2000 + Math.sin(i/7)*4;
   return { time: endAt - (n-1-i)*stepMs, open:p-0.4, high:p+1, low:p-1, close:p };
@@ -290,7 +291,7 @@ ok('and is blamed on the data', stalled.dataProblem, true);
 ok('and named in the verdict', /series has stopped updating/.test(stalled.verdict), true);
 console.log('\n-- assembly --');
 const broken = auditAnalysis({ result:{...buyResult, factors:{htf:-1}, weights:{htf:10}}, plan:{...buyPlan, sl:2010, rr:99},
-  candles:unordered, expectedIntervalMs:BAR, now:Date.now(), maxAgeMs:30*MIN });
+  candles:unordered, expectedIntervalMs:BAR, now:NOW, maxAgeMs:30*MIN });
 ok('a badly broken analysis blocks', broken.blocking, true);
 ok('and reports several criticals', broken.critical >= 3, true);
 // The fixture's candles are out of order, so the fault is in the DATA. Saying
@@ -363,7 +364,7 @@ ok('and half-missing is still critical', auditData(genuinelyThin,BAR).find(f=>f.
 // ============================================================
 // The auditor, not the engine, decides which live trades are past saving —
 // the engine judging whether its own trade has gone bad is not a check.
-const TNOW = Date.parse('2026-03-10T12:00:00Z');
+const TNOW = LATE_WEEK;
 const tAgo = h => new Date(TNOW - h * 3600000).toISOString();
 const TC = (t,o,h,l,c) => ({time:t,open:o,high:h,low:l,close:c});
 const T = (o) => Object.assign({ id:'t1', dir:'BUY', entry:2000, sl:1990, tp:2040,

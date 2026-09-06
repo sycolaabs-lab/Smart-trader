@@ -3,6 +3,7 @@
 // structure off it, and weekly + daily + 4H + 1H carry roughly 45 of the
 // composite's ~109 weight. The only symptom was that structure stopped moving.
 import { chromium } from 'playwright';
+import { NOW, pinPage } from './clock.mjs';
 const PORT = process.env.PORT || '8899';
 const STEP = { '15min':9e5, '1h':36e5, '4h':144e5, '1day':864e5, '1week':6048e5 };
 function build(n, stepMs, endAt) {
@@ -25,9 +26,10 @@ await p.route('https://api.twelvedata.com/**', r => {
   if (u.pathname.includes('/price')) return r.fulfill({status:200,contentType:'application/json',body:JSON.stringify({price:'2000.00'})});
   if (failHtf && iv === '4h') return r.fulfill({status:500,contentType:'application/json',body:JSON.stringify({message:'upstream unavailable'})});
   const n = Math.min(+u.searchParams.get('outputsize')||500, 900);
-  r.fulfill({status:200,contentType:'application/json',body:JSON.stringify({ values: build(n, STEP[iv]||9e5, Date.now()) })});
+  r.fulfill({status:200,contentType:'application/json',body:JSON.stringify({ values: build(n, STEP[iv]||9e5, NOW) })});
 });
 await p.route('**/api/fred**', r => r.fulfill({status:200,contentType:'application/json',body:JSON.stringify({observations:[]})}));
+await pinPage(p);
 await p.goto(`http://localhost:${PORT}/index.html`, { waitUntil:'domcontentloaded' });
 await p.waitForTimeout(1200);
 await p.evaluate(() => localStorage.clear());

@@ -2,6 +2,7 @@
 // writes, and can be hand-edited. None of it may white-screen the page.
 // Run against a static server on :8899 —  python3 -m http.server 8899
 import { chromium } from 'playwright';
+import { pinPage } from './clock.mjs';
 const cases = {
   'wrong types':        {'smc-signal-log-v1':'{"a":1}','smc-knowledge-v1':'[]','smc-paper-v1':'[]','smc-factor-stats-v1':'42'},
   'null inside arrays': {'smc-signal-log-v1':'[null,null]','smc-paper-v1':'{"positions":[null]}','smc-knowledge-v1':'{"rows":[null]}'},
@@ -21,6 +22,7 @@ for (const [name, store] of Object.entries(cases)) {
   const errs=[];
   const onErr=e=>errs.push(e.message); const onCon=m=>{const t=m.text();if(m.type()==='error'&&!/ERR_|net::|404|Failed to load/i.test(t))errs.push('C:'+t);};
   p.on('pageerror',onErr); p.on('console',onCon);
+  await pinPage(p);
   await p.goto('http://localhost:8899/index.html',{waitUntil:'domcontentloaded'});
   await p.evaluate(s=>{localStorage.clear();for(const[k,v]of Object.entries(s))localStorage.setItem(k,v);},store);
   await p.reload({waitUntil:'domcontentloaded'});

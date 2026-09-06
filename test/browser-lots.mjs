@@ -1,14 +1,16 @@
 // The paper account has to quote size the way a broker does: lots, not ounces.
 import { chromium } from 'playwright';
+import { isoAgo, pinPage } from './clock.mjs';
 const PORT = process.env.PORT || '8899';
 const b = await chromium.launch({ executablePath: '/opt/pw-browsers/chromium-1194/chrome-linux/chrome' });
 const p = await b.newPage();
 const errs = []; p.on('pageerror', e => errs.push(e.message));
 p.on('console', m => { if (m.type()==='error' && !/ERR_|net::|404/.test(m.text())) errs.push('CONSOLE: '+m.text()); });
+await pinPage(p);
 await p.goto(`http://localhost:${PORT}/index.html`, { waitUntil:'domcontentloaded' });
 await p.waitForTimeout(900);
 
-const ago = h => new Date(Date.now() - h*3600000).toISOString();
+const ago = h => isoAgo(h);
 await p.evaluate((t) => {
   localStorage.clear();
   localStorage.setItem('smc-paper-v1', JSON.stringify({ enabled:true, manual:true, startingBalance:10000, positions:[

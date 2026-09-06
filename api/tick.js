@@ -423,7 +423,12 @@ export async function runTick({ db, tdKey, fredKey, avKey, now }) {
     const resolveCfg = Object.assign({}, AUTONOMY_DEFAULTS, {
       maxHoursToFill: envNum('TICK_KILL_FILL_HOURS', AUTONOMY_DEFAULTS.maxHoursToFill),
       maxHoursOpen: envNum('TICK_KILL_OPEN_HOURS', AUTONOMY_DEFAULTS.maxHoursOpen),
-      maxDriftRToFill: envNum('TICK_KILL_DRIFT_R', AUTONOMY_DEFAULTS.maxDriftRToFill)
+      maxDriftRToFill: envNum('TICK_KILL_DRIFT_R', AUTONOMY_DEFAULTS.maxDriftRToFill),
+      // The one clock for the whole tick. Without this the market-hours guard
+      // and the audit ran on the caller's `now` while resolution quietly used
+      // the machine's, which is identical in production and divergent under
+      // any test that moves the clock.
+      now: clockNow
     });
     let resolvedThisTick = 0;
     let killedThisTick = 0;
@@ -437,7 +442,7 @@ export async function runTick({ db, tdKey, fredKey, avKey, now }) {
       maxHoursToFill: resolveCfg.maxHoursToFill,
       maxHoursOpen: resolveCfg.maxHoursOpen,
       maxDriftRToFill: resolveCfg.maxDriftRToFill
-    });
+    }, { now: clockNow });
     const killedBy = new Map(tradeAudit.kills.map(k => [k.id, k]));
 
     state.signalLog.forEach(sig => {

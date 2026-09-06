@@ -1270,6 +1270,46 @@ the training data toward scepticism is the right way to be wrong).
 and a stubbed network, and asserts both the dashboard field contract and the
 caching behaviour above.
 
+### Running them
+
+```bash
+node test/run-all.mjs            # everything
+node test/run-all.mjs unit       # unit suites only
+node test/run-all.mjs browser    # browser suites (needs a server on :8899)
+```
+
+The browser suites drive Chromium against the real page:
+
+```bash
+python3 -m http.server 8899      # from the repo root, in another shell
+```
+
+### No test reads the wall clock
+
+The engine has opinions about the calendar — gold's week ends Friday 21:00 UTC,
+orders age in tradeable hours, the book is flattened before the close, analysis
+stands down while the market is shut. A fixture dated "three hours ago" means
+something different on a Sunday than on a Wednesday, so a suite built from
+`Date.now()` measures the day it ran on. That cost four separate debugging
+sessions before it was fixed properly, each one looking like an engine bug.
+
+Every suite therefore takes its "now" from `test/clock.mjs`, and every browser
+suite pins its page clock with `pinPage()` before the first `goto` — a page that
+has already booted has read the real clock.
+
+Two things enforce it. `test/harness.test.mjs` reads the other suites as text
+and fails on a wall-clock read outside a `p.evaluate`, a browser suite that does
+not pin its page, a pin that lands after the `goto`, or a suite declaring its own
+`now`. And `run-all.mjs` honours `FAKE_NOW`, which moves Node's clock so the
+whole harness can be run as any day of the week:
+
+```bash
+FAKE_NOW=$(node -e "console.log(Date.UTC(2026,8,5,12,0,0))") node test/run-all.mjs   # a Saturday
+```
+
+A harness that is genuinely independent of the calendar gives the same result
+for every value. That is the check a grep cannot make.
+
 ---
 
 ## A note on what this is

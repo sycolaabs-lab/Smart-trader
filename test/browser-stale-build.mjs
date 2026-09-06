@@ -3,6 +3,7 @@
 // has since been fixed — which is exactly what happened when the macro engine
 // was reading 1976-2006 FRED data. The tab has to notice.
 import { chromium } from 'playwright';
+import { pinPage } from './clock.mjs';
 const PORT = process.env.PORT || '8899';
 const b = await chromium.launch({ executablePath: '/opt/pw-browsers/chromium-1194/chrome-linux/chrome' });
 const p = await b.newPage();
@@ -19,6 +20,7 @@ await p.route('**/app.js', async r => {
   }
   r.continue();
 });
+await pinPage(p);
 await p.goto(`http://localhost:${PORT}/index.html`, { waitUntil:'domcontentloaded' });
 await p.waitForTimeout(2500);
 

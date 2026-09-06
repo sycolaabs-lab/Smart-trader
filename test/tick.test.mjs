@@ -1,10 +1,11 @@
+import { NOW } from './clock.mjs';
 // Exercises the background worker end-to-end against a fake Firestore and a
 // stubbed network, so the unattended path is covered without live keys.
 import { runTick } from '../api/tick.js';
 
 // A fixed Wednesday. runTick stands down when gold is shut, so a suite pinned to
 // the wall clock would have gone silent every weekend and reported nothing wrong.
-const TICK_NOW = Date.UTC(2026, 8, 2, 12, 0, 0);
+const TICK_NOW = NOW;
 
 let pass=0, fail=0;
 const ok=(n,c,extra)=>{ console.log((c?'PASS':'FAIL')+' '+n+(c?'':'  '+(extra||''))); c?pass++:fail++; };
@@ -26,7 +27,7 @@ function fakeDb() {
 // ---- synthetic market ----
 function series(n, stepMs, startPrice, drift, seed=3){
   let s=seed, r=()=>((s=(s*1103515245+12345)&0x7fffffff)/0x7fffffff);
-  const out=[]; let p=startPrice; const now=Date.now();
+  const out=[]; let p=startPrice; const now=NOW;
   for(let i=n;i>=0;i--){
     p += (r()-0.5+drift)*3;
     const o=p-(r()-0.5)*1.5, h=Math.max(o,p)+r()*2, l=Math.min(o,p)-r()*2;
@@ -48,7 +49,7 @@ globalThis.fetch = async (url) => {
   }
   if (u.hostname === 'api.stlouisfed.org') {
     fredCalls++;
-    const obs=[]; for(let i=60;i>=0;i--) obs.push({date:new Date(Date.now()-i*864e5).toISOString().slice(0,10), value:String(100+Math.sin(i/5)*3)});
+    const obs=[]; for(let i=60;i>=0;i--) obs.push({date:new Date(NOW-i*864e5).toISOString().slice(0,10), value:String(100+Math.sin(i/5)*3)});
     return { json: async () => ({ observations: obs }) };
   }
   if (u.hostname === 'www.alphavantage.co') {
@@ -59,7 +60,7 @@ globalThis.fetch = async (url) => {
 };
 
 const db = fakeDb();
-const t0 = Date.now();
+const t0 = NOW;
 const tick1 = await runTick({ db, tdKey:'TD', fredKey:'FRED', avKey:'AV', now: TICK_NOW });
 
 ok('returns a tick object', !!tick1 && typeof tick1==='object');
@@ -173,7 +174,7 @@ ok('it never exceeds the publish cap', pubLog.length <= 150, `published ${pubLog
 const seeded = {
   id: 'seed-1', dir: 'BUY', entry: 1990, sl: 1980, tp: 2020, entryType: 'market',
   confidence: 55, grade: 'C', session: 'London', status: 'open',
-  time: new Date(Date.now() - 6 * 3600e3).toISOString(),
+  time: new Date(NOW - 6 * 3600e3).toISOString(),
   factors: { structure: 1, momentum: 0.5 }, qualityFeatures: [0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5],
   metaScore: 0.2, source: 'worker'
 };

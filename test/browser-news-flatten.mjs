@@ -3,6 +3,7 @@
 // wide, and the spread widens at the same moment — whatever comes out of that
 // says nothing about whether the setup was sound.
 import { chromium } from 'playwright';
+import { pinPage } from './clock.mjs';
 const PORT = process.env.PORT || '8899';
 const b = await chromium.launch({ executablePath: '/opt/pw-browsers/chromium-1194/chrome-linux/chrome' });
 const p = await b.newPage();
@@ -12,7 +13,7 @@ p.on('console', m => { if (m.type()==='error' && !/ERR_|net::|404/.test(m.text()
 // fixtures seed live trades relative to "now", and the weekend flatten clears
 // the book on sight — run on a Saturday this suite would be testing the
 // calendar rather than the code.
-await p.clock.setFixedTime(new Date('2026-09-02T12:00:00Z'));
+await pinPage(p);
 await p.goto(`http://localhost:${PORT}/index.html`, { waitUntil:'domcontentloaded' });
 await p.waitForTimeout(900);
 

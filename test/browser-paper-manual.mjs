@@ -3,13 +3,14 @@
 // ticking it while the paper account is off must switch the account on rather
 // than doing nothing.
 import { chromium } from 'playwright';
+import { NOW, pinPage } from './clock.mjs';
 const PORT = process.env.PORT || '8899';
 // A clean, deterministic uptrend. The simulated feed the app falls back to is
 // randomised per load, so a flat draw makes the engine hold on every click and
 // nothing is ever logged — which is a property of the fixture, not of the
 // toggle under test. Routed candles remove that.
 function candles(n, stepMs){
-  const now = Date.now();
+  const now = NOW;
   return Array.from({length:n}, (_, i) => {
     const p = 1900 + (i / n) * 180 + Math.sin(i / 6) * 1.5;
     return { datetime: new Date(now - (n - i) * (stepMs || 9e5)).toISOString().slice(0,19).replace('T',' '),
@@ -30,6 +31,7 @@ await p.route('https://api.twelvedata.com/**', r => {
     values: candles(Math.min(+u.searchParams.get('outputsize')||500, 900), STEP[iv] || 9e5) })});
 });
 await p.route('**/api/fred**', r => r.fulfill({status:200,contentType:'application/json',body:JSON.stringify({observations:[]})}));
+await pinPage(p);
 await p.goto(`http://localhost:${PORT}/index.html`, { waitUntil:'domcontentloaded' });
 await p.waitForTimeout(700);
 await p.evaluate(() => localStorage.clear());

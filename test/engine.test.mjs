@@ -1,3 +1,4 @@
+import { NOW as CLOCK_NOW } from './clock.mjs';
 import { auditFeedIntegrity } from '../lib/auditor.js';
 import { newsAlertText, signalsToFlatten, buildMetaTrainingSet, META_LIMITS, thinExamples,
   genData, correlateByDay, alignedLatestChange, pearsonCorrelation,
@@ -34,7 +35,9 @@ ok('gate rejects HOLD', autonomyGate(R('HOLD',70,'A'),P,[],null).take, false);
 ok('gate rejects low conf', autonomyGate(R('BUY',20,'A'),P,[],null).take, false);
 ok('gate rejects bad grade', autonomyGate(R('BUY',70,'D'),P,[],null).take, false);
 ok('gate vetoes on metaScore', autonomyGate(R('BUY',70,'A'),{...P,metaScore:-0.9},[],null).take, false);
-ok('gate respects cooldown', autonomyGate(R('BUY',70,'A'),P,[],Date.now()).take, false);
+ok('gate respects cooldown', autonomyGate(R('BUY',70,'A'),P,[],CLOCK_NOW,{now:CLOCK_NOW}).take, false);
+ok('and lets it through once the cooldown has passed',
+  autonomyGate(R('BUY',70,'A'),P,[],CLOCK_NOW - 90*60000,{now:CLOCK_NOW}).take, true);
 ok('gate respects dup direction', autonomyGate(R('BUY',70,'A'),P,[{dir:'BUY',status:'open'}],null).take, false);
 ok('gate allows opposite dir', autonomyGate(R('BUY',70,'A'),P,[{dir:'SELL',status:'open'}],null).take, true);
 ok('gate respects max open', autonomyGate(R('BUY',70,'A'),P,[{dir:'SELL',status:'open'},{dir:'SELL',status:'open'},{dir:'SELL',status:'pending'}],null).take, false);
@@ -815,7 +818,7 @@ ok('the evidence thresholds are ordered',
 // rather than offering the setup that was analysed. Grading that fill teaches
 // the system from a trade it would never have taken.
 const H = 3600000;
-const NOW = Date.parse('2026-03-10T12:00:00Z');
+const NOW = CLOCK_NOW;
 const ksAgo = h => NOW - h * H;
 const KS = (o) => Object.assign({ dir:'BUY', entry:2000, sl:1990, tp:2040, entryType:'limit' }, o);
 // candles that never reach the entry, timestamped as live data
@@ -846,7 +849,7 @@ ok('a position open too long is scratched',
   resolveSignal(KS({time: ksAgo(140), entryType:'market', filledAt: new Date(ksAgo(140)).toISOString()}), [], {now: NOW}).status, 'expired');
 ok('it is tagged as a stale position',
   resolveSignal(KS({time: ksAgo(140), entryType:'market', filledAt: new Date(ksAgo(140)).toISOString()}), [], {now: NOW}).killSwitch, 'stale-position');
-ok('100 elapsed hours spanning a weekend is only 51 tradeable ones, so it runs on',
+ok('100 elapsed hours spanning a weekend is only 62 tradeable ones, so it runs on',
   resolveSignal(KS({time: ksAgo(100), entryType:'market', filledAt: new Date(ksAgo(100)).toISOString()}), [], {now: NOW}).status, 'open');
 ok('a young position is left running',
   resolveSignal(KS({time: ksAgo(4), entryType:'market'}), [], {now: NOW}).status, 'open');
@@ -909,7 +912,7 @@ ok('nor does a garbage one',
 // ============================================================
 // "awaiting entry" and "filled" are true of a trade placed a minute ago and of
 // one about to be culled. The chip has to tell those apart.
-const LV_NOW = Date.parse('2026-03-10T12:00:00Z');
+const LV_NOW = CLOCK_NOW;
 const lvAgo = h => new Date(LV_NOW - h * 3600000).toISOString();
 const LV = (o) => Object.assign({ dir:'BUY', entry:2000, sl:1990, tp:2040, entryType:'limit' }, o);
 const live = (o, price) => signalLiveness(LV(o), {}, { now: LV_NOW, price });

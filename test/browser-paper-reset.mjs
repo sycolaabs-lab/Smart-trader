@@ -3,15 +3,16 @@
 // thing the paper trader exists to produce, and what the meta-labeler, the
 // journal and the win rate all read. A reset now moves a line instead.
 import { chromium } from 'playwright';
+import { NOW, pinPage } from './clock.mjs';
 const PORT = process.env.PORT || '8899';
 // Inside the trading week and clear of the Friday-close flatten window, so the
 // weekend sweep does not clear the book out from under this suite.
-const PIN = Date.parse('2026-09-02T12:00:00Z');
+const PIN = NOW;
 const b = await chromium.launch({ executablePath: '/opt/pw-browsers/chromium-1194/chrome-linux/chrome' });
 const p = await b.newPage();
 const errs = []; p.on('pageerror', e => errs.push(e.message));
 p.on('console', m => { if (m.type()==='error' && !/ERR_|net::|404/.test(m.text())) errs.push('CONSOLE: '+m.text()); });
-await p.clock.setFixedTime(new Date(PIN));
+await pinPage(p);
 await p.goto(`http://localhost:${PORT}/index.html`, { waitUntil:'domcontentloaded' });
 await p.waitForTimeout(900);
 

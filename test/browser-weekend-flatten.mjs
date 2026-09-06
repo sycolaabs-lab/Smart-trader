@@ -3,6 +3,7 @@
 // fill at its limit price in simulation when the real fill was far worse — both
 // put fabricated evidence into the record the system learns from.
 import { chromium } from 'playwright';
+import { pinPage } from './clock.mjs';
 const PORT = process.env.PORT || '8899';
 const b = await chromium.launch({ executablePath: '/opt/pw-browsers/chromium-1194/chrome-linux/chrome' });
 
@@ -13,7 +14,7 @@ async function pageAt(iso) {
   const p = await b.newPage();
   const errs = []; p.on('pageerror', e => errs.push(e.message));
   p.on('console', m => { if (m.type()==='error' && !/ERR_|net::|404/.test(m.text())) errs.push('CONSOLE: '+m.text()); });
-  await p.clock.setFixedTime(new Date(iso));
+  await pinPage(p, Date.parse(iso));
   await p.goto(`http://localhost:${PORT}/index.html`, { waitUntil:'domcontentloaded' });
   await p.waitForTimeout(700);
   await p.evaluate(() => {

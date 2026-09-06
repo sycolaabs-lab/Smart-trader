@@ -2,10 +2,11 @@
 // "awaiting entry" and "filled" are true of a trade placed a minute ago and of
 // one about to be culled — the log has to tell those apart at a glance.
 import { chromium } from 'playwright';
+import { LATE_WEEK, pinPage } from './clock.mjs';
 const PORT = process.env.PORT || '8899';
 // Same instant the page clock is pinned to, so fixture candles and the page
 // agree on what "now" is.
-const LV_PIN = Date.parse('2026-09-04T20:00:00Z');
+const LV_PIN = LATE_WEEK;
 function candles(n){return Array.from({length:n},(_,i)=>{const p=2012+Math.sin(i/11)*1.2;const now=LV_PIN;
   return {datetime:new Date(now-(n-i)*9e5).toISOString().slice(0,19).replace('T',' '),
    open:p.toFixed(2),high:(p+0.8).toFixed(2),low:(p-0.8).toFixed(2),close:p.toFixed(2)};})
@@ -25,7 +26,7 @@ await p.route('https://api.twelvedata.com/**', r => {
 // "N hours ago", and the stale-order clock now counts tradeable hours only — so
 // run on a weekend, every age collapses to zero and the suite tests the
 // calendar rather than the code.
-await p.clock.setFixedTime(new Date(LV_PIN));
+await pinPage(p, LV_PIN);
 await p.goto(`http://localhost:${PORT}/index.html`, { waitUntil:'domcontentloaded' });
 await p.waitForTimeout(700);
 

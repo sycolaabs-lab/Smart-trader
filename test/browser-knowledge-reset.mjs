@@ -3,11 +3,13 @@
 // apart by day, so the record is discarded once — and the panel has to say why,
 // because a knowledge base that silently returns to zero looks like a bug.
 import { chromium } from 'playwright';
+import { pinPage } from './clock.mjs';
 const PORT = process.env.PORT || '8899';
 const b = await chromium.launch({ executablePath: '/opt/pw-browsers/chromium-1194/chrome-linux/chrome' });
 const p = await b.newPage();
 const errs = []; p.on('pageerror', e => errs.push(e.message));
 p.on('console', m => { if (m.type()==='error' && !/ERR_|net::|404/.test(m.text())) errs.push('CONSOLE: '+m.text()); });
+await pinPage(p);
 await p.goto(`http://localhost:${PORT}/index.html`, { waitUntil:'domcontentloaded' });
 await p.waitForTimeout(900);
 
