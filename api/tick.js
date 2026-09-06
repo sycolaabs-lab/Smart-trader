@@ -299,7 +299,7 @@ function sweepForWeekend(signalLog, at) {
   });
   const state = weekendFlattenState(at, cfg);
   let swept = 0;
-  signalsToFlattenForWeekend(signalLog, state).forEach(item => {
+  signalsToFlattenForWeekend(signalLog, state, at).forEach(item => {
     const sig = signalLog.find(x => x.id === item.id);
     if (!sig || (sig.status !== 'pending' && sig.status !== 'open')) return;
     sig.status = 'expired';

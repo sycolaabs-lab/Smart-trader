@@ -25,7 +25,8 @@ import {
   mergeSignalLogs, newlyResolvedSignals, newlyArrivedOpenSignals, newlyExpiredSignals,
   interpretConfidence, confidenceBand, CONFIDENCE_PRACTICAL_MAX, signalLiveness,
   weekendFlattenState, signalsToFlattenForWeekend, weekendFlattenText,
-  resetPaperAccount, thinPositions, PAPER_HISTORY_SOFT_LIMIT
+  resetPaperAccount, thinPositions, PAPER_HISTORY_SOFT_LIMIT,
+  reconcilePaperBook, isInEra, normaliseEpoch
 } from './lib/engine.js';
 import { emptyKnowledge, recordObservation, assessKnowledge, detectNovelty,
   describeKnowledge, KNOWLEDGE_DEFAULTS } from './lib/knowledge.js';
@@ -2645,8 +2646,9 @@ function flattenForNews() {
 // weekend flatten is about the calendar and applies to everything, and the two
 // have to be distinguishable in the log afterwards.
 function flattenForWeekend() {
-  const st = weekendFlattenState(Date.now(), weekendFlattenConfig());
-  const due = signalsToFlattenForWeekend(signalLog, st);
+  const now = Date.now();
+  const st = weekendFlattenState(now, weekendFlattenConfig());
+  const due = signalsToFlattenForWeekend(signalLog, st, now);
   if (!due.length) return 0;
   const price = currentMarkPrice();
   let done = 0;
@@ -2740,6 +2742,7 @@ function startNewsWatch() {
       flattenForNews();
       flattenForWeekend();
       advanceLiveTrades();
+      reconcilePaper();
       renderCalendar();
       // Nothing refreshes over a closed weekend, so without its own tick the
       // header would still be showing Friday's state on Sunday afternoon.
@@ -2872,6 +2875,7 @@ async function loadPaper() {
     if (raw) paper = Object.assign(paper, asPlainObject(JSON.parse(raw)));
   } catch (e) { /* fresh account */ }
   paper.positions = asObjectArray(paper.positions, ['id']);
+  paper.epoch = normaliseEpoch(paper.epoch);
   if (!isFinite(paper.startingBalance)) paper.startingBalance = PAPER_DEFAULTS.startingBalance;
   if (typeof paper.manual !== 'boolean') paper.manual = true;
   const cb = document.getElementById('paperEnabled');
@@ -2938,6 +2942,32 @@ function paperOpenForSignal(sig) {
   renderSignalLog(); // the log row carries this position's state
   return pos;
 }
+// Bring the paper book back into step with the signal log.
+//
+// Runs on load and on every watch pass, because the two can drift whenever a
+// resolution happens somewhere this tab was not: the worker closes a trade while
+// the tab is shut, and on the next load the signal is already `won` so the
+// newly-resolved diff has nothing to report and the position stays open.
+function reconcilePaper() {
+  if (!paper.positions.length || !signalLog.length) return 0;
+  const actions = reconcilePaperBook(paper.positions, signalLog);
+  if (!actions.length) return 0;
+  const price = currentMarkPrice();
+  actions.forEach(a => {
+    const idx = paper.positions.findIndex(p => p.id === a.id);
+    if (idx === -1) return;
+    const at = a.action === 'close' && isFinite(a.exitPrice) ? a.exitPrice
+      : (isFinite(price) ? price : undefined);
+    paper.positions[idx] = closePaperPosition(paper.positions[idx], a.outcome, price, paperConfig(), at);
+    paper.positions[idx].closeReason = 'reconciled: ' + a.reason;
+  });
+  savePaper();
+  renderPaper();
+  setWorkerLogNote('Paper book reconciled — ' + actions.length +
+    ' position(s) were still open against finished signals.');
+  return actions.length;
+}
+
 function paperCloseForSignal(signalId, outcome, atPrice) {
   if (!paper.positions.length) return;
   // Pending too: an unfilled order still has to be cancelled, or it lingers
@@ -3013,8 +3043,9 @@ function renderPaper() {
   }
 
   // The lists below show the live book and the current era's results; archived
-  // trades are summarised above rather than listed twice.
-  const inEra = (p) => !paper.epoch || Date.parse(p.closedAt || p.openedAt || '') >= paper.epoch;
+  // trades are summarised above rather than listed twice. Same predicate the
+  // summary uses — a second copy of this drifted from it once already.
+  const inEra = (p) => isInEra(p, paper.epoch);
   const resting = paper.positions.filter(p => p.status === 'pending' && inEra(p));
   if (resting.length) {
     html += '<div style="font-size:10px;color:#454a56;margin:10px 0 6px;">Awaiting entry (no exposure yet)</div>';

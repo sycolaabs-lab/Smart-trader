@@ -1473,5 +1473,106 @@ ok('the very first trade is still there', rpThinned[rpThinned.length - 1].id, 'p
 ok('and the newest is untouched', rpThinned[0].id, 'p43799');
 ok('a small book is left exactly as it is', thinPositions(rpMany.slice(0, 10)).length, 10);
 
+import { reconcilePaperBook, isInEra, normaliseEpoch } from '../lib/engine.js';
+
+// ============================================================
+// THE BOOK AND THE LOG MUST AGREE
+// ------------------------------------------------------------
+// Nothing reconciled them. A position is normally closed by the same pass that
+// resolves its signal, but the signal log syncs across devices and survives a
+// closed tab while the paper book does neither — so a trade the worker resolved
+// while this tab was shut comes back already `won`, the newly-resolved diff sees
+// no change, and the position stays open accruing floating P&L against a trade
+// the system considers finished.
+console.log('\n-- reconciling the paper book --');
+const rcSig = (id, status, extra) => Object.assign({ id, status }, extra || {});
+const rcPos = (id, signalId, status) => ({ id, signalId, status });
+const rcActions = reconcilePaperBook(
+  [rcPos('pp1','WON1','open'), rcPos('pp2','LOST1','open'), rcPos('pp3','EXP1','pending'),
+   rcPos('pp4','GHOST','open'), rcPos('pp5','LIVE1','open'), rcPos('pp6','LIVE1','open'),
+   rcPos('pp7','DONE','closed')],
+  [rcSig('WON1','won',{exitPrice:2040}), rcSig('LOST1','lost'), rcSig('EXP1','expired'), rcSig('LIVE1','open')]);
+const rcById = Object.fromEntries(rcActions.map(a => [a.id, a]));
+
+ok('a position whose signal won is closed as a win', [rcById.pp1.action, rcById.pp1.outcome], ['close','won']);
+ok('and it carries the signal\'s own exit price', rcById.pp1.exitPrice, 2040);
+ok('a position whose signal lost is closed as a loss', [rcById.pp2.action, rcById.pp2.outcome], ['close','lost']);
+ok('a resting order whose signal was killed is cancelled', [rcById.pp3.action, rcById.pp3.outcome], ['cancel','expired']);
+ok('a position with no signal at all is cancelled', rcById.pp4.action, 'cancel');
+ok('and says why', /no signal in the log/.test(rcById.pp4.reason), true);
+ok('one live position per signal is kept', rcById.pp5, undefined);
+ok('the duplicate is cancelled', rcById.pp6.action, 'cancel');
+ok('and named as a duplicate', /duplicate live position/.test(rcById.pp6.reason), true);
+ok('an already-closed position is left alone', rcById.pp7, undefined);
+ok('a book that agrees with its log needs nothing doing',
+   reconcilePaperBook([rcPos('a','LIVE1','open')], [rcSig('LIVE1','open')]).length, 0);
+ok('empty inputs are tolerated',
+   [reconcilePaperBook(null, null).length, reconcilePaperBook([], []).length], [0, 0]);
+
+console.log('\n-- one definition of which era a trade belongs to --');
+// The UI re-derived this with `!epoch` and a bare `>=`, which agrees for null
+// and disagrees for everything else: a stored ISO string made the summary count
+// three closed trades while the list below it showed none.
+const eraPos = (id, at) => ({ id, status:'closed', pnl:100, outcome:'won', rMultiple:1,
+  closedAt: at, openedAt: at, dir:'BUY', entryFill:2000, sl:1990, units:10 });
+const eraBook = [eraPos('a','2026-09-01T00:00:00Z'), eraPos('b','2026-09-02T00:00:00Z')];
+const CUT = Date.parse('2026-09-01T12:00:00Z');
+[['x', 2], [{}, 2], [null, 2], [undefined, 2], [-5, 2], [0, 2],
+ ['2026-09-01T12:00:00Z', 1], [CUT, 1]].forEach(([epoch, want]) => {
+  const sum = paperAccountSummary(eraBook, 10000, 2000, epoch);
+  const listed = eraBook.filter(q => isInEra(q, epoch)).length;
+  ok('epoch ' + JSON.stringify(epoch) + ': summary and list agree', [sum.closedCount, listed], [want, want]);
+});
+ok('a junk epoch means no reset has happened', normaliseEpoch('x'), null);
+ok('an ISO epoch is understood', normaliseEpoch('2026-09-01T12:00:00Z'), CUT);
+ok('a numeric epoch passes through', normaliseEpoch(CUT), CUT);
+
+console.log('\n-- one live position per signal --');
+const dupAcct = { balance: 10000, positions: [{ signalId:'S1', status:'open' }] };
+ok('a second position on the same signal is refused',
+   /already has a live paper position/.test(paperRejectReason({id:'S1',dir:'BUY',entry:2000,sl:1990}, dupAcct, {})), true);
+ok('a different signal is not',
+   paperRejectReason({id:'S2',dir:'BUY',entry:2000,sl:1990}, dupAcct, {}), null);
+ok('and a closed position on that signal does not block a new one',
+   paperRejectReason({id:'S1',dir:'BUY',entry:2000,sl:1990},
+     { balance:10000, positions:[{signalId:'S1',status:'closed'}] }, {}), null);
+
+console.log('\n-- an order that lived through the close is cleared on sight --');
+// The flatten only fired inside the window, so a tab shut on Friday evening and
+// opened on Monday carried the order across. Monday's first bars then fill it at
+// its limit price on a gap that traded straight through — measured on a Friday
+// 1950 buy limit against a 1930 reopen, the engine books it as a LOSS at the
+// stop, and files that as evidence the level was wrong.
+const MON = Date.UTC(2026, 8, 7, 8, 0, 0);
+const fridayOrder = { id:'FRI', status:'pending', time: Date.UTC(2026, 8, 4, 19, 0, 0) };
+const mondayOrder = { id:'MON', status:'pending', time: Date.UTC(2026, 8, 7, 7, 0, 0) };
+const monState = weekendFlattenState(MON);
+ok('Monday morning is not the flatten window', monState.flatten, false);
+const monDue = signalsToFlattenForWeekend([fridayOrder, mondayOrder], monState, MON);
+ok('but the Friday order is cleared anyway', monDue.map(d => d.id), ['FRI']);
+ok('and the reason says why', /still live across the weekly close/.test(monDue[0].reason), true);
+ok('an order placed this morning is left alone',
+   monDue.some(d => d.id === 'MON'), false);
+const WEDNOW = CLOCK_NOW;   // the shared midweek instant
+ok('and midweek nothing is cleared at all',
+   signalsToFlattenForWeekend([{ id:'W', status:'open', time: WEDNOW - 3600000 }],
+     weekendFlattenState(WEDNOW), WEDNOW).length, 0);
+ok('an ISO timestamp is understood too',
+   signalsToFlattenForWeekend([{ id:'I', status:'open', time: '2026-09-04T19:00:00.000Z' }],
+     monState, MON).length, 1);
+ok('a signal with no usable time is not cleared on a guess',
+   signalsToFlattenForWeekend([{ id:'N', status:'open', time: null }], monState, MON).length, 0);
+
+// The toggle has to switch off BOTH ways a trade qualifies. It was written when
+// there was only one, and adding the second quietly made it a half-switch.
+const offState = weekendFlattenState(MON, { enabled: false });
+ok('with the flatten off, a close-spanning order is left alone',
+   signalsToFlattenForWeekend([fridayOrder], offState, MON).length, 0);
+ok('and with it off inside the window too',
+   signalsToFlattenForWeekend([fridayOrder],
+     weekendFlattenState(Date.UTC(2026,8,4,20,45,0), { enabled: false }), Date.UTC(2026,8,4,20,45,0)).length, 0);
+ok('the state says so plainly', offState.enabled, false);
+ok('and says so when it is on', monState.enabled, true);
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail?1:0);

@@ -83,6 +83,26 @@ async function pageAt(iso) {
   await p.close();
 }
 
+// ---- the tab was shut all weekend --------------------------------------
+// The flatten only fired inside the window, so an order placed Friday evening
+// with the tab then closed came back on Monday and filled at its limit price on
+// a gap that traded straight through it. The engine booked that as a loss at the
+// stop and filed it as evidence the level was wrong.
+{
+  const { p, errs, log } = await pageAt('2026-09-07T08:00:00Z');
+  const open1 = log.find(s => s.id === 'OPEN1');
+  const rest1 = log.find(s => s.id === 'REST1');
+  ok('a Friday trade first seen on Monday is cleared, not resumed',
+     open1.status === 'expired' && rest1.status === 'expired',
+     JSON.stringify([open1.status, rest1.status]));
+  ok('and says it lived through the close',
+     /still live across the weekly close/.test(rest1.expiryReason || ''), rest1.expiryReason);
+  ok('neither is graded as a win or a loss',
+     ['won','lost'].indexOf(open1.status) === -1 && ['won','lost'].indexOf(rest1.status) === -1, '');
+  ok('no page errors', errs.length === 0, errs.join(' | '));
+  await p.close();
+}
+
 console.log(`\n${pass} passed, ${fail} failed`);
 await b.close();
 process.exit(fail?1:0);
