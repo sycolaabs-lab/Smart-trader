@@ -69,9 +69,9 @@ ok('half the bars missing is critical', auditData(halved,BAR).find(f=>f.code==='
 ok('a healthy feed is clean', auditData(good,BAR).length, 0);
 
 console.log('\n-- freshness --');
-const old = candles(30, Date.now()-6*3600000);
-ok('stale data is flagged', has(auditFreshness(old, Date.now(), 30*MIN),'stale-feed'), true);
-ok('very stale is critical', auditFreshness(old, Date.now(), 30*MIN)[0].severity, 'critical');
+const old = candles(30, FIXTURE_NOW-6*3600000);
+ok('stale data is flagged', has(auditFreshness(old, FIXTURE_NOW, 30*MIN),'stale-feed'), true);
+ok('very stale is critical', auditFreshness(old, FIXTURE_NOW, 30*MIN)[0].severity, 'critical');
 ok('fresh data passes', auditFreshness(good, good[good.length-1].time+MIN, 60*MIN).length, 0);
 
 console.log('\n-- claims outrunning evidence --');
@@ -441,6 +441,58 @@ ok('nulls in the book are ignored', auditOpenTrades([null, T({time:tAgo(1)})], [
 ok('the defaults are the documented ones',
   [TRADE_AUDIT_DEFAULTS.maxHoursToFill, TRADE_AUDIT_DEFAULTS.maxHoursOpen, TRADE_AUDIT_DEFAULTS.maxDriftRToFill],
   [12, 72, 1.5]);
+
+// ============================================================
+// THE TRADING WEEK
+// ------------------------------------------------------------
+// Gold is shut from Friday ~21:00 UTC to Sunday ~22:00 UTC. Before this the
+// system had no concept of it: an hour-of-day lookup called Sunday lunchtime
+// "London-NY Overlap", the header dot stayed green because a provider was
+// connected, and the stale-order clock counted the 49-hour closure against
+// resting orders that had no opportunity to fill in any of it.
+console.log('\n-- the trading week --');
+const { nextMarketOpen, lastMarketClose, marketHoursBetween, marketClock, auditMarketHours } =
+  await import('../lib/auditor.js');
+const MW_SUN = Date.UTC(2026, 8, 6, 12, 0, 0);   // Sunday midday — shut
+const MW_WED = Date.UTC(2026, 8, 2, 12, 0, 0);   // Wednesday midday — open
+
+ok('Sunday midday is shut', isMarketOpen(MW_SUN), false);
+ok('it reopens Sunday 22:00 UTC', new Date(nextMarketOpen(MW_SUN)).toISOString(), '2026-09-06T22:00:00.000Z');
+ok('it shut Friday 21:00 UTC', new Date(lastMarketClose(MW_SUN)).toISOString(), '2026-09-04T21:00:00.000Z');
+ok('an open instant is its own next open', nextMarketOpen(MW_WED), MW_WED);
+ok('the clock reports hours to the reopen', Math.round(marketClock(MW_SUN).hoursUntilOpen), 10);
+ok('and reports open with nothing pending', marketClock(MW_WED).open, true);
+
+// the clock that ages orders
+ok('a whole weekend is zero tradeable hours',
+   marketHoursBetween(Date.UTC(2026,8,5,0,0,0), Date.UTC(2026,8,6,12,0,0)), 0);
+ok('Friday 19:00 to Sunday noon is the two hours before the close',
+   marketHoursBetween(Date.UTC(2026,8,4,19,0,0), MW_SUN), 2);
+ok('a plain midweek span is just elapsed time',
+   marketHoursBetween(MW_WED, MW_WED + 5*3600000), 5);
+
+// the backstop: did anything upstream fail to stand down?
+const closedAudit = auditMarketHours({ direction:'BUY' }, MW_SUN);
+ok('a directional signal while shut is critical', closedAudit[0].severity, 'critical');
+ok('and named so it can be found', closedAudit[0].code, 'signal-while-closed');
+ok('a HOLD while shut is context, not a fault', auditMarketHours({ direction:'HOLD' }, MW_SUN)[0].severity, 'note');
+ok('and nothing at all is said while the market is open', auditMarketHours({ direction:'BUY' }, MW_WED).length, 0);
+
+// a feed frozen at Friday's close is correct, not stale
+const fridayClose = candles(30, Date.UTC(2026, 8, 4, 21, 0, 0));
+ok('Friday’s last bar is not stale on a Sunday',
+   has(auditFreshness(fridayClose, MW_SUN, 30*MIN), 'stale-feed'), false);
+ok('but the same gap midweek is', has(auditFreshness(candles(30, MW_WED - 6*3600000), MW_WED, 30*MIN), 'stale-feed'), true);
+
+// The whole-week fast path must agree with walking every hour, or a months-old
+// signal is aged against a different clock from a fresh one.
+{
+  const brute = (x, y) => { let t = 0; for (let c = x; c < y; c += 3600000) if (isMarketOpen(c)) t++; return t; };
+  const a = Date.UTC(2026, 0, 1, 0, 0, 0);
+  const spans = [1, 5, 20, 60, 200, 400];
+  const mismatched = spans.filter(d => marketHoursBetween(a, a + d*86400000) !== brute(a, a + d*86400000));
+  ok('the week shortcut matches an hour-by-hour count over 400 days', mismatched, []);
+}
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail?1:0);

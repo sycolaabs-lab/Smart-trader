@@ -2,6 +2,10 @@
 // stubbed network, so the unattended path is covered without live keys.
 import { runTick } from '../api/tick.js';
 
+// A fixed Wednesday. runTick stands down when gold is shut, so a suite pinned to
+// the wall clock would have gone silent every weekend and reported nothing wrong.
+const TICK_NOW = Date.UTC(2026, 8, 2, 12, 0, 0);
+
 let pass=0, fail=0;
 const ok=(n,c,extra)=>{ console.log((c?'PASS':'FAIL')+' '+n+(c?'':'  '+(extra||''))); c?pass++:fail++; };
 
@@ -56,7 +60,7 @@ globalThis.fetch = async (url) => {
 
 const db = fakeDb();
 const t0 = Date.now();
-const tick1 = await runTick({ db, tdKey:'TD', fredKey:'FRED', avKey:'AV' });
+const tick1 = await runTick({ db, tdKey:'TD', fredKey:'FRED', avKey:'AV', now: TICK_NOW });
 
 ok('returns a tick object', !!tick1 && typeof tick1==='object');
 ok('has a direction', ['BUY','SELL','HOLD'].includes(tick1.direction), 'got '+tick1.direction);
@@ -78,7 +82,7 @@ ok('latestTick satisfies the dashboard contract', missing.length===0, 'missing: 
 
 // --- caching: a second tick must not refetch higher timeframes ---
 const tdAfterFirst = tdCalls;
-await runTick({ db, tdKey:'TD', fredKey:'FRED', avKey:'AV' });
+await runTick({ db, tdKey:'TD', fredKey:'FRED', avKey:'AV', now: TICK_NOW });
 const secondTickCalls = tdCalls - tdAfterFirst;
 ok('second tick reuses cached HTF/macro', secondTickCalls === 1, 'made '+secondTickCalls+' TwelveData calls (want 1: just 15min)');
 
@@ -95,7 +99,7 @@ w.unshift({ id:'forced', dir:'BUY', entry: 1000, sl: 900, tp: 1010, entryType:'m
 db._docs.worker.signalLog = JSON.stringify(w);
 db._docs.worker.cacheMeta = {}; // force a refetch so candles move past the target
 
-const tick3 = await runTick({ db, tdKey:'TD', fredKey:'FRED', avKey:'AV' });
+const tick3 = await runTick({ db, tdKey:'TD', fredKey:'FRED', avKey:'AV', now: TICK_NOW });
 const after = JSON.parse(db._docs.worker.signalLog);
 const forced = after.find(s => s.id==='forced');
 ok('injected signal was self-graded', forced && forced.status==='won', 'status='+(forced&&forced.status));
@@ -108,7 +112,7 @@ ok('resolvedBy marked as worker', forced && forced.resolvedBy==='worker');
 // Regression: after swapping oil/S&P out of the basket, the six-hour cache kept
 // serving a score computed from the OLD instruments with no sign it was stale.
 const fredBefore = fredCalls;
-await runTick({ db, tdKey:'TD', fredKey:'FRED', avKey:'AV' });
+await runTick({ db, tdKey:'TD', fredKey:'FRED', avKey:'AV', now: TICK_NOW });
 ok('cached macro is reused while config is unchanged', fredCalls === fredBefore, `made ${fredCalls-fredBefore} FRED calls, want 0`);
 
 const sigBefore = JSON.parse(JSON.stringify(db._docs.worker.cacheSig || {}));
@@ -117,7 +121,7 @@ ok('cache records the config signature', typeof sigBefore.correlation === 'strin
 // simulate an instrument swap by corrupting the stored signature
 db._docs.worker.cacheSig = Object.assign({}, sigBefore, { correlation: 'different-instrument-set' });
 const fredBefore2 = fredCalls;
-await runTick({ db, tdKey:'TD', fredKey:'FRED', avKey:'AV' });
+await runTick({ db, tdKey:'TD', fredKey:'FRED', avKey:'AV', now: TICK_NOW });
 ok('a changed instrument set refetches immediately', fredCalls > fredBefore2, `made ${fredCalls-fredBefore2} FRED calls, want >0`);
 ok('signature is restored after the refetch', db._docs.worker.cacheSig.correlation, sigBefore.correlation);
 
@@ -135,7 +139,7 @@ globalThis.fetch = async (url) => {
 };
 db._docs.worker.cacheMeta = {};   // force every macro input to refetch at once
 db._docs.worker.cacheSig = {};
-const slowTick = await runTick({ db, tdKey:'TD', fredKey:'FRED', avKey:'AV' });
+const slowTick = await runTick({ db, tdKey:'TD', fredKey:'FRED', avKey:'AV', now: TICK_NOW });
 globalThis.fetch = realFetch;
 ok('still publishes a tick under slow macro', !!slowTick && isFinite(slowTick.price), true);
 ok('still reports a direction', ['BUY','SELL','HOLD'].includes(slowTick.direction), true);
@@ -144,7 +148,7 @@ ok('reports which macro work was skipped', Array.isArray(slowTick.macroSkipped),
 
 // --- the worker must not commit an internally broken plan ---
 // It runs unattended, so it is the half that most needs the arithmetic check.
-const auditTick = await runTick({ db, tdKey:'TD', fredKey:'FRED', avKey:'AV' });
+const auditTick = await runTick({ db, tdKey:'TD', fredKey:'FRED', avKey:'AV', now: TICK_NOW });
 ok('worker reports audit results', typeof auditTick.auditCritical, 'number');
 ok('audit findings are published', Array.isArray(auditTick.auditFindings), true);
 ok('a clean run has no critical findings', auditTick.auditCritical === 0, 'found ' + auditTick.auditCritical + ': ' + JSON.stringify(auditTick.auditFindings));
@@ -176,7 +180,7 @@ const seeded = {
 const wlog = JSON.parse(db._docs.worker.signalLog);
 wlog.unshift(seeded);
 db._docs.worker.signalLog = JSON.stringify(wlog);
-await runTick({ db, tdKey:'TD', fredKey:'FRED', avKey:'AV' });
+await runTick({ db, tdKey:'TD', fredKey:'FRED', avKey:'AV', now: TICK_NOW });
 const pub2 = JSON.parse(db._docs.workerSignals.signalLog);
 const found = pub2.find(s => s.id === 'seed-1');
 ok('a worker trade appears in the published log', !!found, 'seed-1 missing from ' + pub2.length + ' entries');
@@ -227,7 +231,7 @@ globalThis.fetch = async (url) => {
   return goodFetch(url);
 };
 db._docs.worker.cacheMeta = {}; db._docs.worker.cacheSig = {};
-const shiftedTick = await runTick({ db, tdKey:'TD', fredKey:'FRED', avKey:'AV' });
+const shiftedTick = await runTick({ db, tdKey:'TD', fredKey:'FRED', avKey:'AV', now: TICK_NOW });
 globalThis.fetch = goodFetch;
 ok('a decimal-shifted feed is caught', shiftedTick.auditDataProblem === true,
   JSON.stringify({problem: shiftedTick.auditDataProblem, faults: shiftedTick.auditDataFaults}));
@@ -235,6 +239,22 @@ ok('and named', shiftedTick.auditDataFaults.some(f => /price-out-of-band/.test(f
   JSON.stringify(shiftedTick.auditDataFaults));
 ok('and it blocks the trade', shiftedTick.gateCode === 'audit' || shiftedTick.direction === 'HOLD',
   JSON.stringify({gate: shiftedTick.gateCode, dir: shiftedTick.direction}));
+
+// ============================================================
+// THE WORKER STANDS DOWN WHEN GOLD IS SHUT
+// ------------------------------------------------------------
+// On a 5-minute schedule the closed weekend is ~590 ticks. Every one of them
+// would have re-analysed Friday's final bar and been free to log the result as
+// a fresh signal against a market that was not trading.
+console.log('\n-- market closed --');
+const closedTick = await runTick({ db, tdKey:'TD', fredKey:'FRED', avKey:'AV',
+  now: Date.UTC(2026, 8, 6, 12, 0, 0) });
+ok('it skips', closedTick.skipped === 'market-closed', closedTick.skipped);
+ok('and says the market is shut', closedTick.marketOpen === false, String(closedTick.marketOpen));
+ok('and when it reopens', closedTick.opensAt === '2026-09-06T22:00:00.000Z', closedTick.opensAt);
+ok('and produces no analysis at all', closedTick.direction === undefined, String(closedTick.direction));
+const reopened = await runTick({ db, tdKey:'TD', fredKey:'FRED', avKey:'AV', now: Date.UTC(2026, 8, 6, 23, 0, 0) });
+ok('Sunday after the open runs normally', reopened.skipped === undefined, String(reopened.skipped));
 
 console.log(`\nnetwork: twelvedata=${tdCalls} fred=${fredCalls} alphavantage=${avCalls}`);
 console.log(`${pass} passed, ${fail} failed`);

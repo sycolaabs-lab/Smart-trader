@@ -27,7 +27,7 @@ import {
 } from './lib/engine.js';
 import { emptyKnowledge, recordObservation, assessKnowledge, detectNovelty,
   describeKnowledge, KNOWLEDGE_DEFAULTS } from './lib/knowledge.js';
-import { auditAnalysis, auditOpenTrades } from './lib/auditor.js';
+import { auditAnalysis, auditOpenTrades, isMarketOpen, marketClock } from './lib/auditor.js';
 
 const LEARNING_KEY = 'smc-factor-stats-v1';
 let learningState = { factors: {}, patterns: {}, totalLogged: 0, metaExamples: [], metaModel: null };
@@ -916,6 +916,7 @@ let lastPlan = null;
 
 const connectBtn = document.getElementById('connectBtn');
 const connStatus = document.getElementById('connStatus');
+let liveModeLabel = 'simulated feed';
 const modeLabel = document.getElementById('modeLabel');
 const liveDot = document.getElementById('liveDot');
 const btSourceNote = document.getElementById('btSourceNote');
@@ -1345,7 +1346,8 @@ async function connectProvider() {
     prevClose = liveData.length > 1 ? liveData[liveData.length - 2].close : liveData[liveData.length - 1].close;
     dataMode = 'live';
     if (simTickHandle) clearInterval(simTickHandle);
-    modeLabel.textContent = 'live · ' + LIVE_INTERVAL + ' · ' + provider.label;
+    liveModeLabel = 'live · ' + LIVE_INTERVAL + ' · ' + provider.label;
+    modeLabel.textContent = liveModeLabel;
     liveDot.classList.add('on');
     connStatus.textContent = 'Connected to ' + provider.label + '. Live 15-minute candles for ' + SYMBOL + '.';
     connStatus.className = 'conn-status ok';
@@ -1595,7 +1597,28 @@ function badgeHtml(trend, labels) {
   const txt = trend === 'bullish' ? labels.bullish : trend === 'bearish' ? labels.bearish : labels.neutral;
   return '<span class="badge ' + cls + '">' + txt + '</span>';
 }
+// The header dot means "a provider is connected", which on a Saturday reads as
+// "the market is trading". Two different facts, and only one of them was shown.
+function renderMarketClock() {
+  const clock = marketClock(Date.now());
+  const dot = document.getElementById('liveDot');
+  const label = document.getElementById('modeLabel');
+  if (!dot || !label) return;
+  if (clock.open) {
+    if (dataMode === 'live') dot.classList.add('on');
+    label.textContent = liveModeLabel;
+    return;
+  }
+  dot.classList.remove('on');
+  const h = clock.hoursUntilOpen;
+  // Keep the feed mode visible alongside it — on the simulated feed "market
+  // closed" alone would drop the one caveat that matters more.
+  label.textContent = (dataMode === 'live' ? '' : 'simulated · ') + 'market closed · reopens in ' +
+    (h < 1 ? Math.round(h * 60) + 'm' : h.toFixed(1) + 'h');
+}
+
 function refreshAll() {
+  renderMarketClock();
   if (typeof renderPaper === 'function' && paper && paper.positions.length) renderPaper();
   const weights = getWeights();
   lastComposite = computeComposite(liveData, liveData.length - 1, weights, mtfData, htfData, correlationScore, fundamentalScore, newsSentimentScore, dailyData, weeklyData);
@@ -1673,7 +1696,11 @@ function refreshAll() {
   else sweepEl.classList.add('hidden');
 
   // Session & Regime
-  document.getElementById('sessionBadge').innerHTML = '<span class="badge neutral">' + r.sessionInfo.session + '</span>';
+  const si = r.sessionInfo;
+  document.getElementById('sessionBadge').innerHTML = si.marketOpen === false
+    ? '<span class="badge bearish">Closed</span> <span style="font-size:10px;color:#8a8f9c;">reopens in ' +
+      (si.hoursUntilOpen < 1 ? Math.round(si.hoursUntilOpen * 60) + 'm' : si.hoursUntilOpen.toFixed(1) + 'h') + '</span>'
+    : '<span class="badge neutral">' + si.session + '</span>';
   document.getElementById('regimeBadge').textContent = r.regimeInfo.regime;
   const kzEl = document.getElementById('killZoneAlert');
   if (r.sessionInfo.killZone) { kzEl.textContent = '⚡ ' + r.sessionInfo.killZone + ' active — expect sharper, faster moves.'; kzEl.classList.remove('hidden'); }
@@ -2668,6 +2695,9 @@ function startNewsWatch() {
       flattenForNews();
       advanceLiveTrades();
       renderCalendar();
+      // Nothing refreshes over a closed weekend, so without its own tick the
+      // header would still be showing Friday's state on Sunday afternoon.
+      renderMarketClock();
     } catch (e) { /* never let the watch die on one bad pass */ }
   };
   // Immediately, not in thirty seconds. A release can already be minutes away
@@ -3442,6 +3472,18 @@ async function autonomyHeartbeat() {
   if (dataMode !== 'live') {
     setAutonomyStatus('Waiting for a live data provider — connect an API key above.', 'warn',
       'Autonomous mode needs real candles; it will not run on the simulated feed.');
+    return;
+  }
+  // Gold is shut from Friday ~21:00 UTC to Sunday ~22:00 UTC. Analysing a frozen
+  // feed produces confident-looking signals off Friday's last bar, and every one
+  // of them enters the learning record as a real read of a market that was not
+  // trading. Nothing to analyse, so nothing runs.
+  if (!isMarketOpen(Date.now())) {
+    const clock = marketClock(Date.now());
+    const h = clock.hoursUntilOpen;
+    setAutonomyStatus('Market closed — resumes when gold reopens in ' +
+      (h < 1 ? Math.round(h * 60) + 'm' : h.toFixed(1) + 'h') + '.', 'warn',
+      'The feed is frozen at Friday\u2019s close. Analysing it would generate signals from a market that is not trading.');
     return;
   }
   if (autonomy.skipCycles > 0) {

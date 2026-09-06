@@ -7,8 +7,11 @@ const PORT = process.env.PORT || '8899';
 // Price sits at 2012 and never trades down to a 2000 limit. Each timeframe gets
 // its own spacing — serving 15-minute bars for every interval makes the data
 // auditor (correctly) report a stale, out-of-order feed, which is noise here.
+// The page's clock is pinned below; the fixture must use the same instant or
+// the candles arrive dated two days after the page thinks it is.
+const PIN = Date.parse('2026-09-04T20:00:00Z');
 const STEP = { '15min':9e5, '1h':36e5, '4h':144e5, '1day':864e5, '1week':6048e5 };
-function candles(n, stepMs){const now=Date.now();
+function candles(n, stepMs){const now=PIN;
  return Array.from({length:n},(_,i)=>{const p=2012+Math.sin(i/11)*1.2;
   return {datetime:new Date(now-(n-i)*(stepMs||9e5)).toISOString().slice(0,19).replace('T',' '),
    open:p.toFixed(2),high:(p+0.8).toFixed(2),low:(p-0.8).toFixed(2),close:p.toFixed(2)};})
@@ -29,6 +32,11 @@ await p.route('https://api.twelvedata.com/**', r => {
     values: candles(Math.min(+u.searchParams.get('outputsize')||500, 900), STEP[iv]||9e5) })});
 });
 await p.route('**/api/fred**', r => r.fulfill({status:200,contentType:'application/json',body:JSON.stringify({observations:[]})}));
+// Pinned to a Friday afternoon inside the trading week. These fixtures are all
+// "N hours ago", and the stale-order clock now counts tradeable hours only — so
+// run on a weekend, every age collapses to zero and the suite tests the
+// calendar rather than the code.
+await p.clock.setFixedTime(new Date(PIN));
 await p.goto(`http://localhost:${PORT}/index.html`, { waitUntil:'domcontentloaded' });
 await p.waitForTimeout(800);
 

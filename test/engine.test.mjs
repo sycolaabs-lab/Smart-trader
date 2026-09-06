@@ -840,10 +840,14 @@ ok('and the kill switch can be turned off entirely',
   resolveSignal(KS({time: ksAgo(500)}), [], {now: NOW, maxHoursToFill: 0}).status, 'pending');
 
 // --- a filled position that never resolves --------------------------------
+// 140 wall-clock hours back from a Tuesday is 91 tradeable hours — the weekend
+// in the middle is not held against the position.
 ok('a position open too long is scratched',
-  resolveSignal(KS({time: ksAgo(100), entryType:'market', filledAt: new Date(ksAgo(100)).toISOString()}), [], {now: NOW}).status, 'expired');
+  resolveSignal(KS({time: ksAgo(140), entryType:'market', filledAt: new Date(ksAgo(140)).toISOString()}), [], {now: NOW}).status, 'expired');
 ok('it is tagged as a stale position',
-  resolveSignal(KS({time: ksAgo(100), entryType:'market', filledAt: new Date(ksAgo(100)).toISOString()}), [], {now: NOW}).killSwitch, 'stale-position');
+  resolveSignal(KS({time: ksAgo(140), entryType:'market', filledAt: new Date(ksAgo(140)).toISOString()}), [], {now: NOW}).killSwitch, 'stale-position');
+ok('100 elapsed hours spanning a weekend is only 51 tradeable ones, so it runs on',
+  resolveSignal(KS({time: ksAgo(100), entryType:'market', filledAt: new Date(ksAgo(100)).toISOString()}), [], {now: NOW}).status, 'open');
 ok('a young position is left running',
   resolveSignal(KS({time: ksAgo(4), entryType:'market'}), [], {now: NOW}).status, 'open');
 ok('a limit that filled is aged from the FILL, not the signal',
@@ -929,7 +933,7 @@ ok('a filled position is running', live({status:'open', filledAt:lvAgo(5)}).stat
 ok('a young one is alive', live({status:'open', filledAt:lvAgo(5)}).tone, 'live');
 ok('one past half its life is stalling', live({status:'open', filledAt:lvAgo(40)}).tone, 'warn');
 ok('one near the limit is about to be scratched',
-  /about to be scratched/.test(live({status:'open', filledAt:lvAgo(70)}).label), true);
+  /about to be scratched/.test(live({status:'open', filledAt:lvAgo(115)}).label), true);
 ok('progress in R is on the chip', /\+1\.60R/.test(live({status:'open', filledAt:lvAgo(5)}, 2016).label), true);
 ok('a losing position shows it', /-0\.60R/.test(live({status:'open', filledAt:lvAgo(5)}, 1994).label), true);
 ok('the detail spells it out', /behind by 0\.60R/.test(live({status:'open', filledAt:lvAgo(5)}, 1994).detail), true);
@@ -1319,6 +1323,53 @@ ok('a custom budget is respected',
   buildMetaTrainingSet(mex(900, 'L'), []).examples.length <= META_LIMITS.trainingSet, true);
 ok('a tiny budget still returns something',
   buildMetaTrainingSet(mex(900, 'L'), [], { trainingSet: 10 }).examples.length, 10);
+
+
+import { getSessionInfo, sessionRegimeQuality } from '../lib/engine.js';
+
+// ============================================================
+// THE TRADING WEEK
+// ------------------------------------------------------------
+console.log('\n-- sessions know the market can be shut --');
+const WK_SUN = Date.UTC(2026, 8, 6, 12, 0, 0);   // Sunday midday
+const WK_SUNOPEN = Date.UTC(2026, 8, 6, 23, 0, 0); // Sunday after the open
+const WK_WED = Date.UTC(2026, 8, 2, 13, 0, 0);   // Wednesday, London-NY overlap
+ok('Sunday midday is not the London-NY overlap', getSessionInfo(WK_SUN).session, 'Closed');
+ok('and carries no killzone', getSessionInfo(WK_SUN).killZone, null);
+ok('and says the market is shut', getSessionInfo(WK_SUN).marketOpen, false);
+ok('and how long until it opens', Math.round(getSessionInfo(WK_SUN).hoursUntilOpen), 10);
+ok('Sunday evening is trading again', getSessionInfo(WK_SUNOPEN).marketOpen, true);
+ok('a weekday session is unchanged', getSessionInfo(WK_WED).session, 'London-NY Overlap');
+// Closed contributes 0 where London contributes 1, so the same regime scores lower.
+ok('a closed market scores zero session quality',
+   sessionRegimeQuality({ session:'Closed' }, { regime:'Ranging', isTrending:false }), 0.1);
+ok('where an open London session does not',
+   sessionRegimeQuality({ session:'London' }, { regime:'Ranging', isTrending:false }), 0.6);
+
+console.log('\n-- the kill switch pauses for the weekend --');
+// A limit placed two hours before Friday's close. Wall-clock it is 41 hours old
+// by Sunday lunchtime — over three times the 12h fill limit — but the market was
+// only open for two of them.
+const WKSIG = { dir:'BUY', entry:1950, sl:1940, tp:1990, entryType:'limit',
+  time: Date.UTC(2026, 8, 4, 19, 0, 0) };
+const WKBAR = [{ time: Date.UTC(2026, 8, 4, 20, 45, 0), open:2000, high:2005, low:1995, close:2000 }];
+ok('a Friday order survives the weekend',
+   resolveSignal(WKSIG, WKBAR, { now: WK_SUN }).status, 'pending');
+ok('and is still alive at the Monday open',
+   resolveSignal(WKSIG, WKBAR, { now: Date.UTC(2026, 8, 7, 6, 0, 0) }).status, 'pending');
+ok('but dies after twelve genuinely tradeable hours',
+   resolveSignal(WKSIG, WKBAR, { now: Date.UTC(2026, 8, 7, 8, 0, 0) }).status, 'expired');
+ok('and the reason quotes tradeable hours, not elapsed ones',
+   /after 12h without filling/.test(resolveSignal(WKSIG, WKBAR, { now: Date.UTC(2026, 8, 7, 8, 0, 0) }).reason), true);
+
+console.log('\n-- and the badge says the clock is paused --');
+const wkLive = signalLiveness({ ...WKSIG, sl:1940, status:'pending' }, {}, { now: WK_SUN });
+ok('the age counts tradeable hours only', Math.round(wkLive.ageHours), 2);
+ok('the chip says the market is shut', /market shut/.test(wkLive.label), true);
+ok('and the detail says when it resumes', /clock is paused and resumes in/.test(wkLive.detail), true);
+ok('midweek it says nothing of the sort',
+   /market shut/.test(signalLiveness({ ...WKSIG, time: WK_WED - 3600000, status:'pending' }, {}, { now: WK_WED }).label), false);
+
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail?1:0);

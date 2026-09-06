@@ -30,7 +30,7 @@ import {
   seriesDeltas, latestChangeOf, correlateByDay, ECONOMIC_RELEASES, buildReleaseCalendar,
   newsWindowState, NEWS_WINDOW_DEFAULTS, signalsToFlatten
 } from '../lib/engine.js';
-import { auditAnalysis, auditOpenTrades } from '../lib/auditor.js';
+import { auditAnalysis, auditOpenTrades, isMarketOpen, marketClock } from '../lib/auditor.js';
 
 const SYMBOL = 'XAU/USD';
 const LIVE_INTERVAL = '15min';
@@ -288,8 +288,26 @@ const FUNDAMENTAL_SIG = MACRO_FETCH_VERSION + '||' + describe(FUNDAMENTAL_INSTRU
 // The whole tick, with its two external dependencies — Firestore and the API
 // keys — passed in rather than reached for. handler() below wires up the real
 // ones; the test suite passes fakes and exercises the same code path.
-export async function runTick({ db, tdKey, fredKey, avKey }) {
+export async function runTick({ db, tdKey, fredKey, avKey, now }) {
   const started = Date.now();
+  // Gold is shut Friday ~21:00 UTC to Sunday ~22:00 UTC. Nothing new can arrive
+  // in that window, so a tick can only re-analyse Friday's last bar and post the
+  // result as a fresh read. On a 5-minute schedule that is ~590 wasted provider
+  // calls a weekend, and worse, ~590 chances to log a signal against a market
+  // that was not trading.
+  const clockNow = isFinite(now) ? now : Date.now();
+  if (!isMarketOpen(clockNow)) {
+    const clock = marketClock(clockNow);
+    return {
+      skipped: 'market-closed',
+      marketOpen: false,
+      closedSince: new Date(clock.closedSince).toISOString(),
+      opensAt: new Date(clock.opensAt).toISOString(),
+      hoursUntilOpen: Math.round(clock.hoursUntilOpen * 10) / 10,
+      note: 'Gold is closed for the weekend. No analysis run and no provider quota spent.',
+      durationMs: Date.now() - started
+    };
+  }
   {
     const sysRef = db.collection('system');
     const workerRef = sysRef.doc(WORKER_DOC);
@@ -471,7 +489,7 @@ export async function runTick({ db, tdKey, fredKey, avKey }) {
     const audit = auditAnalysis({
       result, plan, candles: ltf,
       expectedIntervalMs: 15 * 60 * 1000,
-      now: Date.now(),
+      now: clockNow,
       maxAgeMs: 45 * 60 * 1000,
       knowledgeAssessment: null,
       calibration: null,
