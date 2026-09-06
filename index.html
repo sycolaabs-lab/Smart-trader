@@ -56,6 +56,10 @@ canvas { width:100%; background:#12151c; border-radius:12px; border:1px solid #1
 
 .zone-item { display:flex; justify-content:space-between; align-items:center; background:#0d0f14; border-radius:8px; padding:7px 9px; margin-bottom:5px; font-size:11px; border-left:3px solid #3ecf8e; }
 .zone-item.bearish { border-left-color:#ef4d5f; }
+.lg { display:grid; grid-template-columns:88px 1fr; gap:8px 12px; font-size:11px; line-height:1.45; }
+.lg dt { color:#e8c37a; font-weight:600; }
+.lg dd { color:#8a8f9c; }
+.lg dd b { color:#c7cbd4; font-weight:600; }
 .zone-empty { font-size:11px; color:#454a56; padding:6px 0; }
 
 .liq-row { display:flex; justify-content:space-between; font-size:11px; padding:5px 0; border-bottom:1px solid #16191f; }
@@ -187,6 +191,7 @@ canvas { width:100%; background:#12151c; border-radius:12px; border:1px solid #1
 <div class="tabs">
   <div class="tab active" data-tab="live">Live Dashboard</div>
   <div class="tab" data-tab="backtest">Backtest</div>
+  <div class="tab" data-tab="legend">Legend</div>
 </div>
 
 <!-- ================= LIVE TAB ================= -->
@@ -782,6 +787,85 @@ canvas { width:100%; background:#12151c; border-radius:12px; border:1px solid #1
     </div>
   </div>
   <div id="btEmpty" class="log-empty">Run a backtest — ideally on Twelve Data, since it has the deepest free history — to train the knowledge base. Only out-of-sample (Test) trades feed it. Once trained, those weights apply automatically to live analysis on any connected provider, including lighter live-only ones.</div>
+</div>
+
+<!-- ================= LEGEND TAB ================= -->
+<!-- Only the marks this system invented or uses in its own way. Standard chart
+     vocabulary — OB, FVG, BOS, R, ATR, RSI, bullish/bearish colouring — is left
+     out on purpose; a trader already has it, and listing it buries the rest. -->
+<div id="tab-legend" class="hidden">
+
+  <div class="panel">
+    <div class="panel-title">Who took the trade</div>
+    <dl class="lg">
+      <dt>&#x270B; manual</dt><dd>You pressed Generate.</dd>
+      <dt>&#x2699; auto</dt><dd>Autonomous mode, running in this browser tab.</dd>
+      <dt>&#x2601; worker</dt><dd>The background tick on the server. Runs with this tab closed.</dd>
+    </dl>
+    <div style="font-size:10px;color:#454a56;margin-top:8px;line-height:1.4;">Anything not marked manual grades itself against live candles and books its own paper result. The Won/Lost buttons are an override, not the only way an outcome gets recorded.</div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-title">How a trade ended</div>
+    <dl class="lg">
+      <dt>&#x2713; won</dt><dd>Reached target.</dd>
+      <dt>&#x25D0;</dt><dd><b>Partial win</b> — the first target was banked and the remainder closed early. It made money; it is not a half-loss.</dd>
+      <dt>&#x2717; lost</dt><dd>Reached stop.</dd>
+      <dt>&#x2298; killed</dt><dd><b>Cancelled by the auditor as stale — deliberately not graded.</b> An order that never filled says nothing about whether the level was right, so it counts as neither a win nor a loss and never enters the learning record. A run of these is not a losing streak; it means orders are being placed where price is not going.</dd>
+      <dt>&#x2013; expired</dt><dd>Ended without an outcome for another reason — flattened before news, or price ran away from the zone.</dd>
+    </dl>
+  </div>
+
+  <div class="panel">
+    <div class="panel-title">Is the trade still alive</div>
+    <dl class="lg">
+      <dt style="color:#3ecf8e;">&#x25CF;</dt><dd>Under half its allotted time. Alive.</dd>
+      <dt style="color:#ffa726;">&#x25D0;</dt><dd>Past half. Going stale (resting) or stalling (filled).</dd>
+      <dt style="color:#ef4d5f;">&#x25CB;</dt><dd>Past 85%. About to be killed or scratched.</dd>
+    </dl>
+    <div style="font-size:10px;color:#454a56;margin-top:8px;line-height:1.4;">A resting order has 12 hours to fill; a filled position has 72 to resolve. Both are counted in <strong>tradeable hours only</strong> — the weekend closure is not held against an order that had no opportunity to fill in it, so a Friday-evening limit reads "resting 2.0h &middot; market shut" all weekend rather than dying before Monday. Hover the chip for the exact time left and how far price is from the entry.</div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-title">Reading the numbers</div>
+    <dl class="lg">
+      <dt>Confidence</dt><dd><b>Not a probability.</b> Its practical ceiling is about 49%, so 45% is high — read it against that, not against 100. Once 20+ signals are logged the bands re-cut themselves around your own history, and each band shows the win rate it actually achieved next to the breakeven rate it needs to clear.</dd>
+      <dt>Grade</dt><dd>A &ge;70, B &ge;50, C &ge;30, D below — then downgraded a step in a ranging market, and again if similar past setups leaned the other way.</dd>
+      <dt>Strong / Moderate / Weak</dt><dd>Zone quality — the same read the meta-labeler trains on.</dd>
+      <dt>Dead</dt><dd>The zone is still untested, but more than 4&times; ATR away. Technically valid, too far to matter.</dd>
+      <dt>&#x221E;</dt><dd>Profit factor with no losing trades yet. Not a real number — there is nothing to divide by.</dd>
+      <dt>R&sup2;</dt><dd>How much of gold's movement a macro model explains. 0.15 is respectable in markets, not a failure.</dd>
+    </dl>
+  </div>
+
+  <div class="panel">
+    <div class="panel-title">What the macro engine believes</div>
+    <div style="font-size:10px;color:#454a56;margin-bottom:8px;line-height:1.4;">The coloured dot beside each driver is how firmly the relationship is held, not how strong it is.</div>
+    <dl class="lg">
+      <dt>watching</dt><dd>Too few observations to say anything yet.</dd>
+      <dt>emerging</dt><dd>A real relationship appearing, not enough history to lean on.</dd>
+      <dt>established</dt><dd>Statistically supported and stable.</dd>
+      <dt>unsupported</dt><dd>Enough data, no relationship found. Cited evidence from one of these is flagged by the auditor.</dd>
+      <dt>unstable</dt><dd>The sign flipped — it used to work one way, now the other.</dd>
+      <dt>decaying</dt><dd>It used to hold and is weakening.</dd>
+    </dl>
+    <div style="font-size:10px;color:#454a56;margin-top:8px;line-height:1.4;">Two driver codes worth knowing: <strong>DFII10</strong> is the 10-year <em>real</em> yield — inflation-adjusted, and the strongest single driver of gold. <strong>T10YIE</strong> is 10-year breakeven inflation, what the bond market expects inflation to be.</div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-title">Banners and alerts</div>
+    <dl class="lg">
+      <dt>&#x23F8; HOLD</dt><dd><b>No trade can be taken.</b> Not "wait a moment" — while HOLD stands the gate refuses signals.</dd>
+      <dt>&#x26D4;</dt><dd>Blocking. The auditor found something that makes the analysis unsafe to act on, or news has trading shut.</dd>
+      <dt>&#x26A0;</dt><dd>Usable, with a caveat worth reading first.</dd>
+      <dt>&#x2713;</dt><dd>The auditor re-derived the plan from raw candles and found nothing wrong.</dd>
+      <dt>&#x23F3;</dt><dd>A major release is approaching — alert window.</dd>
+      <dt>&#x1F6A8;</dt><dd>Inside the flatten window. Open trades are being closed <em>now</em>, before the print.</dd>
+      <dt>&#x1F50D;</dt><dd>Novelty. Current conditions do not resemble anything in the knowledge base, so the historical read carries less weight than usual.</dd>
+      <dt>market closed</dt><dd>Gold is shut (Friday ~21:00 to Sunday ~22:00 UTC). The header dot goes dark, the session reads Closed, and both the browser and the server worker stand down rather than analyse a frozen feed.</dd>
+    </dl>
+  </div>
+
 </div>
 
 <div class="disclaimer">This tool is for analysis and education; it is not financial advice. Order blocks, FVGs, structure breaks, and liquidity zones are pattern-based interpretations, not guarantees — the engine can misread choppy or low-liquidity conditions. Past backtest performance does not guarantee future results.</div>

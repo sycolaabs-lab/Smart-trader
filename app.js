@@ -837,8 +837,10 @@ document.querySelectorAll('.tab').forEach(t => {
   t.addEventListener('click', () => {
     document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
     t.classList.add('active');
-    document.getElementById('tab-live').classList.toggle('hidden', t.dataset.tab !== 'live');
-    document.getElementById('tab-backtest').classList.toggle('hidden', t.dataset.tab !== 'backtest');
+    // Driven off the buttons rather than a hardcoded list, so adding a tab is
+    // one line of markup and nothing here.
+    document.querySelectorAll('[id^="tab-"]').forEach(panel =>
+      panel.classList.toggle('hidden', panel.id !== 'tab-' + t.dataset.tab));
     if (t.dataset.tab === 'live') resizeLiveCanvas();
   });
 });
