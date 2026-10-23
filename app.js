@@ -3199,7 +3199,7 @@ function renderPaper() {
   let html = '<div class="metrics" style="margin-bottom:10px;">'
     + '<div class="card"><div class="label">' + (hasLiveMark ? 'Equity' : 'Equity · realised only') + '</div><div class="value mono ' + pnlCls(a.equity - a.startingBalance) + '">' + money(a.equity) + '</div></div>'
     + '<div class="card"><div class="label">Return</div><div class="value mono ' + pnlCls(a.returnPct) + '">' + (a.returnPct >= 0 ? '+' : '') + a.returnPct.toFixed(2) + '%</div></div>'
-    + '<div class="card"><div class="label">Max DD</div><div class="value mono">' + (a.maxDrawdown * 100).toFixed(1) + '%</div></div>'
+    + '<div class="card"><div class="label">' + (hasLiveMark ? 'Max DD' : 'Max DD · mark needed') + '</div><div class="value mono">' + (hasLiveMark ? (a.maxDrawdown * 100).toFixed(1) + '%' : '—') + '</div></div>'
     + '<div class="card"><div class="label">Open</div><div class="value mono">' + a.openCount + (a.pendingCount ? ' <span style="font-size:10px;color:#5c6270;">+' + a.pendingCount + ' resting</span>' : '') + '</div></div>'
     + '</div>';
 
