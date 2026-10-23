@@ -128,11 +128,11 @@ canvas { width:100%; background:#12151c; border-radius:12px; border:1px solid #1
 <div class="header">
   <div>
     <h1>XAUUSD SMC ASSISTANT</h1>
-    <div class="sub"><span class="livedot" id="liveDot"></span> <span id="modeLabel">simulated feed</span></div>
+    <div class="sub"><span class="livedot" id="liveDot"></span> <span id="modeLabel">API disconnected — analysis paused</span></div>
   </div>
   <div class="price-box">
-    <div class="price mono" id="livePrice">$1,928.40</div>
-    <div class="sub mono" id="priceChange">+0.00 (0.00%)</div>
+    <div class="price mono" id="livePrice">—</div>
+    <div class="sub mono" id="priceChange">No verified market data</div>
   </div>
 </div>
 
@@ -621,6 +621,9 @@ canvas { width:100%; background:#12151c; border-radius:12px; border:1px solid #1
       These are the checks a person cannot run on themselves: nobody keeps an honest ledger of the
       trades they passed on, and nobody can tell from memory whether their own conviction means anything.
     </div>
+    <label style="display:flex;align-items:center;gap:8px;font-size:11px;margin:8px 0;color:#c9cedb;"><input type="checkbox" id="autoTuneFilterEnabled" checked style="accent-color:#e8c37a;"> Auto-tune minimum confidence from taken vs declined expectancy (minimum 10 resolved in each group)</label>
+    <div id="filterTuneStatus" class="data-source-note"></div>
+    <button class="btn" id="tuneFilterNow" style="width:100%;margin:6px 0;">Tune Filter From Evidence Now</button>
     <div id="qualityContent"></div>
   </div>
 
@@ -642,7 +645,7 @@ canvas { width:100%; background:#12151c; border-radius:12px; border:1px solid #1
   </div>
 
   <div class="panel">
-    <div class="panel-title">Adaptive Learning <span class="collapse-toggle" id="resetLearning">reset learning data</span></div>
+    <div class="panel-title">Adaptive Learning <span class="collapse-toggle" id="resetLearning">rebuild learning from saved data</span></div>
     <div class="data-source-note" id="kbStatus">Loading knowledge base…</div>
     <div class="data-source-note" id="learningStatus" style="margin-top:4px;">Loading learning history…</div>
     <table class="factor-table" id="learningTable"></table>
@@ -747,7 +750,7 @@ canvas { width:100%; background:#12151c; border-radius:12px; border:1px solid #1
 <div id="tab-backtest" class="hidden">
   <div class="panel">
     <div class="panel-title">Backtest Parameters</div>
-    <div class="data-source-note" id="btSourceNote">Data source: simulated (connect an API key above to backtest on real 15min history).</div>
+    <div class="data-source-note" id="btSourceNote">Backtesting is disabled until a market-data API key is connected.</div>
     <div class="field-grid">
       <div class="field"><label>Min confidence (%)</label><input type="number" id="pMinConf" value="35"></div>
       <div class="field"><label>Risk / trade (%)</label><input type="number" id="pRisk" value="1" step="0.1"></div>
@@ -765,8 +768,8 @@ canvas { width:100%; background:#12151c; border-radius:12px; border:1px solid #1
       <input type="checkbox" id="autoBacktestCheckbox" checked style="accent-color:#e8c37a;transform:scale(1.2);">
       Auto-backtest while connected (self-learning)
     </label>
-    <div class="data-source-note" id="autoBacktestStatus" style="margin-bottom:0;">Not started yet — connect a data provider to begin.</div>
-    <div style="font-size:10px;color:#454a56;margin-top:8px;line-height:1.4;">Runs the full walk-forward backtest automatically every ~4 hours using whatever real history is available, feeding results into the knowledge base without you clicking anything. This only runs while this tab stays open — a closed tab or locked phone stops all execution, same as any web page. It targets a good risk-reward ratio over many trades, not perfection on any single one.</div>
+    <div class="data-source-note" id="autoBacktestStatus" style="margin-bottom:0;">Runs hourly in this browser while open; server-side runs require a configured scheduler.</div>
+    <div style="font-size:10px;color:#454a56;margin-top:8px;line-height:1.4;">Runs the walk-forward backtest hourly using real provider history and feeds out-of-sample results into learning. Browser runs stop when this tab closes; unattended runs require the server worker scheduler. — a closed tab or locked phone stops all execution, same as any web page. It targets a good risk-reward ratio over many trades, not perfection on any single one.</div>
   </div>
 
   <div id="btResults" class="hidden">
