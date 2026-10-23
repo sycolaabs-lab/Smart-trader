@@ -908,7 +908,7 @@ const SYMBOL = 'XAU/USD';
 const LIVE_INTERVAL = '15min';
 let apiKey = null, dataMode = 'disconnected', activeProvider = null;
 let liveData = [];
-let mtfData = [], htfData = [], dailyData = [], weeklyData = []; // real 1H/4H/Daily/Weekly candles when the provider supports them; empty = fall back to aggregation
+let fiveMinData = [], mtfData = [], thirtyMinData = [], htfData = [], eightHourData = [], dailyData = [], weeklyData = []; // real provider bars where supported; 8H is aggregated from 1H
 let prevClose = NaN;
 let simTickHandle = null, pollPriceHandle = null, resyncHandle = null, mtfResyncHandle = null, htfResyncHandle = null, corrResyncHandle = null, newsResyncHandle = null, dailyResyncHandle = null, weeklyResyncHandle = null;
 // Mutable state that functions defined further up this file reach into.
@@ -1116,6 +1116,25 @@ document.getElementById('rememberKeysCheckbox').addEventListener('change', () =>
   else if (apiKey) saveKeysIfRemembered();
 });
 
+function aggregateCandles(candles, hours) {
+  if (!Array.isArray(candles) || !candles.length) return [];
+  const bucketMs = hours * 60 * 60 * 1000, out = [];
+  candles.forEach(c => {
+    if (!Number.isFinite(c.time) || ![c.open,c.high,c.low,c.close].every(Number.isFinite)) return;
+    const bucket = Math.floor(c.time / bucketMs) * bucketMs;
+    let last = out[out.length - 1];
+    if (!last || last.time !== bucket) {
+      last = { time: bucket, open: c.open, high: c.high, low: c.low, close: c.close };
+      out.push(last);
+    } else {
+      last.high = Math.max(last.high, c.high);
+      last.low = Math.min(last.low, c.low);
+      last.close = c.close;
+    }
+  });
+  return out;
+}
+
 // Fetch each higher timeframe, and record what happened to it.
 //
 // A failure here used to set the series to [] and say nothing. That is not
@@ -1150,6 +1169,12 @@ async function fetchHigherTimeframes(provider, key) {
   await one('4H', provider.htfInterval, 200, d => { htfData = d; });
   await one('Daily', provider.dailyInterval, 200, d => { dailyData = d; });
   await one('Weekly', provider.weeklyInterval, 104, d => { weeklyData = d; }); // ~2 years
+  await one('5m', '5min', 300, d => { fiveMinData = d; });
+  await one('30m', '30min', 200, d => { thirtyMinData = d; });
+  eightHourData = aggregateCandles(mtfData, 8);
+  timeframeHealth['8H'] = eightHourData.length
+    ? { ok: true, at: Date.now(), derived: true, source: 'aggregated from 1H candles' }
+    : { ok: false, aggregated: true, reason: 'waiting for usable 1H candles', at: Date.now() };
   renderTimeframeHealth();
 }
 
