@@ -400,8 +400,11 @@ export async function runTick({ db, tdKey, fredKey, avKey, now }) {
         const firstPass = runSmcBacktest(ltf, params, baseWeights, 4, envNum('TICK_BACKTEST_COST_PIPS', 2));
         const trainTrades = firstPass.trades.filter(t => Number.isInteger(t.exitIndex) && t.entryIndex < splitIdx && t.exitIndex < splitIdx);
         const tuned = computeTunedWeights(trainTrades, baseWeights).tuned;
-        const secondPass = runSmcBacktest(ltf, params, tuned, 4, envNum('TICK_BACKTEST_COST_PIPS', 2));
-        const testTrades = secondPass.trades.filter(t => t.entryIndex >= splitIdx && Number.isInteger(t.exitIndex) && t.exitIndex >= splitIdx);
+        // Preserve pre-split candles for indicator warmup, but do not carry
+        // training-era open/resting positions into the test-period book.
+        const testStartIdx = splitIdx + 1;
+        const secondPass = runSmcBacktest(ltf, Object.assign({}, params, { startIndex: testStartIdx }), tuned, 4, envNum('TICK_BACKTEST_COST_PIPS', 2));
+        const testTrades = secondPass.trades.filter(t => t.entryIndex >= testStartIdx && Number.isInteger(t.exitIndex));
         const oldExamples = state.learningState.metaBacktestExamples || [];
         const knownIds = new Set(oldExamples.map(e => e.id).filter(Boolean));
         const startTime = ltf[0] && ltf[0].time != null ? ltf[0].time : 'start';
