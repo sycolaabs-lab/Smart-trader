@@ -24,7 +24,11 @@ for (const f of files) {
   // report differently (corrupt-state prints per-case rows).
   const tally = [...out].reverse().find(l => /passed, \d+ failed/.test(l)) || out[out.length - 1] || '(no output)';
   const bad = r.status !== 0;
-  if (bad) failed++;
+  if (bad) {
+    failed++;
+    const diagnostic = [r.stdout || '', r.stderr || ''].join('\n').trim().split('\n').slice(-30).join('\n');
+    console.error('--- ' + f + ' diagnostics ---\n' + (diagnostic || (r.error && r.error.message) || 'child exited without output') + '\n--- end diagnostics ---');
+  }
   console.log((bad ? 'FAIL ' : 'ok   ') + f.replace('.mjs', '').padEnd(30) + ' ' + tally.trim());
 }
 console.log(failed ? '\n' + failed + ' suite(s) failed' : '\nall suites passed');

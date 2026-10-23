@@ -128,11 +128,11 @@ canvas { width:100%; background:#12151c; border-radius:12px; border:1px solid #1
 <div class="header">
   <div>
     <h1>XAUUSD SMC ASSISTANT</h1>
-    <div class="sub"><span class="livedot" id="liveDot"></span> <span id="modeLabel">simulated feed</span></div>
+    <div class="sub"><span class="livedot" id="liveDot"></span> <span id="modeLabel">API disconnected — analysis paused</span></div>
   </div>
   <div class="price-box">
-    <div class="price mono" id="livePrice">$1,928.40</div>
-    <div class="sub mono" id="priceChange">+0.00 (0.00%)</div>
+    <div class="price mono" id="livePrice">—</div>
+    <div class="sub mono" id="priceChange">No verified market data</div>
   </div>
 </div>
 
@@ -145,7 +145,7 @@ canvas { width:100%; background:#12151c; border-radius:12px; border:1px solid #1
     <input type="password" id="apiKeyInput" placeholder="Paste API key (optional)">
     <button id="connectBtn">Connect</button>
   </div>
-  <div class="conn-status" id="connStatus">Not connected — running on simulated data.</div>
+  <div class="conn-status" id="connStatus">Not connected — simulation disabled; connect a provider to enable analysis.</div>
   <div style="display:flex; align-items:center; justify-content:space-between; margin-top:8px;">
     <label style="font-size:11px;color:#9298a5;display:flex;align-items:center;gap:6px;">
       <input type="checkbox" id="rememberKeysCheckbox" checked style="accent-color:#e8c37a;">
@@ -257,7 +257,7 @@ canvas { width:100%; background:#12151c; border-radius:12px; border:1px solid #1
         <div class="field"><label>Cooldown (min)</label><input type="number" id="aCooldown" value="60" min="0" step="5"></div>
         <div class="field"><label>Max open signals</label><input type="number" id="aMaxOpen" value="3" min="1" max="10"></div>
         <div class="field"><label>Analysis every (min)</label><input type="number" id="aInterval" value="15" min="5" step="5"></div>
-        <div class="field"><label>Re-backtest every (h)</label><input type="number" id="aBtHours" value="4" min="1" step="1"></div>
+        <div class="field"><label>Re-backtest every (h)</label><input type="number" id="aBtHours" value="1" min="1" step="1"></div>
         <div class="field"><label>Meta-score floor</label><input type="number" id="aMinMeta" value="-0.25" step="0.05"></div>
         <div class="field"><label>Daily API credit cap</label><input type="number" id="aDailyCap" value="500" min="50" step="50"></div>
         <div class="field"><label>Kill resting order (h)</label><input type="number" id="aKillFill" value="12" min="0" step="1"></div>
@@ -613,7 +613,7 @@ canvas { width:100%; background:#12151c; border-radius:12px; border:1px solid #1
   </div>
 
   <div class="panel">
-    <div class="panel-title">Analysis Quality <span class="collapse-toggle" id="resetQuality">reset declined log</span></div>
+    <div class="panel-title">Analysis Quality <span class="collapse-toggle" id="resetQuality">rebuild quality view</span></div>
     <div style="font-size:11px;color:#5c6270;margin-bottom:8px;line-height:1.5;">
       This panel does not try to predict anything. It audits the engine's own judgement over its
       resolved record — whether its confidence score carries real information, which sessions and
@@ -621,12 +621,15 @@ canvas { width:100%; background:#12151c; border-radius:12px; border:1px solid #1
       These are the checks a person cannot run on themselves: nobody keeps an honest ledger of the
       trades they passed on, and nobody can tell from memory whether their own conviction means anything.
     </div>
+    <label style="display:flex;align-items:center;gap:8px;font-size:11px;margin:8px 0;color:#c9cedb;"><input type="checkbox" id="autoTuneFilterEnabled" checked style="accent-color:#e8c37a;"> Auto-tune minimum confidence from taken vs declined expectancy (minimum 10 resolved in each group)</label>
+    <div id="filterTuneStatus" class="data-source-note"></div>
+    <button class="btn" id="tuneFilterNow" style="width:100%;margin:6px 0;">Tune Filter From Evidence Now</button>
     <div id="qualityContent"></div>
   </div>
 
   <div class="panel">
     <div class="panel-title">Background System <span class="collapse-toggle" id="bgSetupToggle" style="color:#454a56;">setup</span></div>
-    <div style="font-size:11px;color:#5c6270;margin-bottom:8px;line-height:1.5;">A server-side function keeps analyzing gold on a schedule independent of this browser tab — full parity with the live engine: structure across Weekly/Daily/4H/1H/15min, correlation, fundamentals, news sentiment, and the meta-labeler, all server-side. It also tracks its own trades to resolution and retrains its meta-labeler from real outcomes — genuinely learning while you're away, not just repeating a snapshot.</div>
+    <div style="font-size:11px;color:#5c6270;margin-bottom:8px;line-height:1.5;">A server-side function keeps analyzing gold independently of this browser tab: 5m/15m/30m/1H/4H/Daily candles, derived 8H structure, correlation, fundamentals, news sentiment, and the meta-labeler. It publishes factor weights, each factor's contribution to the final score, candle age/integrity warnings, and the latest hourly walk-forward backtest. It tracks its own trades to resolution and learns from outcomes while you're away.</div>
     <div id="bgSetupNote" class="hidden" style="font-size:10px;color:#454a56;line-height:1.6;margin-bottom:10px;padding:10px;background:#0d0f14;border-radius:8px;">
       1. Vercel project → Settings → Environment Variables — add:<br>
       &nbsp;&nbsp;• <code>TICK_SECRET</code> — a password you choose<br>
@@ -635,14 +638,14 @@ canvas { width:100%; background:#12151c; border-radius:12px; border:1px solid #1
       &nbsp;&nbsp;• <code>ALPHAVANTAGE_API_KEY</code> — optional, powers news sentiment<br>
       &nbsp;&nbsp;• <code>FIREBASE_SERVICE_ACCOUNT</code> — base64 of the service account JSON from Firebase Console → Project Settings → Service Accounts → Generate new private key<br>
       2. Firestore Rules — add a public-read rule for the <code>system</code> collection (see README.md).<br>
-      3. Point a free scheduler (e.g. cron-job.org) at <code>https://your-app.vercel.app/api/tick?secret=YOUR_TICK_SECRET</code> every 5–15 minutes. Vercel's free-tier cron only fires once a day; <code>vercel.json</code> registers that daily run as a safety net, but an external scheduler is what actually gets you minute-scale background operation.
+      3. The dashboard cannot run code while a browser tab is closed or the phone is locked. For unattended operation, configure the server scheduler: <code>vercel.json</code> requests a 5-minute cron for <code>/api/tick</code>; confirm your Vercel plan supports that frequency. If deployment rejects the schedule, use an external scheduler (e.g. cron-job.org) every 5–15 minutes with <code>https://your-app.vercel.app/api/tick?secret=YOUR_TICK_SECRET</code>. Hourly backtesting runs inside the server worker when that worker is invoked and has enough real candles.
     </div>
     <div id="bgTickStatus" style="font-size:11px;color:#5c6270;margin-bottom:8px;">Not configured yet, or no tick has landed — see setup above.</div>
     <div id="bgTickDetail"></div>
   </div>
 
   <div class="panel">
-    <div class="panel-title">Adaptive Learning <span class="collapse-toggle" id="resetLearning">reset learning data</span></div>
+    <div class="panel-title">Adaptive Learning <span class="collapse-toggle" id="resetLearning">retrain from saved data</span></div>
     <div class="data-source-note" id="kbStatus">Loading knowledge base…</div>
     <div class="data-source-note" id="learningStatus" style="margin-top:4px;">Loading learning history…</div>
     <table class="factor-table" id="learningTable"></table>
@@ -747,7 +750,7 @@ canvas { width:100%; background:#12151c; border-radius:12px; border:1px solid #1
 <div id="tab-backtest" class="hidden">
   <div class="panel">
     <div class="panel-title">Backtest Parameters</div>
-    <div class="data-source-note" id="btSourceNote">Data source: simulated (connect an API key above to backtest on real 15min history).</div>
+    <div class="data-source-note" id="btSourceNote">Backtesting is disabled until a market-data API key is connected.</div>
     <div class="field-grid">
       <div class="field"><label>Min confidence (%)</label><input type="number" id="pMinConf" value="35"></div>
       <div class="field"><label>Risk / trade (%)</label><input type="number" id="pRisk" value="1" step="0.1"></div>
@@ -765,8 +768,8 @@ canvas { width:100%; background:#12151c; border-radius:12px; border:1px solid #1
       <input type="checkbox" id="autoBacktestCheckbox" checked style="accent-color:#e8c37a;transform:scale(1.2);">
       Auto-backtest while connected (self-learning)
     </label>
-    <div class="data-source-note" id="autoBacktestStatus" style="margin-bottom:0;">Not started yet — connect a data provider to begin.</div>
-    <div style="font-size:10px;color:#454a56;margin-top:8px;line-height:1.4;">Runs the full walk-forward backtest automatically every ~4 hours using whatever real history is available, feeding results into the knowledge base without you clicking anything. This only runs while this tab stays open — a closed tab or locked phone stops all execution, same as any web page. It targets a good risk-reward ratio over many trades, not perfection on any single one.</div>
+    <div class="data-source-note" id="autoBacktestStatus" style="margin-bottom:0;">Runs hourly in this browser while open; server-side runs require a configured scheduler.</div>
+    <div style="font-size:10px;color:#454a56;margin-top:8px;line-height:1.4;">Runs the walk-forward backtest hourly using real provider history and feeds out-of-sample results into learning. Browser runs stop when this tab closes; the server worker also runs walk-forward backtests hourly whenever the external scheduler invokes /api/tick. For restricted Vercel plans, keep the external scheduler active. The system prioritizes honest risk-reward and validation over a high win rate.</div>
   </div>
 
   <div id="btResults" class="hidden">
@@ -790,13 +793,13 @@ canvas { width:100%; background:#12151c; border-radius:12px; border:1px solid #1
       <div class="stat"><div class="v mono" id="btReturn">-</div><div class="l">Total Return</div></div>
       <div class="stat"><div class="v mono" id="btDD">-</div><div class="l">Max Drawdown</div></div>
       <div class="stat"><div class="v mono" id="btPF">-</div><div class="l">Profit Factor</div></div>
-      <div class="stat"><div class="v mono" id="btFinal">-</div><div class="l">Final Equity</div></div>
+      <div class="stat"><div class="v mono" id="btFinal">-</div><div class="l">Equity (marked)</div></div>
     </div>
     <div class="panel">
       <div class="panel-title">Trade History</div>
       <div class="table-wrap">
         <table class="trades-table">
-          <thead><tr><th>#</th><th>Seg</th><th>Dir</th><th>Conf</th><th>Entry</th><th>Exit</th><th>P&L</th><th>Res</th></tr></thead>
+          <thead><tr><th>#</th><th>Seg</th><th>Dir</th><th>Conf</th><th>Entry</th><th>SL</th><th>TP</th><th>Exit</th><th>P&L</th><th>R</th><th>Res</th></tr></thead>
           <tbody id="btTradeBody"></tbody>
         </table>
       </div>

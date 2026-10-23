@@ -1,0 +1,34 @@
+name: Unit tests
+
+on:
+  push:
+    branches:
+      - codex/fix-backtest-validation
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: unit-tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Install dependencies
+        run: npm install
+      - name: Run unit tests
+        run: npm test
+      - name: Diagnose failing suites
+        if: failure()
+        shell: bash
+        run: |
+          timeout 30s node test/engine.test.mjs || true
+          timeout 30s node test/tick.test.mjs || true

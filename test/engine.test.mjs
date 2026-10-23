@@ -4,7 +4,9 @@ import { newsAlertText, signalsToFlatten, buildMetaTrainingSet, META_LIMITS, thi
   genData, correlateByDay, alignedLatestChange, pearsonCorrelation,
   resolveSignal, autonomyGate, mergeSignalLogs, newlyResolvedSignals,
   newlyArrivedOpenSignals, newlyExpiredSignals, signalResolutionRank, signalLiveness, shouldPaperTrade, paperRejectReason, interpretConfidence, confidenceBand,
-  confidenceBands, breakevenWinRate, CONFIDENCE_PRACTICAL_MAX, CONFIDENCE_EVIDENCE } from '../lib/engine.js';
+  confidenceBands, breakevenWinRate, CONFIDENCE_PRACTICAL_MAX, CONFIDENCE_EVIDENCE,
+  paperPositionSize, roundToLotStep, PAPER_DEFAULTS, worsePrice, openPaperPosition,
+  closePaperPosition, unrealisedPnl, paperAccountSummary } from '../lib/engine.js';
 const C=(t,o,h,l,c)=>({time:t,open:o,high:h,low:l,close:c});
 let pass=0,fail=0;
 const ok=(n,a,e)=>{ const g=JSON.stringify(a)===JSON.stringify(e); console.log((g?'PASS':'FAIL')+' '+n+(g?'':'  got='+JSON.stringify(a)+' want='+JSON.stringify(e))); g?pass++:fail++; };
@@ -39,10 +41,24 @@ ok('gate respects cooldown', autonomyGate(R('BUY',70,'A'),P,[],CLOCK_NOW,{now:CL
 ok('and lets it through once the cooldown has passed',
   autonomyGate(R('BUY',70,'A'),P,[],CLOCK_NOW - 90*60000,{now:CLOCK_NOW}).take, true);
 ok('gate respects dup direction', autonomyGate(R('BUY',70,'A'),P,[{dir:'BUY',status:'open'}],null).take, false);
-ok('gate allows opposite dir', autonomyGate(R('BUY',70,'A'),P,[{dir:'SELL',status:'open'}],null).take, true);
+ok('gate blocks opposite dir to avoid hedging', autonomyGate(R('BUY',70,'A'),P,[{dir:'SELL',status:'open'}],null).take, false);
+const strongerOpposite = autonomyGate(
+  {...R('BUY',70,'A'), factors:{ltf:1, mtf:1, htf:1}},
+  P,
+  [{id:'weak-sell',dir:'SELL',status:'open',factors:{ltf:1,mtf:-1,htf:1}}],
+  null
+);
+ok('stronger confluence may replace the weaker opposite signal', strongerOpposite.replaceSignalIds, ['weak-sell']);
 ok('gate respects max open', autonomyGate(R('BUY',70,'A'),P,[{dir:'SELL',status:'open'},{dir:'SELL',status:'open'},{dir:'SELL',status:'pending'}],null).take, false);
 ok('gate rejects bad plan', autonomyGate(R('BUY',70,'A'),{entry:NaN,sl:1,tp:2,rr:1},[],null).take, false);
 
+
+// Risk sizing must stay at or below the configured capital risk after lot-step rounding.
+const sizedWithinBudget = paperPositionSize(1000, 1, 2000, 1999.3, {
+  sizingMode:'risk', contractSize:100, lotStep:0.01, minLots:0.01
+});
+ok('risk sizing does not round up beyond capital budget',
+  sizedWithinBudget ? sizedWithinBudget.riskAmount <= sizedWithinBudget.requestedRisk + 1e-8 : true, true);
 
 // ---------------- analysis quality ----------------
 import { computeCalibration, computeConditionBreakdown, computeGateAudit, signalRMultiple } from '../lib/engine.js';
@@ -162,8 +178,6 @@ ok('summary calm when low', /Within budget/.test(quotaSummary({day:'d',used:50},
 
 
 // ---------------- paper trading ----------------
-import { roundToLotStep, PAPER_DEFAULTS, worsePrice, paperPositionSize, openPaperPosition,
-         closePaperPosition, unrealisedPnl, paperAccountSummary } from '../lib/engine.js';
 console.log('\n-- paper trading --');
 const PCFG = { startingBalance:10000, riskPercent:1, spreadPips:3, slippagePips:1, maxConcurrent:3 };
 const near = (a,b,eps)=>Math.abs(a-b)<(eps||1e-6);
@@ -185,6 +199,11 @@ ok('and the risk taken matches that size', near(sz.riskAmount, sz.units * 10), t
 ok('which lands within one lot step of the request',
   Math.abs(sz.riskAmount - sz.requestedRisk) <= 0.01 * 100 * 10 + 1e-9, true);
 ok('zero-width stop refuses to size', paperPositionSize(10000,1,2000,2000), null);
+const fixedCapped = paperPositionSize(10000, 1, 2000, 1900, {
+  sizingMode: 'fixed', fixedLots: 1, contractSize: 100, lotStep: 0.01, minLots: 0.01
+});
+ok('fixed lots are capped by the available risk budget', fixedCapped.lots, 0.01);
+ok('fixed-lot cap does not exceed requested risk', fixedCapped.riskAmount <= fixedCapped.requestedRisk, true);
 
 const sigBuy = { id:'s1', dir:'BUY', entry:2000, sl:1990, tp:2040, entryType:'market', time:'2026-01-01T00:00:00Z' };
 const acct = { balance:10000, positions:[] };
@@ -1140,18 +1159,16 @@ ok('naming the stop and the balance as the cause',
 ok('a lower minimum and finer step let it through',
   paperPositionSize(1000, 1, 4400, 4380, { minLots: 0.001, lotStep: 0.001 }).lots, 0.005);
 
-// fixed sizing: the lot count is constant and the risk moves instead
+// Fixed-lot mode is a preference, but the account risk budget is a hard cap.
 const fixedCfg = { sizingMode: 'fixed', fixedLots: 0.25 };
-ok('fixed sizing places the stated lots', paperPositionSize(10000, 1, 2000, 1990, fixedCfg).lots, 0.25);
-ok('regardless of the stop', paperPositionSize(10000, 1, 2000, 1950, fixedCfg).lots, 0.25);
-ok('and regardless of the balance', paperPositionSize(500, 1, 2000, 1990, fixedCfg).lots, 0.25);
-// A five-times-wider stop on the same lot size risks five times as much — which
-// is precisely the trade-off fixed sizing makes.
-ok('so a five-times-wider stop risks five times as much',
-   paperPositionSize(10000, 1, 2000, 1950, fixedCfg).riskAmount,
-   paperPositionSize(10000, 1, 2000, 1990, fixedCfg).riskAmount * 5);
-ok('fixed lots are still rounded to the step',
-  paperPositionSize(10000, 1, 2000, 1990, { sizingMode: 'fixed', fixedLots: 0.257 }).lots, 0.25);
+ok('fixed sizing is capped by the 1% capital budget', paperPositionSize(10000, 1, 2000, 1990, fixedCfg).lots, 0.1);
+ok('a wider structural stop reduces fixed-lot size', paperPositionSize(10000, 1, 2000, 1950, fixedCfg).lots, 0.02);
+ok('too little capital refuses an unplaceable risk-capped size',
+  paperPositionSize(500, 1, 2000, 1990, fixedCfg), null);
+ok('fixed sizing never exceeds requested risk',
+  paperPositionSize(10000, 1, 2000, 1950, fixedCfg).riskAmount <= paperPositionSize(10000, 1, 2000, 1950, fixedCfg).requestedRisk, true);
+ok('fixed lots are capped before lot-step rounding',
+  paperPositionSize(10000, 1, 2000, 1990, { sizingMode: 'fixed', fixedLots: 0.257 }).lots, 0.1);
 ok('and still refused below the minimum',
   paperPositionSize(10000, 1, 2000, 1990, { sizingMode: 'fixed', fixedLots: 0.004 }), null);
 

@@ -5,7 +5,7 @@
   "type": "module",
   "description": "XAUUSD smart-money analysis dashboard with autonomous self-backtesting",
   "scripts": {
-    "test": "node test/run-all.mjs unit",
+    "test": "node --check app.js && node --check api/tick.js && node --check lib/engine.js && node test/run-all.mjs unit",
     "test:browser": "node test/run-all.mjs browser",
     "test:all": "node test/run-all.mjs",
     "test:week": "node test/run-week.mjs unit"

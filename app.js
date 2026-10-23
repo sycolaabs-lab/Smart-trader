@@ -137,13 +137,18 @@ document.getElementById('autoTuneBtn').addEventListener('click', () => {
   refreshAll(); renderLearningTable();
 });
 document.getElementById('resetLearning').addEventListener('click', async () => {
-  learningState = { factors: {}, patterns: {}, totalLogged: 0, metaExamples: [], metaModel: null };
-  Object.keys(FACTOR_LABELS).forEach(k => { learningState.factors[k] = { votes: 0, wins: 0 }; });
-  setMetaModel(null);
+  // Relearn from all preserved live and backtest examples. This deliberately
+  // does not clear the raw signal ledger, factor history, or prior examples.
+  const beforeLive = (learningState.metaExamples || []).length;
+  const beforeBacktest = (learningState.metaBacktestExamples || []).length;
+  retrainMetaLabeler();
   await saveLearningState();
   renderLearningTable();
   renderPatternTable();
   applyKnowledgeBaseWeights();
+  renderDataInventory();
+  const status = document.getElementById('learningStatus');
+  if (status) status.textContent = 'Re-trained from preserved evidence: ' + beforeLive + ' live examples and ' + beforeBacktest + ' backtest examples. No collected data was deleted.';
 });
 // NOTE: startup restore of learning state deliberately does NOT happen here.
 // loadLearningState() calls renderLearningTable() -> getWeights(), which reads the
@@ -796,11 +801,40 @@ if (fbReady) {
         ? '<span style="' + (score > 0.1 ? 'color:#3ecf8e' : score < -0.1 ? 'color:#ef4d5f' : 'color:#5c6270') + '">' + label + ' ' + (score >= 0 ? '+' : '') + score.toFixed(2) + '</span>'
         : '<span style="color:#454a56;">' + label + ' off</span>';
       const m = d.macro || {};
+      const totalWeight = Number(d.totalWeight) || Object.values(d.weights || {}).reduce((sum, w) => sum + (Number(w) || 0), 0) || 1;
+      const factorRows = Object.keys(d.factors || {}).map(k => {
+        const value = Number(d.factors[k]) || 0, weight = Number((d.weights || {})[k]) || 0;
+        const contribution = value * weight / totalWeight;
+        return '<div class="zone-item"><span>' + (FACTOR_LABELS[k] || k) + ' <span style="color:#454a56;">value ' + value.toFixed(2) + ' × weight ' + weight + '</span></span>'
+          + '<span class="mono">' + (contribution >= 0 ? '+' : '') + (contribution * 100).toFixed(1) + ' pp</span></div>';
+      }).join('');
+      const backtest = d.backtest || d.lastBacktestSummary || null;
+      const backtestHtml = backtest
+        ? '<div class="panel-title" style="font-size:11px;margin-top:10px;">Hourly background backtest</div>'
+          + '<div class="zone-item"><span>Last run</span><span class="mono">' + (backtest.at || '—') + '</span></div>'
+          + (backtest.error ? '<div class="event-line" style="border-left-color:#ef4d5f;">Backtest error: ' + escapeAttr(backtest.error) + '</div>'
+            : '<div class="zone-item"><span>Training / test trades</span><span class="mono">' + (backtest.trainingTrades || 0) + ' / ' + (backtest.testTrades || 0) + '</span></div>'
+              + '<div class="zone-item"><span>Out-of-sample expectancy</span><span class="mono">' + (Number.isFinite(backtest.testExpectancyR) ? ((backtest.testExpectancyR >= 0 ? '+' : '') + backtest.testExpectancyR.toFixed(2) + 'R') : 'not enough resolved trades') + '</span></div>'
+              + '<div class="zone-item"><span>Weight update</span><span class="mono">' + (backtest.weightsUpdated ? 'applied from training sample' : 'waiting for 10 training trades') + '</span></div>')
+        : '<div class="zone-empty">No server-side backtest has completed yet.</div>';
+      const healthRows = Object.keys(d.dataHealth || {}).map(k => {
+        const h = d.dataHealth[k] || {};
+        const age = Number.isFinite(Number(h.ageMinutes)) ? Math.max(0, Number(h.ageMinutes)) + 'm old' : 'age unknown';
+        const stale = h.stale === true || !Number.isFinite(Number(h.ageMinutes)) || Number(h.ageMinutes) > (k === '5m' ? 20 : k === '15m' ? 45 : k === '30m' ? 90 : k === '1H' ? 180 : k === '4H' ? 600 : k === '8H' ? 1200 : k === 'Daily' ? 4320 : 17280);
+        const issues = (h.invalidCandles || 0) + ' invalid · ' + (h.gapCount || 0) + ' gaps · ' + (h.largeJumps || 0) + ' large jumps';
+        const issueColour = (h.invalidCandles || 0) || (h.gapCount || 0) || (h.largeJumps || 0) ? '#ffa726' : '#454a56';
+        return '<div class="zone-item"><span>' + k + ' <span style="color:#454a56;">' + age + ' · ' + (h.count || 0) + ' valid bars</span><div style="font-size:9px;color:' + issueColour + ';">' + issues + '</div></span><span class="mono" style="color:' + (stale ? '#ef4d5f' : '#3ecf8e') + ';">' + (stale ? 'STALE' : 'fresh') + '</span></div>';
+      }).join('');
       detailEl.innerHTML = '<div class="zone-item"><span>' + d.direction + ' <span style="color:#454a56;">(' + d.confidence + '%, full engine — structure + macro + meta-labeler)</span></span><span class="mono ' + dirCls + '">$' + fmt(d.price) + '</span></div>'
         + (d.direction !== 'HOLD' ? '<div class="zone-item"><span>Entry / SL / TP</span><span class="mono">$' + fmt(d.entry) + ' / $' + fmt(d.sl) + ' / $' + fmt(d.tp) + '</span></div>' : '')
         + (d.direction !== 'HOLD' ? '<div class="zone-item"><span>Meta-labeler score</span><span class="mono">' + (d.metaTrained ? ((d.metaScore >= 0 ? '+' : '') + fmt(d.metaScore)) : 'not trained yet') + ' <span style="color:#454a56;font-size:9px;">(' + d.metaExampleCount + ' examples)</span></span></div>' : '')
         + '<div class="zone-item"><span>Macro reads</span><span style="font-size:10px;">' + macroTag('Corr', m.correlationAvailable, m.correlationScore || 0) + ' · ' + macroTag('Fund', m.fundamentalAvailable, m.fundamentalScore || 0) + ' · ' + macroTag('News', m.newsAvailable, m.newsScore || 0) + '</span></div>'
-        + '<div class="zone-item"><span>Session / Regime</span><span class="mono" style="font-size:10px;">' + (d.session || '—') + ' · ' + (d.regime || '—') + '</span></div>';
+        + '<div class="zone-item"><span>Session / Regime</span><span class="mono" style="font-size:10px;">' + (d.session || '—') + ' · ' + (d.regime || '—') + '</span></div>'
+        + backtestHtml
+        + '<div class="panel-title" style="font-size:11px;margin-top:10px;">Background data freshness</div>' + (healthRows || '<div class="zone-empty">No candle health data published yet.</div>')
+        + '<div class="panel-title" style="font-size:11px;margin-top:10px;">Factor weight in final score</div>' + (factorRows || '<div class="zone-empty">No factor breakdown published yet.</div>')
+        + (d.lastBacktestSummary ? '<div class="panel-title" style="font-size:11px;margin-top:10px;">Hourly background walk-forward backtest</div><div class="zone-item"><span>Last run</span><span class="mono">' + (d.lastBacktestSummary.at || '—') + '</span></div>' + (d.lastBacktestSummary.error ? '<div class="event-line" style="border-left-color:#ef4d5f;">Backtest error: ' + d.lastBacktestSummary.error + '</div>' : '<div class="zone-item"><span>Training / OOS trades</span><span class="mono">' + (d.lastBacktestSummary.trainingTrades || 0) + ' / ' + (d.lastBacktestSummary.testTrades || 0) + '</span></div><div class="zone-item"><span>OOS expectancy</span><span class="mono">' + (d.lastBacktestSummary.testExpectancyR == null ? '—' : (d.lastBacktestSummary.testExpectancyR >= 0 ? '+' : '') + Number(d.lastBacktestSummary.testExpectancyR).toFixed(2) + 'R') + '</span></div><div class="zone-item"><span>Weights updated</span><span class="mono">' + (d.lastBacktestSummary.weightsUpdated ? 'yes' : 'no — insufficient training sample') + '</span></div>') : '<div class="zone-empty">Hourly server-side backtest has not completed yet.</div>')
+        + ((d.auditDataFaults || []).length ? '<div class="event-line" style="border-left-color:#ef4d5f;">Data audit flags: ' + d.auditDataFaults.join('; ') + '</div>' : '');
     },
     (err) => { document.getElementById('bgTickStatus').textContent = 'Could not read background tick data: ' + err.message + ' (check Firestore rules allow public read on the "system" collection).'; }
   );
@@ -882,11 +916,11 @@ function getTargetRR() { return +document.getElementById('targetRR').value; }
 // ============================================================
 const SYMBOL = 'XAU/USD';
 const LIVE_INTERVAL = '15min';
-let apiKey = null, dataMode = 'simulated', activeProvider = null;
-let liveData = genData(700, 1928, 900000);
-let mtfData = [], htfData = [], dailyData = [], weeklyData = []; // real 1H/4H/Daily/Weekly candles when the provider supports them; empty = fall back to aggregation
-let prevClose = liveData[liveData.length - 1].close;
-let simTickHandle = null, pollPriceHandle = null, resyncHandle = null, mtfResyncHandle = null, htfResyncHandle = null, corrResyncHandle = null, newsResyncHandle = null, dailyResyncHandle = null, weeklyResyncHandle = null;
+let apiKey = null, dataMode = 'disconnected', activeProvider = null;
+let liveData = [];
+let fiveMinData = [], mtfData = [], thirtyMinData = [], htfData = [], eightHourData = [], dailyData = [], weeklyData = []; // real provider bars where supported; 8H is aggregated from 1H
+let prevClose = NaN;
+let simTickHandle = null, pollPriceHandle = null, resyncHandle = null, fiveMinResyncHandle = null, thirtyMinResyncHandle = null, mtfResyncHandle = null, htfResyncHandle = null, corrResyncHandle = null, newsResyncHandle = null, dailyResyncHandle = null, weeklyResyncHandle = null;
 // Mutable state that functions defined further up this file reach into.
 // Declared here, above the first top-level refreshAll(), because `let` bindings
 // are in their temporal dead zone until evaluated — declaring them beside their
@@ -991,6 +1025,28 @@ function renderQuota() {
 // plus mtfInterval/htfInterval — the native interval strings for that provider's real 1H/4H data
 // (null if the provider doesn't support that granularity, in which case the app falls back to
 // aggregating from the 15min feed automatically). Adding a new provider means adding one entry here.
+function validateCandleSeries(candles, interval, label) {
+  if (!Array.isArray(candles) || candles.length < 2) throw new Error((label || 'Provider') + ' returned too few candles');
+  const stepMs = ({ '1min': 60000, '5min': 300000, '15min': 900000, '30min': 1800000, '45min': 2700000,
+    '60min': 3600000, '1h': 3600000, '2h': 7200000, '4h': 14400000, '8h': 28800000,
+    '1day': 86400000, '1week': 604800000 })[interval] || 900000;
+  let previous = -Infinity;
+  for (const c of candles) {
+    if (!Number.isFinite(c.time) || ![c.open, c.high, c.low, c.close].every(Number.isFinite) ||
+        c.open <= 0 || c.high <= 0 || c.low <= 0 || c.close <= 0 ||
+        c.high < c.low || c.open < c.low || c.open > c.high || c.close < c.low || c.close > c.high) {
+      throw new Error((label || 'Provider') + ' returned malformed OHLC candle data');
+    }
+    if (c.time <= previous) throw new Error((label || 'Provider') + ' returned duplicate or out-of-order candle timestamps');
+    if (c.time > Date.now() + 5 * 60 * 1000) throw new Error((label || 'Provider') + ' returned a future candle timestamp');
+    previous = c.time;
+  }
+  const age = Date.now() - candles[candles.length - 1].time;
+  const allowedAge = Math.max(stepMs * 4, interval === '1day' ? 72 * 3600000 : interval === '1week' ? 12 * 86400000 : 0);
+  if (age > allowedAge && isMarketOpen(Date.now())) throw new Error((label || 'Provider') + ' latest candle is stale (' + Math.round(age / 60000) + ' minutes old)');
+  return candles;
+}
+
 const PROVIDERS = {
   twelvedata: {
     // pollSeconds is the dedicated /price cadence. At 60s it cost 1,440 credits/day
@@ -1009,7 +1065,7 @@ const PROVIDERS = {
       const j = await r.json();
       if (j.status === 'error' || j.code) throw new Error(j.message || 'Twelve Data error');
       if (!j.values || !j.values.length) throw new Error('No data returned for ' + sym);
-      return j.values.slice().reverse().map(v => ({ time: parseUtcDatetime(v.datetime), open: +v.open, high: +v.high, low: +v.low, close: +v.close }));
+      return validateCandleSeries(j.values.slice().reverse().map(v => ({ time: parseUtcDatetime(v.datetime), open: +v.open, high: +v.high, low: +v.low, close: +v.close })), interval, sym);
     },
     async price(key) {
       const qs = new URLSearchParams({ symbol: SYMBOL, apikey: key });
@@ -1041,7 +1097,7 @@ const PROVIDERS = {
         time: new Date(ts.replace(' ', 'T') + 'Z').getTime(),
         open: +series[ts]['1. open'], high: +series[ts]['2. high'], low: +series[ts]['3. low'], close: +series[ts]['4. close']
       }));
-      return rows.slice(-outputsize);
+      return validateCandleSeries(rows.slice(-outputsize), interval, 'Alpha Vantage');
     },
     async price(key) {
       const qs = new URLSearchParams({ function: 'CURRENCY_EXCHANGE_RATE', from_currency: 'XAU', to_currency: 'USD', apikey: key });
@@ -1092,6 +1148,25 @@ document.getElementById('rememberKeysCheckbox').addEventListener('change', () =>
   else if (apiKey) saveKeysIfRemembered();
 });
 
+function aggregateCandles(candles, hours) {
+  if (!Array.isArray(candles) || !candles.length) return [];
+  const bucketMs = hours * 60 * 60 * 1000, out = [];
+  candles.forEach(c => {
+    if (!Number.isFinite(c.time) || ![c.open,c.high,c.low,c.close].every(Number.isFinite)) return;
+    const bucket = Math.floor(c.time / bucketMs) * bucketMs;
+    let last = out[out.length - 1];
+    if (!last || last.time !== bucket) {
+      last = { time: bucket, open: c.open, high: c.high, low: c.low, close: c.close };
+      out.push(last);
+    } else {
+      last.high = Math.max(last.high, c.high);
+      last.low = Math.min(last.low, c.low);
+      last.close = c.close;
+    }
+  });
+  return out;
+}
+
 // Fetch each higher timeframe, and record what happened to it.
 //
 // A failure here used to set the series to [] and say nothing. That is not
@@ -1111,7 +1186,7 @@ async function fetchHigherTimeframes(provider, key) {
       const d = await provider.timeSeries(key, interval, bars);
       if (!Array.isArray(d) || !d.length) throw new Error('provider returned no candles');
       assign(d);
-      timeframeHealth[label] = { ok: true, at: Date.now() };
+      timeframeHealth[label] = { ok: true, at: Date.now(), candleTime: d[d.length - 1].time, count: d.length, source: 'provider' };
     } catch (e) {
       assign([]);
       timeframeHealth[label] = {
@@ -1126,6 +1201,12 @@ async function fetchHigherTimeframes(provider, key) {
   await one('4H', provider.htfInterval, 200, d => { htfData = d; });
   await one('Daily', provider.dailyInterval, 200, d => { dailyData = d; });
   await one('Weekly', provider.weeklyInterval, 104, d => { weeklyData = d; }); // ~2 years
+  await one('5m', '5min', 300, d => { fiveMinData = d; });
+  await one('30m', '30min', 200, d => { thirtyMinData = d; });
+  eightHourData = aggregateCandles(mtfData, 8);
+  timeframeHealth['8H'] = eightHourData.length
+    ? { ok: true, at: Date.now(), candleTime: eightHourData[eightHourData.length - 1].time, count: eightHourData.length, derived: true, source: 'aggregated from 1H candles' }
+    : { ok: false, aggregated: true, reason: 'waiting for usable 1H candles', at: Date.now() };
   renderTimeframeHealth();
 }
 
@@ -1348,6 +1429,7 @@ async function connectProvider() {
     apiKey = key; activeProvider = providerId;
     liveData = candles;
     lastPriceUpdateTime = Date.now();
+    timeframeHealth['15m'] = { ok: true, at: lastPriceUpdateTime, candleTime: candles[candles.length - 1].time, count: candles.length, source: 'provider' };
     prevClose = liveData.length > 1 ? liveData[liveData.length - 2].close : liveData[liveData.length - 1].close;
     dataMode = 'live';
     if (simTickHandle) clearInterval(simTickHandle);
@@ -1357,7 +1439,12 @@ async function connectProvider() {
     connStatus.textContent = 'Connected to ' + provider.label + '. Live 15-minute candles for ' + SYMBOL + '.';
     connStatus.className = 'conn-status ok';
     btSourceNote.textContent = 'Data source: ' + provider.label + ' — connected.';
+    // Load each timeframe once on connection. fetchHigherTimeframes includes
+    // 5m and 30m and derives 8H from 1H, preserving the provider's daily quota.
     await fetchHigherTimeframes(provider, key);
+    eightHourData = aggregateCandles(mtfData, 8);
+    timeframeHealth['8H'] = { ok: eightHourData.length > 0, at: Date.now(), candleTime: eightHourData.length ? eightHourData[eightHourData.length - 1].time : null, count: eightHourData.length, derived: true, source: 'aggregated from 1H candles' };
+    renderTimeframeHealth();
     await refreshCorrelation(providerId, key, document.getElementById('fredKeyInput').value.trim());
     await refreshFundamentals(document.getElementById('fredKeyInput').value.trim());
     await refreshNewsSentiment(document.getElementById('newsKeyInput').value.trim());
@@ -1367,7 +1454,9 @@ async function connectProvider() {
     await saveKeysIfRemembered();
     startAutoBacktest();
   } catch (e) {
-    connStatus.textContent = 'Connection failed: ' + e.message + ' — staying on simulated data.';
+    apiKey = null; activeProvider = null; dataMode = 'disconnected'; liveData = []; prevClose = NaN;
+    connStatus.textContent = 'Connection failed: ' + e.message + ' — analysis and simulation are paused until a valid API connection is established.';
+    refreshAll();
     connStatus.className = 'conn-status err';
   }
   connectBtn.disabled = false; connectBtn.textContent = 'Connect';
@@ -1386,6 +1475,8 @@ connectBtn.addEventListener('click', () => { connectProvider(); });
 function startLivePolling() {
   if (pollPriceHandle) clearInterval(pollPriceHandle);
   if (resyncHandle) clearInterval(resyncHandle);
+  if (fiveMinResyncHandle) clearInterval(fiveMinResyncHandle);
+  if (thirtyMinResyncHandle) clearInterval(thirtyMinResyncHandle);
   if (mtfResyncHandle) clearInterval(mtfResyncHandle);
   if (htfResyncHandle) clearInterval(htfResyncHandle);
   if (dailyResyncHandle) clearInterval(dailyResyncHandle);
@@ -1397,7 +1488,10 @@ function startLivePolling() {
   resyncHandle = setInterval(() => { if (!autonomy.enabled) resyncCandles(); }, provider.resyncMinutes * 60 * 1000);
   // Higher timeframes resync on their own natural cadence — no point re-fetching a 4H
   // candle that hasn't closed yet, and it's cheaper on the API quota than constant polling.
-  if (provider.mtfInterval) mtfResyncHandle = setInterval(() => resyncTimeframe('1H', provider.mtfInterval, 300, d => { mtfData = d; }), 60 * 60 * 1000);
+  // Keep intraday diagnostic timeframes fresh without polling on every tick.
+  fiveMinResyncHandle = setInterval(() => resyncTimeframe('5m', '5min', 300, d => { fiveMinData = d; }), 15 * 60 * 1000);
+  thirtyMinResyncHandle = setInterval(() => resyncTimeframe('30m', '30min', 200, d => { thirtyMinData = d; }), 30 * 60 * 1000);
+  if (provider.mtfInterval) mtfResyncHandle = setInterval(() => resyncTimeframe('1H', provider.mtfInterval, 300, d => { mtfData = d; eightHourData = aggregateCandles(d, 8); timeframeHealth['8H'] = { ok: eightHourData.length > 0, at: Date.now(), candleTime: eightHourData.length ? eightHourData[eightHourData.length - 1].time : null, count: eightHourData.length, derived: true, source: 'aggregated from 1H candles' }; renderTimeframeHealth(); }), 60 * 60 * 1000);
   if (provider.htfInterval) htfResyncHandle = setInterval(() => resyncTimeframe('4H', provider.htfInterval, 200, d => { htfData = d; }), 4 * 60 * 60 * 1000);
   // Daily/weekly candles barely move intraday — resyncing a few times a day (daily) or once a day
   // (weekly) is plenty and keeps this well clear of any provider's rate limit.
@@ -1464,18 +1558,26 @@ async function resyncTimeframe(label, interval, bars, assign) {
 function renderTimeframeHealth() {
   const el = document.getElementById('timeframeHealth');
   if (!el) return;
-  const bad = Object.keys(timeframeHealth).filter(k => !timeframeHealth[k].ok);
-  if (!bad.length) { el.textContent = ''; el.classList.add('hidden'); return; }
+  const rows = ['5m','15m','30m','1H','4H','8H','Daily','Weekly'].map(label => {
+    let info = timeframeHealth[label] || null;
+    if (label === '15m' && liveData.length) info = {
+      ok: true, candleTime: liveData[liveData.length - 1].time,
+      at: lastPriceUpdateTime || Date.now(), count: liveData.length, source: 'provider'
+    };
+    if (!info) return '<div class="zone-item"><span>' + label + '</span><span class="mono" style="color:#ef4d5f;">not loaded</span></div>';
+    const candleTime = Number(info.candleTime);
+    const ageMs = Number.isFinite(candleTime) ? Date.now() - candleTime : (Number(info.at) ? Date.now() - Number(info.at) : null);
+    const ageText = ageMs == null ? 'age unknown' : ageMs < -60000 ? 'future timestamp — invalid' : Math.max(0, Math.round(ageMs / 60000)) + 'm old';
+    const stale = ageMs != null && (ageMs < -60000 || ageMs > (label === '5m' ? 20 : label === '15m' ? 45 : label === '30m' ? 90 : label === '1H' ? 180 : label === '4H' ? 600 : label === '8H' ? 1200 : 2880) * 60000);
+    const ok = !!info.ok && !stale;
+    const source = info.derived ? 'derived' : info.source || 'provider';
+    const detail = info.reason ? escapeAttr(info.reason) : source + (info.count ? ' · ' + info.count + ' bars' : '');
+    return '<div class="zone-item"><span>' + label + ' <span style="color:#454a56;">' + ageText + '</span></span>'
+      + '<span class="mono" style="color:' + (ok ? '#3ecf8e' : '#ef4d5f') + ';">' + (ok ? 'OK' : stale ? 'STALE' : 'UNAVAILABLE')
+      + ' <span style="color:#5c6270;">' + detail + '</span></span></div>';
+  }).join('');
   el.classList.remove('hidden');
-  const aggregated = bad.filter(k => timeframeHealth[k].aggregated);
-  el.innerHTML = '⚠️ <strong>Higher-timeframe data is not loading.</strong> '
-    + bad.map(k => k + ' — ' + escapeAttr(timeframeHealth[k].reason)
-        + (timeframeHealth[k].failures > 1 ? ' (' + timeframeHealth[k].failures + ' attempts)' : '')).join('; ')
-    + '. '
-    + (aggregated.length
-        ? escapeAttr(aggregated.join(' and ')) + ' structure is being AGGREGATED from 15-minute candles rather than read from real bars, '
-          + 'and still carries its full weight in the score.'
-        : 'Structure on those timeframes is frozen and still carries its full weight in the score.');
+  el.innerHTML = '<strong>Data freshness analyzer</strong><div style="font-size:10px;color:#5c6270;margin:4px 0 6px;">Shows candle age, source and fallback state. A successful HTTP response is not proof that the data is current or correct.</div>' + rows;
 }
 
 let lastPriceUpdateTime = null;
@@ -1507,6 +1609,7 @@ async function resyncCandles() {
   try {
     liveData = await PROVIDERS[activeProvider].timeSeries(apiKey, LIVE_INTERVAL, 500);
     lastPriceUpdateTime = Date.now();
+    timeframeHealth['15m'] = { ok: true, at: lastPriceUpdateTime, candleTime: liveData[liveData.length - 1].time, count: liveData.length, source: 'provider' };
     refreshAll();
   } catch (e) { /* keep last good data */ }
 }
@@ -1622,9 +1725,73 @@ function renderMarketClock() {
     (h < 1 ? Math.round(h * 60) + 'm' : h.toFixed(1) + 'h');
 }
 
+function pauseSignalUI(message) {
+  lastComposite = null;
+  const dir = document.getElementById('dirDisplay');
+  if (dir) { dir.className = 'dir hold'; dir.innerText = '⏸ PAUSED'; }
+  const conf = document.getElementById('confidenceLabel');
+  if (conf) conf.textContent = 'No verified live data';
+  ['sEntry','sSl','sTp','sRr','sSlPips','sTpPips'].forEach(id => { const el = document.getElementById(id); if (el) el.textContent = '—'; });
+  const entryType = document.getElementById('sEntryType'); if (entryType) entryType.textContent = 'Unavailable';
+  const reason = document.getElementById('sReason'); if (reason) reason.textContent = message || 'Analysis paused until fresh provider data is available.';
+  const meta = document.getElementById('metaLabelerBox'); if (meta) meta.classList.add('hidden');
+}
 function refreshAll() {
   renderMarketClock();
   if (typeof renderPaper === 'function' && paper && paper.positions.length) renderPaper();
+  if (dataMode !== 'live' || !apiKey || !activeProvider || !liveData.length) {
+    // Clear the last valid analysis too. Otherwise a failed disconnect could
+    // leave a stale BUY/SELL visible and the Generate button could reuse it.
+    lastComposite = null;
+    lastPlan = null;
+    const dir = document.getElementById('dirDisplay');
+    if (dir) { dir.className = 'dir hold'; dir.textContent = '⏸ HOLD'; }
+    const confidence = document.getElementById('confidenceLabel');
+    if (confidence) confidence.textContent = 'No verified data';
+    ['sEntry','sSl','sTp','sRr','sEntryType','sSlPips','sTpPips'].forEach(id => {
+      const el = document.getElementById(id); if (el) el.textContent = '—';
+    });
+    const reason = document.getElementById('sReason');
+    if (reason) reason.textContent = 'Analysis paused until a valid market-data API connection is available.';
+    const factorTable = document.getElementById('factorTable');
+    if (factorTable) factorTable.innerHTML = '';
+    const label = document.getElementById('modeLabel');
+    if (label) label.textContent = 'API disconnected — analysis paused';
+    const price = document.getElementById('livePrice');
+    if (price) price.textContent = '—';
+    const change = document.getElementById('priceChange');
+    if (change) change.textContent = 'No verified market data';
+    const warning = document.getElementById('staleFeedWarning');
+    if (warning) { warning.textContent = 'Connect a market-data API key to enable analysis, paper trading and backtesting. Synthetic prices are disabled.'; warning.classList.remove('hidden'); }
+    pauseSignalUI('No API connection. Synthetic data and simulated signals are disabled.');
+    return;
+  }
+  const latest = liveData[liveData.length - 1];
+  const candleAge = Number.isFinite(Number(latest.time)) ? Date.now() - Number(latest.time) : Infinity;
+  const candleValid = [latest.open, latest.high, latest.low, latest.close].every(v => Number.isFinite(Number(v)) && Number(v) > 0)
+    && Number(latest.high) >= Math.max(Number(latest.open), Number(latest.close), Number(latest.low))
+    && Number(latest.low) <= Math.min(Number(latest.open), Number(latest.close), Number(latest.high))
+    && candleAge >= -60000 && candleAge <= 45 * 60000;
+  if (!candleValid) {
+    const label = document.getElementById('modeLabel');
+    if (label) label.textContent = 'Feed invalid or stale — analysis paused';
+    const warning = document.getElementById('staleFeedWarning');
+    if (warning) { warning.textContent = 'DATA ANALYZER BLOCK: latest 15m candle is malformed, future-dated, or older than 45 minutes. No new analysis or paper entry will be generated until valid fresh data arrives.'; warning.classList.remove('hidden'); }
+    pauseSignalUI('DATA ANALYZER BLOCK: latest 15m candle is invalid or stale.');
+    renderTimeframeHealth();
+    return;
+  }
+  const latestCandleTime = Number(liveData[liveData.length - 1] && liveData[liveData.length - 1].time);
+  const candleAgeMs = Number.isFinite(latestCandleTime) ? Date.now() - latestCandleTime : Infinity;
+  if (candleAgeMs < -60000 || candleAgeMs > 45 * 60 * 1000) {
+    const label = document.getElementById('modeLabel');
+    if (label) label.textContent = 'Data stale — analysis paused';
+    const warning = document.getElementById('staleFeedWarning');
+    if (warning) { warning.textContent = 'Latest 15-minute candle is ' + (Number.isFinite(candleAgeMs) ? Math.max(0, Math.round(candleAgeMs / 60000)) + ' minutes old' : 'invalid') + '. Signal generation is paused until fresh verified candles arrive.'; warning.classList.remove('hidden'); }
+    const price = document.getElementById('livePrice');
+    if (price) price.textContent = '—';
+    return;
+  }
   const weights = getWeights();
   lastComposite = computeComposite(liveData, liveData.length - 1, weights, mtfData, htfData, correlationScore, fundamentalScore, newsSentimentScore, dailyData, weeklyData);
   if (!lastComposite) return;
@@ -1969,16 +2136,11 @@ function setGenOutcome(el, text, tone) {
 }
 
 function liveTick() {
-  if (dataMode !== 'simulated') return;
-  const last = liveData[liveData.length - 1];
-  const drift = (Math.random() - 0.5) * 1.1;
-  const newClose = Math.max(1500, last.close + drift);
-  last.close = +newClose.toFixed(2); last.high = Math.max(last.high, last.close); last.low = Math.min(last.low, last.close);
-  refreshAll();
+  // Synthetic prices are disabled; analysis requires provider-backed candles.
+  return;
 }
 refreshAll();
 window.addEventListener('resize', resizeLiveCanvas);
-simTickHandle = setInterval(liveTick, 2000);
 if (lastComposite) { const plan = buildTradePlan(lastComposite, getTargetRR()); updateSignalUI(lastComposite, plan, false); }
 
 function drawEquityCurve(curve, capital) {
@@ -2018,28 +2180,31 @@ async function runBacktestCycle(isAuto) {
     const costPips = parseFloat(document.getElementById('pCostPips').value) || 0;
 
     let histData;
-    if (dataMode === 'live' && apiKey && activeProvider) {
-      try {
-        histData = await PROVIDERS[activeProvider].timeSeries(apiKey, LIVE_INTERVAL, Math.min(bars, 5000));
-        btSourceNote.textContent = 'Data source: ' + PROVIDERS[activeProvider].label + ' — ' + histData.length + ' × 15min candles for ' + SYMBOL + '.';
-      } catch (e) {
-        btSourceNote.textContent = 'Live history fetch failed (' + e.message + ') — using simulated data instead.';
-        histData = genData(bars, 1850, 900000);
-      }
-    } else {
-      histData = genData(bars, 1850, 900000);
-      btSourceNote.textContent = 'Data source: simulated (connect an API key above to backtest on real 15min history).';
+    if (dataMode !== 'live' || !apiKey || !activeProvider) {
+      throw new Error('Backtesting is disabled until a market-data API key is connected.');
+    }
+    try {
+      histData = await PROVIDERS[activeProvider].timeSeries(apiKey, LIVE_INTERVAL, Math.min(bars, 5000));
+      if (!Array.isArray(histData) || histData.length < 150) throw new Error('Provider returned too few candles for a meaningful backtest.');
+      btSourceNote.textContent = 'Data source: ' + PROVIDERS[activeProvider].label + ' — ' + histData.length + ' × 15min candles for ' + SYMBOL + '.';
+    } catch (e) {
+      btSourceNote.textContent = 'Live history fetch failed (' + e.message + '). No simulated fallback was used.';
+      throw e;
     }
 
     // Pass 1: run with base weights to gather in-sample (train) trades for tuning
     const passA = runSmcBacktest(histData, params, baseWeights, targetRR, costPips);
     const splitIdx = Math.floor(histData.length * 0.7);
-    const trainTrades = passA.trades.filter(t => t.entryIndex < splitIdx);
+    // A trade belongs to training only if it also resolves before the split.
+    const trainTrades = passA.trades.filter(t => t.entryIndex < splitIdx && Number.isInteger(t.exitIndex) && t.exitIndex < splitIdx);
     const { tuned } = computeTunedWeights(trainTrades, baseWeights);
 
-    // Pass 2: re-run full data with tuned weights; only trades opened after the split are genuinely out-of-sample
-    const passB = runSmcBacktest(histData, params, tuned, targetRR, costPips);
-    const testTrades = passB.trades.filter(t => t.entryIndex >= splitIdx);
+    // Pass 2: preserve pre-split candles for indicator warmup but start with
+    // a clean position book after the boundary. No training-era pending/open
+    // position can consume a slot or leak into the test segment.
+    const testStartIdx = splitIdx + 1;
+    const passB = runSmcBacktest(histData, Object.assign({}, params, { startIndex: testStartIdx }), tuned, targetRR, costPips);
+    const testTrades = passB.trades.filter(t => t.entryIndex >= testStartIdx && Number.isInteger(t.exitIndex));
 
     // Only out-of-sample outcomes feed the persisted learning system, to avoid rewarding overfit patterns
     testTrades.forEach(t => recordOutcome(t.dir, t.factors, t.result === 'win'));
@@ -2049,9 +2214,15 @@ async function runBacktestCycle(isAuto) {
     // Backtest examples are regenerable — the same window can be replayed any
     // time — so a rolling store is enough, and crucially they live apart from
     // the live outcomes and can never evict one.
-    const newExamples = testTrades.filter(t => t.qualityFeatures).map(t => ({ features: t.qualityFeatures, label: t.result === 'win' ? 1 : -1 }));
-    learningState.metaBacktestExamples = (learningState.metaBacktestExamples || [])
-      .concat(newExamples).slice(-META_LIMITS.backtestStore);
+    const windowStart = histData[0] && histData[0].time != null ? histData[0].time : 'start';
+    const windowEnd = histData[histData.length - 1] && histData[histData.length - 1].time != null ? histData[histData.length - 1].time : 'end';
+    const existingExamples = learningState.metaBacktestExamples || [];
+    const existingExampleIds = new Set(existingExamples.map(e => e.id).filter(Boolean));
+    const newExamples = testTrades.filter(t => t.qualityFeatures).map(t => ({
+      id: 'wf:' + windowStart + ':' + windowEnd + ':' + t.entryIndex + ':' + t.dir,
+      features: t.qualityFeatures, label: t.result === 'win' ? 1 : -1
+    })).filter(e => !existingExampleIds.has(e.id));
+    learningState.metaBacktestExamples = existingExamples.concat(newExamples).slice(-META_LIMITS.backtestStore);
     retrainMetaLabeler();
     saveLearningState();
 
@@ -2074,7 +2245,7 @@ async function runBacktestCycle(isAuto) {
 
     const wins = result.trades.filter(t => t.result === 'win'), losses = result.trades.filter(t => t.result === 'loss');
     const winRate = result.trades.length ? (wins.length / result.trades.length * 100) : 0;
-    const totalReturn = ((result.finalEquity - params.capital) / params.capital) * 100;
+    const totalReturn = (((result.markedEquity ?? result.finalEquity) - params.capital) / params.capital) * 100;
     const grossWin = wins.reduce((s, t) => s + t.pnl, 0), grossLoss = Math.abs(losses.reduce((s, t) => s + t.pnl, 0));
     const pf = grossLoss > 0 ? (grossWin / grossLoss) : (grossWin > 0 ? Infinity : 0);
 
@@ -2085,17 +2256,17 @@ async function runBacktestCycle(isAuto) {
     retEl.className = 'v mono ' + (totalReturn >= 0 ? 'pos' : 'neg');
     document.getElementById('btDD').innerText = '-' + result.maxDD.toFixed(1) + '%';
     document.getElementById('btPF').innerText = isFinite(pf) ? pf.toFixed(2) : '∞';
-    document.getElementById('btFinal').innerText = '$' + result.finalEquity.toFixed(0);
+    document.getElementById('btFinal').innerText = '$' + (result.markedEquity ?? result.finalEquity).toFixed(0);
 
     const tbody = document.getElementById('btTradeBody'); tbody.innerHTML = '';
     result.trades.slice().reverse().forEach((t, idx) => {
       const seg = t.entryIndex < splitIdx ? 'train' : 'test';
       const tr = document.createElement('tr');
-      tr.innerHTML = '<td>' + (result.trades.length - idx) + '</td><td>' + seg + '</td><td>' + t.dir + '</td><td class="mono">' + t.confidence + '%</td><td class="mono">' + fmt(t.entry) + '</td><td class="mono">' + fmt(t.exit) + '</td><td class="mono ' + t.result + '">' + (t.pnl >= 0 ? '+' : '') + t.pnl.toFixed(2) + '</td><td class="' + t.result + '">' + t.result.toUpperCase() + '</td>';
+      tr.innerHTML = '<td>' + (result.trades.length - idx) + '</td><td>' + seg + '</td><td>' + t.dir + '</td><td class="mono">' + t.confidence + '%</td><td class="mono">' + fmt(t.entry) + '</td><td class="mono">' + fmt(t.sl) + '</td><td class="mono">' + fmt(t.tp) + '</td><td class="mono">' + fmt(t.exit) + '</td><td class="mono ' + t.result + '">' + (t.pnl >= 0 ? '+' : '') + t.pnl.toFixed(2) + '</td><td class="mono">' + (t.rMultiple == null ? '—' : (t.rMultiple >= 0 ? '+' : '') + t.rMultiple.toFixed(2) + 'R') + '</td><td class="' + t.result + '">' + t.result.toUpperCase() + '</td>';
       tbody.appendChild(tr);
     });
     if (isAuto && autoStatus) {
-      autoStatus.textContent = 'Last auto-backtest: ' + new Date().toLocaleTimeString() + '. Next run in ~4 hours while this tab stays open and connected.';
+      autoStatus.textContent = 'Last auto-backtest: ' + new Date().toLocaleTimeString() + '. Next browser run in ~1 hour; closed-tab runs require server scheduling.';
     }
   } catch (e) {
     btSourceNote.textContent = 'Backtest failed: ' + e.message;
@@ -2112,11 +2283,11 @@ function startAutoBacktest() {
   const status = document.getElementById('autoBacktestStatus');
   if (!cb.checked) { status.textContent = 'Auto-backtest is off — check the box above to enable self-learning.'; return; }
   if (dataMode !== 'live') { status.textContent = 'Connect a real data provider to enable auto-backtesting.'; return; }
-  status.textContent = 'Self-learning active — first auto-backtest running now, then every ~4 hours while this tab stays open.';
+  status.textContent = 'Browser backtest active — first run now, then hourly while this tab is open. Closed-tab runs require server scheduling.';
   runBacktestCycle(true);
   autoBacktestHandle = setInterval(() => {
-    if (document.getElementById('autoBacktestCheckbox').checked && dataMode === 'live') runBacktestCycle(true);
-  }, 4 * 60 * 60 * 1000);
+    if (document.getElementById('autoBacktestCheckbox').checked && dataMode === 'live' && apiKey) runBacktestCycle(true);
+  }, 60 * 60 * 1000);
 }
 document.getElementById('autoBacktestCheckbox').addEventListener('change', () => {
   if (document.getElementById('autoBacktestCheckbox').checked) startAutoBacktest();
@@ -2294,7 +2465,11 @@ function runAudit() {
     // not only the reasoning. Timeframes that disagree about the price are not
     // the same instrument; a macro series that is frozen or months out of date
     // is contributing a number that is no longer true.
-    series: { '15m': liveData, '1H': mtfData, '4H': htfData, Daily: dailyData, Weekly: weeklyData },
+    series: {
+      '5m': fiveMinData, '15m': liveData, '30m': thirtyMinData,
+      '1H': mtfData, '4H': htfData, '8H': eightHourData,
+      Daily: dailyData, Weekly: weeklyData
+    },
     macroSeries: (macroSeries.drivers || []).map(d => ({ key: d.key, label: d.label, series: d.series }))
   });
   return lastAudit;
@@ -3010,18 +3185,27 @@ function renderPaper() {
   if (!root) return;
   const cfg = paperConfig();
   const price = currentMarkPrice();
-  const a = paperAccountSummary(paper.positions, cfg.startingBalance, price, paper.epoch);
+  const hasLiveMark = Number.isFinite(price);
+  const a = Object.assign({}, paperAccountSummary(paper.positions, cfg.startingBalance, hasLiveMark ? price : 0, paper.epoch));
+  if (!hasLiveMark) {
+    // Never display synthetic/NaN floating P&L while disconnected. Show realised
+    // balance only until a verified quote returns.
+    a.floating = 0;
+    a.equity = a.balance;
+    a.returnPct = a.startingBalance > 0 ? (a.balance - a.startingBalance) / a.startingBalance * 100 : 0;
+  }
 
   const pnlCls = v => v > 0 ? 'fpos' : v < 0 ? 'fneg' : 'fneu';
   let html = '<div class="metrics" style="margin-bottom:10px;">'
-    + '<div class="card"><div class="label">Equity</div><div class="value mono ' + pnlCls(a.equity - a.startingBalance) + '">' + money(a.equity) + '</div></div>'
+    + '<div class="card"><div class="label">' + (hasLiveMark ? 'Equity' : 'Equity · realised only') + '</div><div class="value mono ' + pnlCls(a.equity - a.startingBalance) + '">' + money(a.equity) + '</div></div>'
     + '<div class="card"><div class="label">Return</div><div class="value mono ' + pnlCls(a.returnPct) + '">' + (a.returnPct >= 0 ? '+' : '') + a.returnPct.toFixed(2) + '%</div></div>'
-    + '<div class="card"><div class="label">Max DD</div><div class="value mono">' + (a.maxDrawdown * 100).toFixed(1) + '%</div></div>'
+    + '<div class="card"><div class="label">' + (hasLiveMark ? 'Max DD' : 'Max DD · mark needed') + '</div><div class="value mono">' + (hasLiveMark ? (a.maxDrawdown * 100).toFixed(1) + '%' : '—') + '</div></div>'
     + '<div class="card"><div class="label">Open</div><div class="value mono">' + a.openCount + (a.pendingCount ? ' <span style="font-size:10px;color:#5c6270;">+' + a.pendingCount + ' resting</span>' : '') + '</div></div>'
     + '</div>';
 
   html += '<div class="zone-item"><span>Balance (realised)</span><span class="mono ' + pnlCls(a.realised) + '">' + money(a.balance) + ' <span style="color:#454a56;">(' + (a.realised >= 0 ? '+' : '') + money(a.realised).replace('$','$') + ')</span></span></div>';
-  if (a.openCount) html += '<div class="zone-item"><span>Floating P&amp;L</span><span class="mono ' + pnlCls(a.floating) + '">' + money(a.floating) + '</span></div>';
+  if (a.openCount && hasLiveMark) html += '<div class="zone-item"><span>Floating P&amp;L</span><span class="mono ' + pnlCls(a.floating) + '">' + money(a.floating) + '</span></div>';
+  if (a.openCount && !hasLiveMark) html += '<div class="data-source-note">Live quote unavailable — floating P&amp;L is hidden until the provider reconnects.</div>';
   html += '<div class="zone-item"><span>Closed trades</span><span class="mono">' + a.closedCount + (a.winRate != null ? ' · ' + (a.winRate * 100).toFixed(0) + '% won' : '') + '</span></div>';
   if (a.profitFactor != null) html += '<div class="zone-item"><span>Profit factor</span><span class="mono ' + pnlCls(a.profitFactor - 1) + '">' + (a.profitFactor === Infinity ? '∞' : a.profitFactor.toFixed(2)) + '</span></div>';
   if (a.avgR != null) html += '<div class="zone-item"><span>Average R per trade</span><span class="mono ' + pnlCls(a.avgR) + '">' + (a.avgR >= 0 ? '+' : '') + a.avgR.toFixed(2) + 'R</span></div>';
@@ -3051,7 +3235,8 @@ function renderPaper() {
     html += '<div style="font-size:10px;color:#454a56;margin:10px 0 6px;">Awaiting entry (no exposure yet)</div>';
     html += resting.map(p =>
       '<div class="zone-item"><span><span class="dirtag ' + p.dir + '">' + p.dir + '</span> ' + lotLabel(p) + ' limit @ $' + fmt(p.requestedEntry)
-      + '</span><span class="mono" style="color:#5c6270;">not filled</span></div>').join('');
+      + '</span><span class="mono" style="color:#5c6270;">not filled</span> '
+      + '<button class="btn" data-paper-action="close" data-paper-id="' + p.id + '" style="padding:3px 7px;font-size:10px;">Cancel</button></div>').join('');
   }
 
   const open = paper.positions.filter(p => p.status === 'open' && inEra(p));
@@ -3059,8 +3244,13 @@ function renderPaper() {
     html += '<div style="font-size:10px;color:#454a56;margin:10px 0 6px;">Open positions</div>';
     html += open.map(p => {
       const u = unrealisedPnl(p, price);
-      return '<div class="zone-item"><span><span class="dirtag ' + p.dir + '">' + p.dir + '</span> ' + lotLabel(p) + ' @ $' + fmt(p.entryFill) + '</span>'
-        + '<span class="mono ' + pnlCls(u) + '">' + money(u) + '</span></div>';
+      return '<div class="zone-item" style="align-items:flex-start;"><span><span class="dirtag ' + p.dir + '">' + p.dir + '</span> ' + lotLabel(p)
+        + ' · entry $' + fmt(p.entryFill) + ' · SL $' + fmt(p.sl) + ' · TP $' + fmt(p.tp)
+        + ' · risk ' + money(p.riskAmount) + ' · R:R ' + (Math.abs(p.tp - p.entryFill) / Math.max(Math.abs(p.entryFill - p.sl), 1e-9)).toFixed(2) + ':1'
+        + '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:5px;">'
+        + '<button class="btn" data-paper-action="edit-sl" data-paper-id="' + p.id + '" style="padding:3px 7px;font-size:10px;">Edit SL</button>'
+        + '<button class="btn" data-paper-action="close" data-paper-id="' + p.id + '" style="padding:3px 7px;font-size:10px;border-color:#ef4d5f;color:#ef4d5f;">Close at market</button>'
+        + '</div></span>' + (hasLiveMark ? '<span class="mono ' + pnlCls(u) + '">' + money(u) + '</span>' : '<span class="mono" style="color:#ffa726;">mark unavailable</span>') + '</div>';
     }).join('');
   }
 
@@ -3068,8 +3258,8 @@ function renderPaper() {
   if (closed.length) {
     html += '<div style="font-size:10px;color:#454a56;margin:10px 0 6px;">Recent closed</div>';
     html += closed.map(p =>
-      '<div class="zone-item"><span><span class="dirtag ' + p.dir + '">' + p.dir + '</span> ' + (p.outcome === 'won' ? (p.partial ? '◐' : '✓') : p.outcome === 'lost' ? '✗' : '–')
-      + ' <span style="color:#454a56;">' + lotLabel(p) + ' · exit $' + fmt(p.exitPrice) + '</span></span>'
+      '<div class="zone-item"><span><span class="dirtag ' + p.dir + '">' + p.dir + '</span> ' + (p.outcome === 'won' ? (p.partial ? '◐ TP' : '✓ TP') : p.outcome === 'lost' ? '✗ SL' : '– closed')
+      + ' <span style="color:#454a56;">' + lotLabel(p) + ' · entry $' + fmt(p.entryFill) + ' · SL $' + fmt(p.sl) + ' · TP $' + fmt(p.tp) + ' · exit $' + fmt(p.exitPrice) + '</span></span>'
       + '<span class="mono ' + pnlCls(p.pnl) + '">' + money(p.pnl) + (p.rMultiple != null ? ' <span style="color:#454a56;">' + (p.rMultiple >= 0 ? '+' : '') + fmt(p.rMultiple) + 'R</span>' : '') + '</span></div>'
     ).join('');
   }
@@ -3081,6 +3271,71 @@ function renderPaper() {
   }
   root.innerHTML = html;
 }
+
+// Paper controls update the paper ledger and matching signal record together.
+document.getElementById('paperContent').addEventListener('click', async event => {
+  const button = event.target.closest('[data-paper-action]');
+  if (!button) return;
+  const position = paper.positions.find(p => p.id === button.dataset.paperId);
+  if (!position || (position.status !== 'open' && position.status !== 'pending')) return;
+  const price = currentMarkPrice();
+  if (button.dataset.paperAction === 'edit-sl') {
+    const raw = window.prompt('New stop-loss price (current SL ' + fmt(position.sl) + '):', String(position.sl));
+    if (raw == null) return;
+    const next = Number(raw);
+    if (!Number.isFinite(next) || next <= 0) { window.alert('Enter a valid positive price.'); return; }
+    if (position.status !== 'open') { window.alert('Cancel the resting order and create a new setup to change its stop.'); return; }
+    const validSide = position.dir === 'BUY'
+      ? next < position.entryFill && next < price
+      : next > position.entryFill && next > price;
+    if (!validSide) { window.alert('The stop must remain beyond entry and current market price on the loss side.'); return; }
+    const cfg = paperConfig();
+    const stopDistance = Math.abs(position.entryFill - next);
+    const riskBudget = Math.max(0, Number(position.balanceAtOpen || paperBalance()) * (cfg.riskPercent / 100));
+    const contract = Number(position.contractSize || cfg.contractSize || 100);
+    const step = cfg.lotStep > 0 ? cfg.lotStep : 0.01;
+    const maxLots = Math.floor((riskBudget / Math.max(stopDistance * contract, 1e-9) + 1e-10) / step) * step;
+    const safeLots = Math.min(Number(position.lots) || 0, +maxLots.toFixed(8));
+    if (safeLots < (cfg.minLots || 0.01)) {
+      window.alert('This stop is too wide for the available capital at the configured risk. The current position was left unchanged.');
+      return;
+    }
+    // Never increase size when tightening a stop, and reduce size when widening
+    // it would breach the original capital risk budget.
+    position.lots = safeLots;
+    position.units = safeLots * contract;
+    position.sl = next;
+    position.riskAmount = stopDistance * position.units;
+    const sig = signalLog.find(x => x.id === position.signalId);
+    if (sig && (sig.status === 'pending' || sig.status === 'open')) {
+      sig.sl = next;
+      sig.rr = Math.abs(sig.tp - sig.entry) / Math.max(Math.abs(sig.entry - next), 1e-9);
+      saveSignalLog();
+    }
+  } else if (button.dataset.paperAction === 'close') {
+    if (position.status === 'open' && !Number.isFinite(price)) {
+      window.alert('Cannot close at market without a verified live price. Reconnect the market-data provider first.');
+      return;
+    }
+    if (!window.confirm(position.status === 'pending' ? 'Cancel this unfilled paper order?' : 'Close this paper trade at the current market price?')) return;
+    const sig = signalLog.find(x => x.id === position.signalId);
+    if (sig && (sig.status === 'pending' || sig.status === 'open')) {
+      sig.status = 'expired';
+      sig.expiryReason = position.status === 'pending' ? 'manually cancelled' : 'manually closed by user';
+      sig.resolvedAt = new Date().toISOString();
+      sig.resolvedBy = 'manual';
+      if (position.status === 'open' && Number.isFinite(price)) sig.exitPrice = price;
+      saveSignalLog();
+    }
+    const idx = paper.positions.findIndex(p => p.id === position.id);
+    paper.positions[idx] = closePaperPosition(position, 'expired', price, paperConfig(), price);
+  }
+  await savePaper();
+  renderPaper();
+  renderSignalLog();
+  renderAnalysisQuality();
+  renderDataInventory();
+});
 
 function renderPaperStatusNote() {
   const note = document.getElementById('paperStatus');
@@ -3150,6 +3405,55 @@ function fmtR(v) { return v == null ? '—' : (v >= 0 ? '+' : '') + v.toFixed(2)
 function fmtPct(v) { return v == null ? '—' : (v * 100).toFixed(0) + '%'; }
 function rClass(v) { return v == null ? 'fneu' : v > 0.05 ? 'fpos' : v < -0.05 ? 'fneg' : 'fneu'; }
 
+function tuneFilterFromEvidence() {
+  const status = document.getElementById('filterTuneStatus');
+  const minN = 10;
+  const outcomeR = sig => {
+    if (!sig || (sig.status !== 'won' && sig.status !== 'lost')) return null;
+    const risk = Math.abs(Number(sig.entry) - Number(sig.sl));
+    if (!(risk > 0)) return sig.status === 'won' ? 1 : -1;
+    const reward = Math.abs(Number(sig.tp) - Number(sig.entry));
+    return sig.status === 'won' ? reward / risk : -1;
+  };
+  const taken = signalLog.map(s => ({ s, r: outcomeR(s) })).filter(x => x.r != null && Number.isFinite(Number(x.s.confidence)));
+  const declined = shadowLog.map(s => ({ s, r: outcomeR(s) })).filter(x => x.r != null && Number.isFinite(Number(x.s.confidence)));
+  if (taken.length < minN || declined.length < minN) {
+    if (status) status.textContent = 'Not enough evidence to tune safely: need at least ' + minN + ' resolved taken trades and ' + minN + ' resolved declined setups. Current: ' + taken.length + ' / ' + declined.length + '.';
+    return false;
+  }
+  const mean = arr => arr.reduce((sum, x) => sum + x.r, 0) / arr.length;
+  const takenR = mean(taken), declinedR = mean(declined);
+  const control = document.getElementById('aMinConf');
+  if (!control) { if (status) status.textContent = 'Could not find the autonomous minimum-confidence setting.'; return false; }
+  const current = Math.max(0, Math.min(100, Number(control.value) || 0));
+  // Conservative one-point adjustments only; never tune on a tiny sample or
+  // let one comparison swing the filter wildly.
+  let next = current;
+  if (takenR > declinedR + 0.1) next = Math.min(95, current + 1);
+  else if (declinedR > takenR + 0.1) next = Math.max(0, current - 1);
+  control.value = String(next);
+  control.dispatchEvent(new Event('change', { bubbles: true }));
+  if (status) status.textContent = 'Evidence comparison: taken expectancy ' + takenR.toFixed(2) + 'R (' + taken.length + '), declined expectancy ' + declinedR.toFixed(2) + 'R (' + declined.length + '). Minimum confidence ' + current.toFixed(0) + '% → ' + next.toFixed(0) + '%. Small step only; review after more resolved evidence.';
+  return true;
+}
+const tuneButton = document.getElementById('tuneFilterNow');
+if (tuneButton) tuneButton.addEventListener('click', tuneFilterFromEvidence);
+const tuneAutoToggle = document.getElementById('autoTuneFilterEnabled');
+if (tuneAutoToggle) {
+  tuneAutoToggle.checked = localStorage.getItem('smc-auto-tune-filter') !== '0';
+  tuneAutoToggle.addEventListener('change', () => {
+    localStorage.setItem('smc-auto-tune-filter', tuneAutoToggle.checked ? '1' : '0');
+  });
+}
+
+function maybeAutoTuneFilter() {
+  const toggle = document.getElementById('autoTuneFilterEnabled');
+  if (!toggle || !toggle.checked) return;
+  const key = 'smc-auto-tune-last-at';
+  const last = Number(localStorage.getItem(key)) || 0;
+  if (Date.now() - last < 60 * 60 * 1000) return;
+  if (tuneFilterFromEvidence()) localStorage.setItem(key, String(Date.now()));
+}
 function renderAnalysisQuality() {
   const root = document.getElementById('qualityContent');
   if (!root) return;
@@ -3214,11 +3518,55 @@ function renderAnalysisQuality() {
   html += '<div class="event-line" style="border-left-color:#c99bff;margin-top:6px;">' + audit.verdict + '</div>';
 
   root.innerHTML = html;
+  autoTuneFilterFromEvidence(audit, false);
 }
+
+const FILTER_TUNE_KEY = 'smc-filter-autotune-v1';
+function autoTuneFilterFromEvidence(audit, force) {
+  const status = document.getElementById('filterTuneStatus');
+  const enabled = document.getElementById('autoTuneFilterEnabled');
+  if (!force && (!enabled || !enabled.checked)) return;
+  if (!audit || audit.taken.n < 10 || audit.declined.n < 10 ||
+      !Number.isFinite(audit.taken.expectancyR) || !Number.isFinite(audit.declined.expectancyR)) {
+    if (status) status.textContent = 'Filter tuning is waiting for at least 10 resolved taken setups and 10 resolved declined setups.';
+    return;
+  }
+  let lastAt = 0;
+  try { lastAt = Number(localStorage.getItem(FILTER_TUNE_KEY)) || 0; } catch (e) {}
+  if (!force && Date.now() - lastAt < 24 * 60 * 60 * 1000) {
+    if (status) status.textContent = 'Evidence ready. Automatic filter adjustment is limited to once per 24 hours to reduce overfitting.';
+    return;
+  }
+  const edge = audit.edgeFromFiltering;
+  const input = document.getElementById('aMinConf');
+  if (!input || !Number.isFinite(edge) || Math.abs(edge) < 0.15) {
+    if (status) status.textContent = 'No filter change: taken and declined expectancy are too close (difference below 0.15R).';
+    return;
+  }
+  const before = Number(input.value) || AUTONOMY_DEFAULTS.minConfidence;
+  // A small bounded step only; never jump the filter based on one noisy sample.
+  const after = Math.max(0, Math.min(100, before + (edge > 0 ? 2 : -2)));
+  input.value = String(after);
+  saveAutonomyState();
+  try { localStorage.setItem(FILTER_TUNE_KEY, String(Date.now())); } catch (e) {}
+  if (status) status.textContent = 'Filter adjusted from resolved evidence: taken expectancy ' + audit.taken.expectancyR.toFixed(2)
+    + 'R vs declined ' + audit.declined.expectancyR.toFixed(2) + 'R. Minimum confidence ' + before + '% → ' + after
+    + '% (' + (edge > 0 ? 'tightened' : 'loosened') + '). This is a small experiment, not proof of an edge.';
+}
+document.getElementById('tuneFilterNow').addEventListener('click', () => {
+  autoTuneFilterFromEvidence(computeGateAudit(signalLog, shadowLog), true);
+});
+document.getElementById('autoTuneFilterEnabled').addEventListener('change', () => {
+  if (document.getElementById('autoTuneFilterEnabled').checked) autoTuneFilterFromEvidence(computeGateAudit(signalLog, shadowLog), false);
+});
 document.getElementById('resetQuality').addEventListener('click', async () => {
-  shadowLog = [];
+  // Declined setups are valuable counterfactual evidence. Keep the raw ledger;
+  // refresh the derived analysis instead of deleting the history.
   await saveShadowLog();
   renderAnalysisQuality();
+  renderDataInventory();
+  const status = document.getElementById('learningStatus');
+  if (status) status.textContent = 'Declined-setup history preserved. Analysis refreshed from retained evidence.';
 });
 
 // ============================================================
@@ -3446,12 +3794,12 @@ function resolveOpenSignals(candles, cfg) {
       changed = true; // expired signals never become training data — no outcome to learn from
     } else if (verdict.status === 'open' && sig.status === 'pending') {
       sig.status = 'open'; // limit entry got tagged; it's a live position now
-      sig.filledAt = new Date().toISOString();
-      paperFillForSignal(sig.id, sig.filledAt);
+      sig.filledAt = verdict.filledAt || sig.filledAt || null;
+      if (sig.filledAt) paperFillForSignal(sig.id, sig.filledAt);
       changed = true;
     }
   });
-  if (changed) { saveSignalLog(); renderSignalLog(); }
+  if (changed) { saveSignalLog(); renderSignalLog(); maybeAutoTuneFilter(); }
   if (resolved) autonomy.autoResolved += resolved;
   if (killed) autonomy.killed = (autonomy.killed || 0) + killed;
   resolveShadowSignals(candles, cfg);
@@ -3477,7 +3825,7 @@ function resolveShadowSignals(candles, cfg) {
       sig.status = 'open'; changed = true;
     }
   });
-  if (changed) { saveShadowLog(); renderAnalysisQuality(); }
+  if (changed) { saveShadowLog(); renderAnalysisQuality(); maybeAutoTuneFilter(); }
 }
 
 // One unattended pass. Everything that can fail is inside the caller's try.
@@ -3515,7 +3863,40 @@ async function autonomyCycle() {
       gate = { take: false, code: 'audit',
         reason: 'independent audit found ' + audit.critical + ' critical issue(s): ' + audit.findings[0].title };
     } else {
-      gate = autonomyGate(lastComposite, plan, signalLog, autonomy.lastSignalAt, cfg);
+      // Avoid hedging: when a new opposite setup is materially stronger, retire
+      // the weaker conflicting signal and its paper position before evaluating
+      // the new setup. If the new setup is not clearly stronger, the engine gate
+      // keeps the existing position and rejects the conflict.
+      const activeOpposing = signalLog.filter(x =>
+        (x.status === 'pending' || x.status === 'open') &&
+        (x.dir === 'BUY' || x.dir === 'SELL') && x.dir !== lastComposite.direction);
+      const factorConfluence = (factors, dir) => {
+        const sign = dir === 'BUY' ? 1 : -1;
+        let aligned = 0, total = 0;
+        Object.values(factors || {}).forEach(v => {
+          if (!Number.isFinite(v)) return;
+          total += Math.abs(v);
+          if (v * sign > 0) aligned += Math.abs(v);
+        });
+        return total > 0 ? aligned / total : 0;
+      };
+      const candidateScore = factorConfluence(lastComposite.factors, lastComposite.direction);
+      const canReplaceAll = activeOpposing.length > 0 && candidateScore > 0 &&
+        activeOpposing.every(x => candidateScore >= factorConfluence(x.factors, x.dir) + 0.15);
+      if (canReplaceAll) {
+        activeOpposing.forEach(x => {
+          x.status = 'expired';
+          x.expiryReason = 'replaced by opposite setup with materially stronger confluence';
+          x.resolvedAt = new Date().toISOString();
+          x.resolvedBy = 'conflict-auditor';
+          paperCloseForSignal(x.id, 'expired', currentMarkPrice());
+        });
+        saveSignalLog();
+        renderSignalLog();
+        gate = autonomyGate(lastComposite, plan, signalLog, autonomy.lastSignalAt, cfg);
+      } else {
+        gate = autonomyGate(lastComposite, plan, signalLog, autonomy.lastSignalAt, cfg);
+      }
     }
     // Tally why each cycle ended as it did. One latest-reason line cannot show
     // whether 13 quiet cycles mean "no setup existed" or "the filter blocked
@@ -3523,6 +3904,23 @@ async function autonomyCycle() {
     const code = gate.code || 'unknown';
     autonomy.gateTally[code] = (autonomy.gateTally[code] || 0) + 1;
     if (gate.take) {
+      const replaceIds = gate.replaceSignalIds || (gate.replaceSignalId ? [gate.replaceSignalId] : []);
+      if (replaceIds.length) {
+        replaceIds.forEach(id => {
+          const weaker = signalLog.find(x => x.id === id && (x.status === 'pending' || x.status === 'open'));
+          if (!weaker) return;
+          weaker.status = 'expired';
+          weaker.expiryReason = 'auditor: superseded by opposite setup with stronger confluence';
+          weaker.resolvedAt = new Date().toISOString();
+          weaker.resolvedBy = 'confluence-auditor';
+          const posIndex = paper.positions.findIndex(p => p.signalId === weaker.id && (p.status === 'open' || p.status === 'pending'));
+          if (posIndex >= 0) paper.positions[posIndex] = closePaperPosition(paper.positions[posIndex], 'expired', currentMarkPrice(), paperConfig(), currentMarkPrice());
+        });
+        saveSignalLog();
+        await savePaper();
+        renderPaper();
+        renderSignalLog();
+      }
       updateSignalUI(lastComposite, plan, true, 'auto'); // logIt = true -> addSignalToLog
       autonomy.signalsTaken++;
       autonomy.lastSignalAt = now;

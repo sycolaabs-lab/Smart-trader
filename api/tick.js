@@ -26,6 +26,7 @@ import {
   computeComposite, buildTradePlan, resolveSignal, autonomyGate, setMetaModel,
   trainAdaBoostStumps, buildMetaTrainingSet, META_LIMITS, thinExamples, parseUtcDatetime, pearsonCorrelation, toDailyReturns,
   CORRELATION_INSTRUMENTS, FUNDAMENTAL_INSTRUMENTS, FRED_INSTRUMENTS,
+  runSmcBacktest, computeTunedWeights, aggregateCandles,
   AUTONOMY_DEFAULTS, macroContribution, aggregateMacroScore, pctChangeOf,
   seriesDeltas, latestChangeOf, correlateByDay, ECONOMIC_RELEASES, buildReleaseCalendar,
   newsWindowState, NEWS_WINDOW_DEFAULTS, signalsToFlatten,
@@ -39,7 +40,9 @@ const LIVE_INTERVAL = '15min';
 // How stale each cached input is allowed to get before the tick refetches it.
 // These are the whole reason the daily quota survives a 5-minute schedule.
 const REFRESH_MS = {
-  ltf: 0,                       // always fresh — this is the signal timeframe
+  ltf: 15 * 60 * 1000,          // reuse 15m candles between completed bars to preserve provider quota
+  five: 5 * 60 * 1000,
+  thirty: 30 * 60 * 1000,
   mtf: 60 * 60 * 1000,          // 1H candles: hourly
   htf: 4 * 60 * 60 * 1000,      // 4H candles: every 4h
   daily: 12 * 60 * 60 * 1000,
@@ -367,16 +370,68 @@ export async function runTick({ db, tdKey, fredKey, avKey, now }) {
       cache: stored.cache ? JSON.parse(stored.cache) : {},
       cacheMeta: stored.cacheMeta || {},
       cacheSig: stored.cacheSig || {},
-      lastSignalAt: stored.lastSignalAt || null
+      lastSignalAt: stored.lastSignalAt || null,
+      lastBacktestAt: stored.lastBacktestAt || 0,
+      lastBacktestSummary: stored.lastBacktestSummary || null
     };
     setMetaModel(state.learningState.metaModel);
 
     // ---- market data (tiered refresh) ------------------------------------
     const ltf = (await cached(state, 'ltf', REFRESH_MS.ltf, () => twelveSeries(tdKey, LIVE_INTERVAL, 500))).value;
+    const fiveR = await cached(state, 'five', REFRESH_MS.five, async () => { await sleep(1200); return twelveSeries(tdKey, '5min', 500); });
+    const thirtyR = await cached(state, 'thirty', REFRESH_MS.thirty, async () => { await sleep(1200); return twelveSeries(tdKey, '30min', 300); });
     const mtfR = await cached(state, 'mtf', REFRESH_MS.mtf, async () => { await sleep(1200); return twelveSeries(tdKey, '1h', 300); });
     const htfR = await cached(state, 'htf', REFRESH_MS.htf, async () => { await sleep(1200); return twelveSeries(tdKey, '4h', 200); });
     const dayR = await cached(state, 'daily', REFRESH_MS.daily, async () => { await sleep(1200); return twelveSeries(tdKey, '1day', 200); });
     const wkR = await cached(state, 'weekly', REFRESH_MS.weekly, async () => { await sleep(1200); return twelveSeries(tdKey, '1week', 104); });
+    const eightHour = aggregateCandles(mtfR.value || [], 8);
+
+    // Server-side hourly walk-forward backtest; independent of browser lifecycle.
+    if (ltf.length >= 180 && clockNow - state.lastBacktestAt >= 60 * 60 * 1000) {
+      const backtestAt = clockNow;
+      try {
+        const params = {
+          capital: Math.max(1, envNum('TICK_BACKTEST_CAPITAL', 10000)),
+          riskPct: Math.min(5, Math.max(0.1, envNum('TICK_BACKTEST_RISK_PCT', 1))),
+          minConfidence: Math.max(0, envNum('TICK_BACKTEST_MIN_CONFIDENCE', 20))
+        };
+        const splitIdx = Math.floor(ltf.length * 0.7);
+        const baseWeights = Object.assign({}, state.weights || DEFAULT_WEIGHTS);
+        const firstPass = runSmcBacktest(ltf, params, baseWeights, 4, envNum('TICK_BACKTEST_COST_PIPS', 2));
+        const trainTrades = firstPass.trades.filter(t => Number.isInteger(t.exitIndex) && t.entryIndex < splitIdx && t.exitIndex < splitIdx);
+        const tuned = computeTunedWeights(trainTrades, baseWeights).tuned;
+        // Preserve pre-split candles for indicator warmup, but do not carry
+        // training-era open/resting positions into the test-period book.
+        const testStartIdx = splitIdx + 1;
+        const secondPass = runSmcBacktest(ltf, Object.assign({}, params, { startIndex: testStartIdx }), tuned, 4, envNum('TICK_BACKTEST_COST_PIPS', 2));
+        const testTrades = secondPass.trades.filter(t => t.entryIndex >= testStartIdx && Number.isInteger(t.exitIndex));
+        const oldExamples = state.learningState.metaBacktestExamples || [];
+        const knownIds = new Set(oldExamples.map(e => e.id).filter(Boolean));
+        const startTime = ltf[0] && ltf[0].time != null ? ltf[0].time : 'start';
+        const endTime = ltf[ltf.length - 1] && ltf[ltf.length - 1].time != null ? ltf[ltf.length - 1].time : 'end';
+        const freshExamples = testTrades.filter(t => t.qualityFeatures).map(t => ({
+          id: 'worker-wf:' + startTime + ':' + endTime + ':' + t.entryIndex + ':' + t.dir,
+          features: t.qualityFeatures, label: t.result === 'win' ? 1 : -1
+        })).filter(e => !knownIds.has(e.id));
+        state.learningState.metaBacktestExamples = oldExamples.concat(freshExamples).slice(-META_LIMITS.backtestStore);
+        const metaSet = buildMetaTrainingSet(state.learningState.metaExamples || [], state.learningState.metaBacktestExamples);
+        state.learningState.metaModel = metaSet.examples.length ? trainAdaBoostStumps(metaSet.examples, 20) : null;
+        setMetaModel(state.learningState.metaModel);
+        if (trainTrades.length >= 10) state.weights = tuned;
+        state.lastBacktestAt = backtestAt;
+        state.lastBacktestSummary = {
+          at: new Date(backtestAt).toISOString(), candleCount: ltf.length,
+          trainingTrades: trainTrades.length, testTrades: testTrades.length,
+          testWins: testTrades.filter(t => t.result === 'win').length,
+          testLosses: testTrades.filter(t => t.result === 'loss').length,
+          testExpectancyR: testTrades.length ? testTrades.reduce((sum, t) => sum + (t.rMultiple || 0), 0) / testTrades.length : null,
+          weights: state.weights, weightsUpdated: trainTrades.length >= 10
+        };
+      } catch (error) {
+        state.lastBacktestAt = backtestAt;
+        state.lastBacktestSummary = { at: new Date(backtestAt).toISOString(), error: String(error && error.message || error) };
+      }
+    }
 
     // ---- macro inputs (all optional, all failure-tolerant) ---------------
     // Each of these may be served straight from cache (cheap) or trigger a full
@@ -501,7 +556,7 @@ export async function runTick({ db, tdKey, fredKey, avKey, now }) {
         sig.status = 'open';
         // The browser books the paper fill off this timestamp, so it has to be
         // recorded here rather than invented on arrival.
-        sig.filledAt = new Date().toISOString();
+        sig.filledAt = verdict.filledAt || sig.filledAt || null;
       }
     });
 
@@ -584,15 +639,44 @@ export async function runTick({ db, tdKey, fredKey, avKey, now }) {
         ? parseFloat(process.env.TICK_MIN_CONFIDENCE)
         : AUTONOMY_DEFAULTS.minConfidence
     });
+    // Compare an opposite-direction candidate with every active setup before
+    // allowing it through. A new signal may replace the opposing book only when
+    // its confidence/meta evidence is materially stronger; otherwise the gate
+    // rejects it and avoids a hedge.
+    const activeOpposites = state.signalLog.filter(x => (x.status === 'pending' || x.status === 'open') && x.dir && x.dir !== result.direction);
+    const factorConfluence = (factors, dir) => {
+      const sign = dir === 'BUY' ? 1 : -1;
+      let aligned = 0, total = 0;
+      Object.values(factors || {}).forEach(v => {
+        if (!Number.isFinite(v)) return;
+        total += Math.abs(v);
+        if (v * sign > 0) aligned += Math.abs(v);
+      });
+      return total > 0 ? aligned / total : 0;
+    };
+    const candidateScore = factorConfluence(result.factors, result.direction);
+    const canSupersede = activeOpposites.length > 0 && candidateScore > 0 &&
+      activeOpposites.every(x => candidateScore >= factorConfluence(x.factors, x.dir) + 0.15);
+    const superseded = canSupersede ? activeOpposites : [];
+    const gateBook = superseded.length
+      ? state.signalLog.filter(x => !superseded.some(old => old.id === x.id))
+      : state.signalLog;
     let gate;
     if (audit.blocking) {
       gate = { take: false, code: 'audit',
         reason: 'independent audit found ' + audit.critical + ' critical issue(s): ' + audit.findings[0].title };
     } else {
-      gate = autonomyGate(result, plan, state.signalLog, state.lastSignalAt, gateCfg);
+      gate = autonomyGate(result, plan, gateBook, state.lastSignalAt, gateCfg);
     }
     let tookSignal = false;
     if (gate.take) {
+      superseded.forEach(old => {
+        old.status = 'expired';
+        old.expiryReason = 'auditor: replaced by materially stronger opposing ' + result.direction + ' confluence';
+        old.killSwitch = 'conflict-resolution';
+        old.resolvedAt = new Date(clockNow).toISOString();
+        old.resolvedBy = 'auditor';
+      });
       state.signalLog.unshift({
         id: Date.now() + '-' + Math.random().toString(36).slice(2, 7),
         dir: result.direction, entry: plan.entry, sl: plan.sl, tp: plan.tp,
@@ -621,6 +705,8 @@ export async function runTick({ db, tdKey, fredKey, avKey, now }) {
       cacheMeta: state.cacheMeta,
       cacheSig: state.cacheSig || {},
       lastSignalAt: state.lastSignalAt,
+      lastBacktestAt: state.lastBacktestAt || 0,
+      lastBacktestSummary: state.lastBacktestSummary || null,
       updatedAt: Date.now()
     }, { merge: true });
 
@@ -661,11 +747,53 @@ export async function runTick({ db, tdKey, fredKey, avKey, now }) {
     // The public snapshot the dashboard subscribes to. Field names here are the
     // contract with the Background System panel in index.html — changing one
     // means changing both.
+    const inspectCandlesForTick = (candles, intervalMs, maxAgeMs) => {
+      const source = Array.isArray(candles) ? candles : [];
+      const valid = source.filter(c => c && Number.isFinite(c.time) &&
+        Number.isFinite(c.open) && Number.isFinite(c.high) && Number.isFinite(c.low) && Number.isFinite(c.close) &&
+        c.high >= Math.max(c.open, c.close, c.low) && c.low <= Math.min(c.open, c.close, c.high));
+      let gaps = 0, largeJumps = 0;
+      const moves = [];
+      for (let i = 1; i < valid.length; i++) {
+        if (valid[i].time - valid[i - 1].time > intervalMs * 1.8) gaps++;
+        const previous = valid[i - 1].close;
+        if (previous > 0) moves.push(Math.abs(valid[i].close - previous) / previous);
+      }
+      const sortedMoves = moves.slice().sort((a, b) => a - b);
+      const medianMove = sortedMoves.length ? sortedMoves[Math.floor(sortedMoves.length / 2)] : 0;
+      // Flag suspicious jumps relative to this series' own typical movement.
+      // This is a warning, not proof of a bad tick; genuine news moves still occur.
+      const absoluteFloor = intervalMs <= 15 * 60000 ? 0.003 : intervalMs <= 60 * 60000 ? 0.008 : intervalMs <= 4 * 60 * 60000 ? 0.015 : 0.025;
+      const jumpThreshold = Math.max(absoluteFloor, medianMove * 8);
+      largeJumps = moves.filter(move => move > jumpThreshold).length;
+      const last = valid.length ? valid[valid.length - 1] : null;
+      const ageMinutes = last ? Math.max(0, Math.round((clockNow - last.time) / 60000)) : null;
+      return { candleAt: last ? last.time : null, ageMinutes, count: valid.length,
+        source: 'Twelve Data', stale: ageMinutes == null || ageMinutes * 60000 > maxAgeMs,
+        invalidCandles: source.length - valid.length, gapCount: gaps, largeJumps,
+        lastCandleAt: last ? new Date(last.time).toISOString() : null };
+    };
     const tick = {
       time: Date.now(),
       price: result.price,
       direction: result.direction,
       confidence: result.confidence,
+      // Publish the actual per-factor weights and source freshness so the UI can
+      // explain the background decision instead of showing only its final price.
+      weights: Object.assign({}, state.weights),
+      factors: Object.assign({}, result.factors),
+      totalWeight: result.totalWeight,
+      dataHealth: {
+        '5m': inspectCandlesForTick(fiveR.value, 5 * 60000, 12 * 60000),
+        '15m': inspectCandlesForTick(ltf, 15 * 60000, 35 * 60000),
+        '30m': inspectCandlesForTick(thirtyR.value, 30 * 60000, 70 * 60000),
+        '1H': inspectCandlesForTick(mtfR.value, 60 * 60000, 130 * 60000),
+        '4H': inspectCandlesForTick(htfR.value, 4 * 60 * 60000, 9 * 60 * 60000),
+        '8H': inspectCandlesForTick(eightHour, 8 * 60 * 60000, 17 * 60 * 60000),
+        'Daily': inspectCandlesForTick(dayR.value, 24 * 60 * 60000, 48 * 60 * 60000),
+        'Weekly': inspectCandlesForTick(wkR.value, 7 * 24 * 60 * 60000, 15 * 24 * 60 * 60000)
+      },
+      backtest: state.lastBacktestSummary || null,
       entry: plan.entry, sl: plan.sl, tp: plan.tp,
       metaScore: plan.metaScore || 0,
       metaTrained: !!(state.learningState.metaModel && state.learningState.metaModel.length),
@@ -704,6 +832,17 @@ export async function runTick({ db, tdKey, fredKey, avKey, now }) {
         newsAvailable: !!news.available, newsScore: news.score || 0
       },
       macroSkipped,
+      timeframeHealth: {
+        '5m': { count: fiveR.value.length, candleTime: fiveR.value.at(-1)?.time || null, fetchedAt: fiveR.fetchedAt || null },
+        '15m': { count: ltf.length, candleTime: ltf.at(-1)?.time || null },
+        '30m': { count: thirtyR.value.length, candleTime: thirtyR.value.at(-1)?.time || null, fetchedAt: thirtyR.fetchedAt || null },
+        '1H': { count: mtfR.value.length, candleTime: mtfR.value.at(-1)?.time || null },
+        '4H': { count: htfR.value.length, candleTime: htfR.value.at(-1)?.time || null },
+        '8H': { count: eightHour.length, candleTime: eightHour.at(-1)?.time || null, derivedFrom: '1H' },
+        'Daily': { count: dayR.value.length, candleTime: dayR.value.at(-1)?.time || null },
+        'Weekly': { count: wkR.value.length, candleTime: wkR.value.at(-1)?.time || null }
+      },
+      lastBacktestSummary: state.lastBacktestSummary || null,
       openSignals: state.signalLog.filter(s => s.status === 'pending' || s.status === 'open').length,
       totalLogged: state.learningState.totalLogged || 0,
       durationMs: Date.now() - started
