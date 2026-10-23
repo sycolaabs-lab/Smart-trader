@@ -1426,7 +1426,14 @@ async function connectProvider() {
     connStatus.textContent = 'Connected to ' + provider.label + '. Live 15-minute candles for ' + SYMBOL + '.';
     connStatus.className = 'conn-status ok';
     btSourceNote.textContent = 'Data source: ' + provider.label + ' — connected.';
+    // Load the requested intraday timeframes immediately on connection, not only
+    // after the first polling interval. 8H is derived from the 1H candles.
+    await resyncTimeframe('5m', '5min', 300, d => { fiveMinData = d; });
+    await resyncTimeframe('30m', '30min', 200, d => { thirtyMinData = d; });
     await fetchHigherTimeframes(provider, key);
+    eightHourData = aggregateCandles(mtfData, 8);
+    timeframeHealth['8H'] = { ok: eightHourData.length > 0, at: Date.now(), candleTime: eightHourData.length ? eightHourData[eightHourData.length - 1].time : null, count: eightHourData.length, derived: true, source: 'aggregated from 1H candles' };
+    renderTimeframeHealth();
     await refreshCorrelation(providerId, key, document.getElementById('fredKeyInput').value.trim());
     await refreshFundamentals(document.getElementById('fredKeyInput').value.trim());
     await refreshNewsSentiment(document.getElementById('newsKeyInput').value.trim());
@@ -1436,7 +1443,9 @@ async function connectProvider() {
     await saveKeysIfRemembered();
     startAutoBacktest();
   } catch (e) {
-    connStatus.textContent = 'Connection failed: ' + e.message + ' — staying on simulated data.';
+    apiKey = null; activeProvider = null; dataMode = 'disconnected'; liveData = []; prevClose = NaN;
+    connStatus.textContent = 'Connection failed: ' + e.message + ' — analysis and simulation are paused until a valid API connection is established.';
+    refreshAll();
     connStatus.className = 'conn-status err';
   }
   connectBtn.disabled = false; connectBtn.textContent = 'Connect';
@@ -3296,6 +3305,44 @@ document.getElementById('paperReset').addEventListener('click', async () => {
 function fmtR(v) { return v == null ? '—' : (v >= 0 ? '+' : '') + v.toFixed(2) + 'R'; }
 function fmtPct(v) { return v == null ? '—' : (v * 100).toFixed(0) + '%'; }
 function rClass(v) { return v == null ? 'fneu' : v > 0.05 ? 'fpos' : v < -0.05 ? 'fneg' : 'fneu'; }
+
+function tuneFilterFromEvidence() {
+  const status = document.getElementById('filterTuneStatus');
+  const minN = 10;
+  const outcomeR = sig => {
+    if (!sig || (sig.status !== 'won' && sig.status !== 'lost')) return null;
+    const risk = Math.abs(Number(sig.entry) - Number(sig.sl));
+    if (!(risk > 0)) return sig.status === 'won' ? 1 : -1;
+    const reward = Math.abs(Number(sig.tp) - Number(sig.entry));
+    return sig.status === 'won' ? reward / risk : -1;
+  };
+  const taken = signalLog.map(s => ({ s, r: outcomeR(s) })).filter(x => x.r != null && Number.isFinite(Number(x.s.confidence)));
+  const declined = shadowLog.map(s => ({ s, r: outcomeR(s) })).filter(x => x.r != null && Number.isFinite(Number(x.s.confidence)));
+  if (taken.length < minN || declined.length < minN) {
+    if (status) status.textContent = 'Not enough evidence to tune safely: need at least ' + minN + ' resolved taken trades and ' + minN + ' resolved declined setups. Current: ' + taken.length + ' / ' + declined.length + '.';
+    return false;
+  }
+  const mean = arr => arr.reduce((sum, x) => sum + x.r, 0) / arr.length;
+  const takenR = mean(taken), declinedR = mean(declined);
+  const control = document.getElementById('aMinConf');
+  if (!control) { if (status) status.textContent = 'Could not find the autonomous minimum-confidence setting.'; return false; }
+  const current = Math.max(0, Math.min(100, Number(control.value) || 0));
+  // Conservative one-point adjustments only; never tune on a tiny sample or
+  // let one comparison swing the filter wildly.
+  let next = current;
+  if (takenR > declinedR + 0.1) next = Math.min(95, current + 1);
+  else if (declinedR > takenR + 0.1) next = Math.max(0, current - 1);
+  control.value = String(next);
+  control.dispatchEvent(new Event('change', { bubbles: true }));
+  if (status) status.textContent = 'Evidence comparison: taken expectancy ' + takenR.toFixed(2) + 'R (' + taken.length + '), declined expectancy ' + declinedR.toFixed(2) + 'R (' + declined.length + '). Minimum confidence ' + current.toFixed(0) + '% → ' + next.toFixed(0) + '%. Small step only; review after more resolved evidence.';
+  return true;
+}
+const tuneButton = document.getElementById('tuneFilterNow');
+if (tuneButton) tuneButton.addEventListener('click', tuneFilterFromEvidence);
+const tuneAutoToggle = document.getElementById('autoTuneFilterEnabled');
+if (tuneAutoToggle) tuneAutoToggle.addEventListener('change', () => {
+  localStorage.setItem('smc-auto-tune-filter', tuneAutoToggle.checked ? '1' : '0');
+});
 
 function renderAnalysisQuality() {
   const root = document.getElementById('qualityContent');
