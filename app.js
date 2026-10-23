@@ -3265,8 +3265,23 @@ document.getElementById('paperContent').addEventListener('click', async event =>
       ? next < position.entryFill && next < price
       : next > position.entryFill && next > price;
     if (!validSide) { window.alert('The stop must remain beyond entry and current market price on the loss side.'); return; }
+    const cfg = paperConfig();
+    const stopDistance = Math.abs(position.entryFill - next);
+    const riskBudget = Math.max(0, Number(position.balanceAtOpen || paperBalance()) * (cfg.riskPercent / 100));
+    const contract = Number(position.contractSize || cfg.contractSize || 100);
+    const step = cfg.lotStep > 0 ? cfg.lotStep : 0.01;
+    const maxLots = Math.floor((riskBudget / Math.max(stopDistance * contract, 1e-9) + 1e-10) / step) * step;
+    const safeLots = Math.min(Number(position.lots) || 0, +maxLots.toFixed(8));
+    if (safeLots < (cfg.minLots || 0.01)) {
+      window.alert('This stop is too wide for the available capital at the configured risk. The current position was left unchanged.');
+      return;
+    }
+    // Never increase size when tightening a stop, and reduce size when widening
+    // it would breach the original capital risk budget.
+    position.lots = safeLots;
+    position.units = safeLots * contract;
     position.sl = next;
-    position.riskAmount = Math.abs(position.entryFill - next) * position.units;
+    position.riskAmount = stopDistance * position.units;
     const sig = signalLog.find(x => x.id === position.signalId);
     if (sig && (sig.status === 'pending' || sig.status === 'open')) {
       sig.sl = next;
