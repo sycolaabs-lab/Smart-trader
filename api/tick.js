@@ -26,6 +26,7 @@ import {
   computeComposite, buildTradePlan, resolveSignal, autonomyGate, setMetaModel,
   trainAdaBoostStumps, buildMetaTrainingSet, META_LIMITS, thinExamples, parseUtcDatetime, pearsonCorrelation, toDailyReturns,
   CORRELATION_INSTRUMENTS, FUNDAMENTAL_INSTRUMENTS, FRED_INSTRUMENTS,
+  runSmcBacktest, computeTunedWeights, META_LIMITS, buildMetaTrainingSet, trainAdaBoostStumps, setMetaModel,
   AUTONOMY_DEFAULTS, macroContribution, aggregateMacroScore, pctChangeOf,
   seriesDeltas, latestChangeOf, correlateByDay, ECONOMIC_RELEASES, buildReleaseCalendar,
   newsWindowState, NEWS_WINDOW_DEFAULTS, signalsToFlatten,
@@ -39,7 +40,9 @@ const LIVE_INTERVAL = '15min';
 // How stale each cached input is allowed to get before the tick refetches it.
 // These are the whole reason the daily quota survives a 5-minute schedule.
 const REFRESH_MS = {
-  ltf: 0,                       // always fresh — this is the signal timeframe
+  ltf: 15 * 60 * 1000,          // reuse 15m candles between completed bars to preserve provider quota
+  five: 5 * 60 * 1000,
+  thirty: 30 * 60 * 1000,
   mtf: 60 * 60 * 1000,          // 1H candles: hourly
   htf: 4 * 60 * 60 * 1000,      // 4H candles: every 4h
   daily: 12 * 60 * 60 * 1000,
@@ -367,16 +370,65 @@ export async function runTick({ db, tdKey, fredKey, avKey, now }) {
       cache: stored.cache ? JSON.parse(stored.cache) : {},
       cacheMeta: stored.cacheMeta || {},
       cacheSig: stored.cacheSig || {},
-      lastSignalAt: stored.lastSignalAt || null
+      lastSignalAt: stored.lastSignalAt || null,
+      lastBacktestAt: stored.lastBacktestAt || 0,
+      lastBacktestSummary: stored.lastBacktestSummary || null
     };
     setMetaModel(state.learningState.metaModel);
 
     // ---- market data (tiered refresh) ------------------------------------
     const ltf = (await cached(state, 'ltf', REFRESH_MS.ltf, () => twelveSeries(tdKey, LIVE_INTERVAL, 500))).value;
+    const fiveR = await cached(state, 'five', REFRESH_MS.five, async () => { await sleep(1200); return twelveSeries(tdKey, '5min', 500); });
+    const thirtyR = await cached(state, 'thirty', REFRESH_MS.thirty, async () => { await sleep(1200); return twelveSeries(tdKey, '30min', 300); });
     const mtfR = await cached(state, 'mtf', REFRESH_MS.mtf, async () => { await sleep(1200); return twelveSeries(tdKey, '1h', 300); });
     const htfR = await cached(state, 'htf', REFRESH_MS.htf, async () => { await sleep(1200); return twelveSeries(tdKey, '4h', 200); });
     const dayR = await cached(state, 'daily', REFRESH_MS.daily, async () => { await sleep(1200); return twelveSeries(tdKey, '1day', 200); });
     const wkR = await cached(state, 'weekly', REFRESH_MS.weekly, async () => { await sleep(1200); return twelveSeries(tdKey, '1week', 104); });
+    const eightHour = aggregateCandles(mtfR.value || [], 8);
+
+    // Server-side hourly walk-forward backtest; independent of browser lifecycle.
+    if (ltf.length >= 180 && clockNow - state.lastBacktestAt >= 60 * 60 * 1000) {
+      const backtestAt = clockNow;
+      try {
+        const params = {
+          capital: Math.max(1, envNum('TICK_BACKTEST_CAPITAL', 10000)),
+          riskPct: Math.min(5, Math.max(0.1, envNum('TICK_BACKTEST_RISK_PCT', 1))),
+          minConfidence: Math.max(0, envNum('TICK_BACKTEST_MIN_CONFIDENCE', 20))
+        };
+        const splitIdx = Math.floor(ltf.length * 0.7);
+        const baseWeights = Object.assign({}, state.weights || DEFAULT_WEIGHTS);
+        const firstPass = runSmcBacktest(ltf, params, baseWeights, 4, envNum('TICK_BACKTEST_COST_PIPS', 2));
+        const trainTrades = firstPass.trades.filter(t => Number.isInteger(t.exitIndex) && t.entryIndex < splitIdx && t.exitIndex < splitIdx);
+        const tuned = computeTunedWeights(trainTrades, baseWeights).tuned;
+        const secondPass = runSmcBacktest(ltf, params, tuned, 4, envNum('TICK_BACKTEST_COST_PIPS', 2));
+        const testTrades = secondPass.trades.filter(t => t.entryIndex >= splitIdx && Number.isInteger(t.exitIndex) && t.exitIndex >= splitIdx);
+        const oldExamples = state.learningState.metaBacktestExamples || [];
+        const knownIds = new Set(oldExamples.map(e => e.id).filter(Boolean));
+        const startTime = ltf[0] && ltf[0].time != null ? ltf[0].time : 'start';
+        const endTime = ltf[ltf.length - 1] && ltf[ltf.length - 1].time != null ? ltf[ltf.length - 1].time : 'end';
+        const freshExamples = testTrades.filter(t => t.qualityFeatures).map(t => ({
+          id: 'worker-wf:' + startTime + ':' + endTime + ':' + t.entryIndex + ':' + t.dir,
+          features: t.qualityFeatures, label: t.result === 'win' ? 1 : -1
+        })).filter(e => !knownIds.has(e.id));
+        state.learningState.metaBacktestExamples = oldExamples.concat(freshExamples).slice(-META_LIMITS.backtestStore);
+        const metaSet = buildMetaTrainingSet(state.learningState.metaExamples || [], state.learningState.metaBacktestExamples);
+        state.learningState.metaModel = metaSet.examples.length ? trainAdaBoostStumps(metaSet.examples, 20) : null;
+        setMetaModel(state.learningState.metaModel);
+        if (trainTrades.length >= 10) state.weights = tuned;
+        state.lastBacktestAt = backtestAt;
+        state.lastBacktestSummary = {
+          at: new Date(backtestAt).toISOString(), candleCount: ltf.length,
+          trainingTrades: trainTrades.length, testTrades: testTrades.length,
+          testWins: testTrades.filter(t => t.result === 'win').length,
+          testLosses: testTrades.filter(t => t.result === 'loss').length,
+          testExpectancyR: testTrades.length ? testTrades.reduce((sum, t) => sum + (t.rMultiple || 0), 0) / testTrades.length : null,
+          weights: state.weights, weightsUpdated: trainTrades.length >= 10
+        };
+      } catch (error) {
+        state.lastBacktestAt = backtestAt;
+        state.lastBacktestSummary = { at: new Date(backtestAt).toISOString(), error: String(error && error.message || error) };
+      }
+    }
 
     // ---- macro inputs (all optional, all failure-tolerant) ---------------
     // Each of these may be served straight from cache (cheap) or trigger a full
@@ -621,6 +673,8 @@ export async function runTick({ db, tdKey, fredKey, avKey, now }) {
       cacheMeta: state.cacheMeta,
       cacheSig: state.cacheSig || {},
       lastSignalAt: state.lastSignalAt,
+      lastBacktestAt: state.lastBacktestAt || 0,
+      lastBacktestSummary: state.lastBacktestSummary || null,
       updatedAt: Date.now()
     }, { merge: true });
 
@@ -716,6 +770,17 @@ export async function runTick({ db, tdKey, fredKey, avKey, now }) {
         newsAvailable: !!news.available, newsScore: news.score || 0
       },
       macroSkipped,
+      timeframeHealth: {
+        '5m': { count: fiveR.value.length, candleTime: fiveR.value.at(-1)?.time || null, fetchedAt: fiveR.fetchedAt || null },
+        '15m': { count: ltf.length, candleTime: ltf.at(-1)?.time || null },
+        '30m': { count: thirtyR.value.length, candleTime: thirtyR.value.at(-1)?.time || null, fetchedAt: thirtyR.fetchedAt || null },
+        '1H': { count: mtfR.value.length, candleTime: mtfR.value.at(-1)?.time || null },
+        '4H': { count: htfR.value.length, candleTime: htfR.value.at(-1)?.time || null },
+        '8H': { count: eightHour.length, candleTime: eightHour.at(-1)?.time || null, derivedFrom: '1H' },
+        'Daily': { count: dayR.value.length, candleTime: dayR.value.at(-1)?.time || null },
+        'Weekly': { count: wkR.value.length, candleTime: wkR.value.at(-1)?.time || null }
+      },
+      lastBacktestSummary: state.lastBacktestSummary || null,
       openSignals: state.signalLog.filter(s => s.status === 'pending' || s.status === 'open').length,
       totalLogged: state.learningState.totalLogged || 0,
       durationMs: Date.now() - started
