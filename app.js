@@ -1740,6 +1740,21 @@ function refreshAll() {
   renderMarketClock();
   if (typeof renderPaper === 'function' && paper && paper.positions.length) renderPaper();
   if (dataMode !== 'live' || !apiKey || !activeProvider || !liveData.length) {
+    // Clear the last valid analysis too. Otherwise a failed disconnect could
+    // leave a stale BUY/SELL visible and the Generate button could reuse it.
+    lastComposite = null;
+    lastPlan = null;
+    const dir = document.getElementById('dirDisplay');
+    if (dir) { dir.className = 'dir hold'; dir.textContent = '⏸ HOLD'; }
+    const confidence = document.getElementById('confidenceLabel');
+    if (confidence) confidence.textContent = 'No verified data';
+    ['sEntry','sSl','sTp','sRr','sEntryType','sSlPips','sTpPips'].forEach(id => {
+      const el = document.getElementById(id); if (el) el.textContent = '—';
+    });
+    const reason = document.getElementById('sReason');
+    if (reason) reason.textContent = 'Analysis paused until a valid market-data API connection is available.';
+    const factorTable = document.getElementById('factorTable');
+    if (factorTable) factorTable.innerHTML = '';
     const label = document.getElementById('modeLabel');
     if (label) label.textContent = 'API disconnected — analysis paused';
     const price = document.getElementById('livePrice');
