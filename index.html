@@ -638,7 +638,7 @@ canvas { width:100%; background:#12151c; border-radius:12px; border:1px solid #1
       &nbsp;&nbsp;• <code>ALPHAVANTAGE_API_KEY</code> — optional, powers news sentiment<br>
       &nbsp;&nbsp;• <code>FIREBASE_SERVICE_ACCOUNT</code> — base64 of the service account JSON from Firebase Console → Project Settings → Service Accounts → Generate new private key<br>
       2. Firestore Rules — add a public-read rule for the <code>system</code> collection (see README.md).<br>
-      3. Point a free scheduler (e.g. cron-job.org) at <code>https://your-app.vercel.app/api/tick?secret=YOUR_TICK_SECRET</code> every 5–15 minutes. Vercel's free-tier cron only fires once a day; <code>vercel.json</code> registers that daily run as a safety net, but an external scheduler is what actually gets you minute-scale background operation.
+      3. The dashboard cannot run code while a browser tab is closed or the phone is locked. For unattended operation, configure the server scheduler: <code>vercel.json</code> requests a 5-minute cron for <code>/api/tick</code>; confirm your Vercel plan supports that frequency. If deployment rejects the schedule, use an external scheduler (e.g. cron-job.org) every 5–15 minutes with <code>https://your-app.vercel.app/api/tick?secret=YOUR_TICK_SECRET</code>. Hourly backtesting runs inside the server worker when that worker is invoked and has enough real candles.
     </div>
     <div id="bgTickStatus" style="font-size:11px;color:#5c6270;margin-bottom:8px;">Not configured yet, or no tick has landed — see setup above.</div>
     <div id="bgTickDetail"></div>
