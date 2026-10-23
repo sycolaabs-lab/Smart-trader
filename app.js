@@ -1049,7 +1049,7 @@ function validateCandleSeries(candles, interval, label) {
   }
   const age = Date.now() - candles[candles.length - 1].time;
   const allowedAge = Math.max(stepMs * 4, interval === '1day' ? 72 * 3600000 : interval === '1week' ? 12 * 86400000 : 0);
-  if (age > allowedAge) throw new Error((label || 'Provider') + ' latest candle is stale (' + Math.round(age / 60000) + ' minutes old)');
+  if (age > allowedAge && isMarketOpen(Date.now())) throw new Error((label || 'Provider') + ' latest candle is stale (' + Math.round(age / 60000) + ' minutes old)');
   return candles;
 }
 
