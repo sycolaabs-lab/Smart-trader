@@ -811,8 +811,10 @@ if (fbReady) {
       const healthRows = Object.keys(d.dataHealth || {}).map(k => {
         const h = d.dataHealth[k] || {};
         const age = Number.isFinite(Number(h.ageMinutes)) ? Math.max(0, Number(h.ageMinutes)) + 'm old' : 'age unknown';
-        const stale = Number.isFinite(Number(h.ageMinutes)) && Number(h.ageMinutes) > (k === '5m' ? 20 : k === '15m' ? 45 : k === '30m' ? 90 : k === '1H' ? 180 : k === '4H' ? 600 : k === '8H' ? 1200 : k === 'Daily' ? 4320 : 17280);
-        return '<div class="zone-item"><span>' + k + ' <span style="color:#454a56;">' + age + ' · ' + (h.count || 0) + ' bars</span></span><span class="mono" style="color:' + (stale ? '#ef4d5f' : '#3ecf8e') + ';">' + (stale ? 'STALE' : 'received') + '</span></div>';
+        const stale = h.stale === true || !Number.isFinite(Number(h.ageMinutes)) || Number(h.ageMinutes) > (k === '5m' ? 20 : k === '15m' ? 45 : k === '30m' ? 90 : k === '1H' ? 180 : k === '4H' ? 600 : k === '8H' ? 1200 : k === 'Daily' ? 4320 : 17280);
+        const issues = (h.invalidCandles || 0) + ' invalid · ' + (h.gapCount || 0) + ' gaps · ' + (h.largeJumps || 0) + ' large jumps';
+        const issueColour = (h.invalidCandles || 0) || (h.gapCount || 0) || (h.largeJumps || 0) ? '#ffa726' : '#454a56';
+        return '<div class="zone-item"><span>' + k + ' <span style="color:#454a56;">' + age + ' · ' + (h.count || 0) + ' valid bars</span><div style="font-size:9px;color:' + issueColour + ';">' + issues + '</div></span><span class="mono" style="color:' + (stale ? '#ef4d5f' : '#3ecf8e') + ';">' + (stale ? 'STALE' : 'fresh') + '</span></div>';
       }).join('');
       detailEl.innerHTML = '<div class="zone-item"><span>' + d.direction + ' <span style="color:#454a56;">(' + d.confidence + '%, full engine — structure + macro + meta-labeler)</span></span><span class="mono ' + dirCls + '">$' + fmt(d.price) + '</span></div>'
         + (d.direction !== 'HOLD' ? '<div class="zone-item"><span>Entry / SL / TP</span><span class="mono">$' + fmt(d.entry) + ' / $' + fmt(d.sl) + ' / $' + fmt(d.tp) + '</span></div>' : '')
