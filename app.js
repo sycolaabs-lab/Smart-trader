@@ -137,13 +137,38 @@ document.getElementById('autoTuneBtn').addEventListener('click', () => {
   refreshAll(); renderLearningTable();
 });
 document.getElementById('resetLearning').addEventListener('click', async () => {
-  learningState = { factors: {}, patterns: {}, totalLogged: 0, metaExamples: [], metaModel: null };
-  Object.keys(FACTOR_LABELS).forEach(k => { learningState.factors[k] = { votes: 0, wins: 0 }; });
-  setMetaModel(null);
+  // Rebuild the active model from the retained signal/shadow ledgers. Resetting
+  // learning must not erase the evidence the system already paid to collect.
+  const rebuilt = { factors: {}, patterns: {}, totalLogged: 0, metaExamples: [], metaBacktestExamples: learningState.metaBacktestExamples || [], metaModel: null };
+  Object.keys(FACTOR_LABELS).forEach(k => { rebuilt.factors[k] = { votes: 0, wins: 0 }; });
+  const seen = new Set();
+  const accumulate = sig => {
+    if (!sig || seen.has(sig.id) || (sig.status !== 'won' && sig.status !== 'lost')) return;
+    seen.add(sig.id);
+    const won = sig.status === 'won', dirSign = sig.dir === 'BUY' ? 1 : -1;
+    Object.keys(FACTOR_LABELS).forEach(k => {
+      const v = sig.factors && sig.factors[k];
+      if (v && Math.sign(v) === dirSign) { rebuilt.factors[k].votes++; if (won) rebuilt.factors[k].wins++; }
+    });
+    const signature = patternSignature(sig.dir, sig.factors || {});
+    if (!rebuilt.patterns[signature]) rebuilt.patterns[signature] = { votes: 0, wins: 0 };
+    rebuilt.patterns[signature].votes++;
+    if (won) rebuilt.patterns[signature].wins++;
+    rebuilt.totalLogged++;
+    if (sig.qualityFeatures) rebuilt.metaExamples.push({ features: sig.qualityFeatures, label: won ? 1 : -1 });
+  };
+  signalLog.forEach(accumulate);
+  shadowLog.forEach(accumulate);
+  rebuilt.metaExamples = thinExamples(rebuilt.metaExamples, META_LIMITS.liveSoftLimit);
+  learningState = rebuilt;
+  retrainMetaLabeler();
   await saveLearningState();
   renderLearningTable();
   renderPatternTable();
   applyKnowledgeBaseWeights();
+  renderDataInventory();
+  const status = document.getElementById('learningStatus');
+  if (status) status.textContent = 'Rebuilt from retained resolved signal and declined-setup history. Raw logs and backtest examples were preserved.';
 });
 // NOTE: startup restore of learning state deliberately does NOT happen here.
 // loadLearningState() calls renderLearningTable() -> getWeights(), which reads the
@@ -3055,8 +3080,7 @@ function renderPaper() {
   if (resting.length) {
     html += '<div style="font-size:10px;color:#454a56;margin:10px 0 6px;">Awaiting entry (no exposure yet)</div>';
     html += resting.map(p =>
-      '<div class="zone-item"><span><span class="dirtag ' + p.dir + '">' + p.dir + '</span> ' + lotLabel(p) + ' limit @ $' + fmt(p.requestedEntry)
-      + '</span><span class="mono" style="color:#5c6270;">not filled</span></div>').join('');
+      '<div class="zone-item"><span><span class="dirtag ' + p.dir + '">' + p.dir + '</span> ' + lotLabel(p) + ' limit @ 
   }
 
   const open = paper.positions.filter(p => p.status === 'open' && inEra(p));
@@ -3064,8 +3088,13126 @@ function renderPaper() {
     html += '<div style="font-size:10px;color:#454a56;margin:10px 0 6px;">Open positions</div>';
     html += open.map(p => {
       const u = unrealisedPnl(p, price);
-      return '<div class="zone-item"><span><span class="dirtag ' + p.dir + '">' + p.dir + '</span> ' + lotLabel(p) + ' @ $' + fmt(p.entryFill) + '</span>'
-        + '<span class="mono ' + pnlCls(u) + '">' + money(u) + '</span></div>';
+      return '<div class="zone-item" style="align-items:flex-start;"><span><span class="dirtag ' + p.dir + '">' + p.dir + '</span> ' + lotLabel(p)
+        + ' · entry 
+  }
+
+  const closed = paper.positions.filter(p => p.status === 'closed' && inEra(p)).slice(0, 8);
+  if (closed.length) {
+    html += '<div style="font-size:10px;color:#454a56;margin:10px 0 6px;">Recent closed</div>';
+    html += closed.map(p =>
+      '<div class="zone-item"><span><span class="dirtag ' + p.dir + '">' + p.dir + '</span> ' + (p.outcome === 'won' ? (p.partial ? '◐' : '✓') : p.outcome === 'lost' ? '✗' : '–')
+      + ' <span style="color:#454a56;">' + lotLabel(p) + ' · exit $' + fmt(p.exitPrice) + '</span></span>'
+      + '<span class="mono ' + pnlCls(p.pnl) + '">' + money(p.pnl) + (p.rMultiple != null ? ' <span style="color:#454a56;">' + (p.rMultiple >= 0 ? '+' : '') + fmt(p.rMultiple) + 'R</span>' : '') + '</span></div>'
+    ).join('');
+  }
+
+  if (!resting.length && !open.length && !closed.length) {
+    html += '<div class="zone-empty">' + (a.archivedCount
+      ? 'Account reset — no trades in this era yet. The record above is intact.'
+      : 'No paper trades yet. Positions open automatically as the engine logs signals.') + '</div>';
+  }
+  root.innerHTML = html;
+}
+
+// Paper-trade controls: manual close/cancel and stop-loss adjustment. These
+// update both the paper ledger and its signal so candle resolution uses the
+// user-adjusted stop rather than silently reverting to the original level.
+document.getElementById('paperContent').addEventListener('click', async event => {
+  const button = event.target.closest('[data-paper-action]');
+  if (!button) return;
+  const position = paper.positions.find(p => p.id === button.dataset.paperId);
+  if (!position || (position.status !== 'open' && position.status !== 'pending')) return;
+  const price = currentMarkPrice();
+  if (button.dataset.paperAction === 'edit-sl') {
+    const raw = window.prompt('New stop-loss price for ' + position.dir + ' (current SL 
+  const note = document.getElementById('paperStatus');
+  if (!note) return;
+  if (!paper.enabled) { note.textContent = 'Off — no positions will be opened.'; return; }
+  note.textContent = paper.manual
+    ? 'On — new signals will open simulated positions. No real orders are placed.'
+    : 'On for the engine\'s own signals. Signals you generate by hand are excluded (signal panel).';
+}
+
+document.getElementById('paperEnabled').addEventListener('change', function () {
+  paper.enabled = this.checked;
+  savePaper();
+  renderPaper();
+  renderPaperStatusNote();
+  renderPaperManualHint();
+});
+
+const paperManualCb = document.getElementById('paperManual');
+if (paperManualCb) paperManualCb.addEventListener('change', function () {
+  paper.manual = this.checked;
+  // Ticking it with the account off is a request to paper-trade, so honour it
+  // rather than silently doing nothing.
+  if (paper.manual && !paper.enabled) {
+    paper.enabled = true;
+    const master = document.getElementById('paperEnabled');
+    if (master) master.checked = true;
+  }
+  savePaper();
+  renderPaper();
+  renderPaperStatusNote();
+  renderPaperManualHint();
+});
+document.getElementById('paperAdvancedToggle').addEventListener('click', () => {
+  document.getElementById('paperAdvanced').classList.toggle('hidden');
+});
+['pStartBalance', 'pRiskPct', 'pSpread', 'pSlippage', 'pMaxPos', 'pPartialPct', 'pHoldMeta', 'pPartialEnabled'].forEach(id => {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener('change', () => { paper.startingBalance = paperConfig().startingBalance; savePaper(); renderPaper(); });
+});
+document.getElementById('paperReset').addEventListener('click', async () => {
+  const price = currentMarkPrice();
+  const live = paper.positions.filter(p => p.status === 'open' || p.status === 'pending').length;
+  const keeping = paper.positions.filter(p => p.status === 'closed').length;
+  const msg = 'Reset the paper account back to $' + fmt(paperConfig().startingBalance) + '?\n\n'
+    + (live ? live + ' live position(s) will be closed at the current price first.\n' : '')
+    + keeping + ' completed trade(s) stay on record — they are what the system learns from, '
+    + 'and they keep counting towards the lifetime win rate. They just stop counting towards the balance.';
+  if (!window.confirm(msg)) return;
+  const out = resetPaperAccount(paper.positions, isFinite(price) ? price : undefined, Date.now());
+  paper.positions = out.positions;
+  paper.epoch = out.epoch;
+  await savePaper();
+  renderPaper();
+  renderDataInventory();
+});
+
+// ============================================================
+// ANALYSIS QUALITY PANEL
+// ------------------------------------------------------------
+// Renders the three self-audits. Every number here is deliberately allowed to
+// say "not enough data yet" rather than show a confident-looking figure built
+// on four trades — a reassuring number from a tiny sample is worse than no
+// number, because it gets believed.
+// ============================================================
+function fmtR(v) { return v == null ? '—' : (v >= 0 ? '+' : '') + v.toFixed(2) + 'R'; }
+function fmtPct(v) { return v == null ? '—' : (v * 100).toFixed(0) + '%'; }
+function rClass(v) { return v == null ? 'fneu' : v > 0.05 ? 'fpos' : v < -0.05 ? 'fneg' : 'fneu'; }
+
+function renderAnalysisQuality() {
+  const root = document.getElementById('qualityContent');
+  if (!root) return;
+
+  const cal = computeCalibration(signalLog);
+  const bd = computeConditionBreakdown(signalLog);
+  const audit = computeGateAudit(signalLog, shadowLog);
+
+  const rows = (list, label) => {
+    const usable = list.filter(r => r.n >= 3);
+    if (!usable.length) return '<div class="zone-empty">' + label + ': not enough resolved trades yet (need 3+ per group).</div>';
+    return usable.map(r =>
+      '<div class="zone-item"><span>' + r.key + ' <span style="color:#454a56;">(' + r.n + ')</span></span>' +
+      '<span class="mono ' + rClass(r.expectancyR) + '">' + fmtR(r.expectancyR) + ' · ' + fmtPct(r.winRate) + '</span></div>'
+    ).join('');
+  };
+
+  const o = bd.overall;
+  let html = '';
+
+  html += '<div class="data-source-note" style="margin-bottom:8px;">Expectancy is shown in R — average profit per unit risked. At a 1:4 target a 30% win rate is already profitable, so win rate alone is a poor scorecard and R is the honest one.</div>';
+
+  html += '<div class="metrics" style="margin-bottom:10px;">'
+    + '<div class="card"><div class="label">Resolved</div><div class="value mono">' + o.n + '</div></div>'
+    + '<div class="card"><div class="label">Win Rate</div><div class="value mono">' + fmtPct(o.winRate) + '</div></div>'
+    + '<div class="card"><div class="label">Expectancy</div><div class="value mono ' + rClass(o.expectancyR) + '">' + fmtR(o.expectancyR) + '</div></div>'
+    + '<div class="card"><div class="label">Total</div><div class="value mono ' + rClass(o.totalR) + '">' + fmtR(o.totalR) + '</div></div>'
+    + '</div>';
+
+  // 1. Is the confidence number worth anything?
+  html += '<div class="panel-title" style="font-size:11px;margin-top:12px;">Is the confidence score meaningful?</div>';
+  html += '<div class="event-line" style="border-left-color:#e8c37a;">' + cal.verdict + '</div>';
+  if (cal.discrimination != null) {
+    html += '<div class="zone-item"><span>High-confidence half vs low-confidence half</span><span class="mono ' + rClass(cal.discrimination) + '">'
+      + (cal.discrimination >= 0 ? '+' : '') + (cal.discrimination * 100).toFixed(0) + ' pp win rate</span></div>';
+  }
+  if (cal.buckets.length) {
+    html += '<table class="factor-table"><tr><th style="text-align:left;color:#5c6270;font-weight:500;">Confidence band</th><th style="color:#5c6270;font-weight:500;">Win rate</th><th style="color:#5c6270;font-weight:500;">Expectancy</th></tr>';
+    html += cal.buckets.map(b =>
+      '<tr><td>' + b.lo + '–' + b.hi + '% <span style="color:#454a56;">(' + b.n + ')</span></td>'
+      + '<td>' + fmtPct(b.winRate) + '</td>'
+      + '<td class="' + rClass(b.expectancyR) + '">' + fmtR(b.expectancyR) + '</td></tr>').join('');
+    html += '</table>';
+  }
+
+  // 2. Where does the edge actually live?
+  html += '<div class="panel-title" style="font-size:11px;margin-top:14px;">Where the edge actually lives</div>';
+  html += '<div style="font-size:10px;color:#454a56;margin-bottom:6px;">By session</div>' + rows(bd.bySession, 'Session');
+  html += '<div style="font-size:10px;color:#454a56;margin:8px 0 6px;">By market regime</div>' + rows(bd.byRegime, 'Regime');
+  html += '<div style="font-size:10px;color:#454a56;margin:8px 0 6px;">By grade</div>' + rows(bd.byGrade, 'Grade');
+  html += '<div style="font-size:10px;color:#454a56;margin:8px 0 6px;">By direction</div>' + rows(bd.byDirection, 'Direction');
+
+  // 3. The roads not taken.
+  html += '<div class="panel-title" style="font-size:11px;margin-top:14px;">The setups it turned down</div>';
+  html += '<div class="data-source-note" style="margin-bottom:6px;">Every setup the filter rejected is tracked and resolved against real price anyway. This is the comparison a human journal can never make, because nobody records their non-trades.</div>';
+  html += '<div class="zone-item"><span>Taken</span><span class="mono ' + rClass(audit.taken.expectancyR) + '">'
+    + fmtR(audit.taken.expectancyR) + ' <span style="color:#454a56;">(' + audit.taken.n + ')</span></span></div>';
+  html += '<div class="zone-item"><span>Declined</span><span class="mono ' + rClass(audit.declined.expectancyR) + '">'
+    + fmtR(audit.declined.expectancyR) + ' <span style="color:#454a56;">(' + audit.declined.n + ')</span></span></div>';
+  const pending = shadowLog.filter(s => s.status === 'pending' || s.status === 'open').length;
+  if (pending) html += '<div class="zone-item"><span>Declined, still running</span><span class="mono">' + pending + '</span></div>';
+  html += '<div class="event-line" style="border-left-color:#c99bff;margin-top:6px;">' + audit.verdict + '</div>';
+
+  root.innerHTML = html;
+}
+document.getElementById('resetQuality').addEventListener('click', async () => {
+  shadowLog = [];
+  await saveShadowLog();
+  renderAnalysisQuality();
+});
+
+// ============================================================
+// AUTONOMOUS MODE
+// ------------------------------------------------------------
+// The unattended operator. Once the user ticks the box, a single heartbeat
+// drives everything: fetch fresh candles, grade any signal that has since hit
+// its stop or target, re-analyse, commit a new signal if the gate clears, and
+// periodically re-backtest and retrain on the record it has built.
+//
+// Three things make this survive real-world conditions rather than only a tab
+// left open on a desk:
+//   * One 60s heartbeat with due-time checks, not a pile of setIntervals. A
+//     laptop that sleeps for six hours wakes up, sees every task is overdue,
+//     and runs them once — rather than firing a backlog of missed timers.
+//   * Losing the connection is expected, not exceptional. Offline is a quiet
+//     pause; repeated failures back off exponentially instead of hammering a
+//     rate-limited provider until the key is blocked.
+//   * Time with the tab closed is recovered, not lost. catchUp() replays the
+//     gap from real candle history on the next load, so signals that resolved
+//     while nobody was watching still become training data.
+// ============================================================
+
+const AUTONOMY_KEY = 'smc-autonomy-v1';
+const AUTONOMY_HEARTBEAT_MS = 60 * 1000;
+
+let autonomyHandle = null;
+let autonomyBusy = false;
+
+function autonomyConfig() {
+  const num = (id, fallback) => {
+    const el = document.getElementById(id);
+    const v = el ? parseFloat(el.value) : NaN;
+    return isFinite(v) ? v : fallback;
+  };
+  return Object.assign({}, AUTONOMY_DEFAULTS, {
+    minConfidence: num('aMinConf', AUTONOMY_DEFAULTS.minConfidence),
+    cooldownMinutes: num('aCooldown', AUTONOMY_DEFAULTS.cooldownMinutes),
+    maxOpenSignals: num('aMaxOpen', AUTONOMY_DEFAULTS.maxOpenSignals),
+    analysisIntervalMinutes: num('aInterval', AUTONOMY_DEFAULTS.analysisIntervalMinutes),
+    backtestIntervalHours: num('aBtHours', AUTONOMY_DEFAULTS.backtestIntervalHours),
+    minMetaScore: num('aMinMeta', AUTONOMY_DEFAULTS.minMetaScore),
+    // Kill switch. 0 in any field disables that arm rather than expiring
+    // everything instantly, which is what a 0 limit would otherwise mean.
+    maxHoursToFill: num('aKillFill', AUTONOMY_DEFAULTS.maxHoursToFill),
+    maxHoursOpen: num('aKillOpen', AUTONOMY_DEFAULTS.maxHoursOpen),
+    maxDriftRToFill: num('aKillDrift', AUTONOMY_DEFAULTS.maxDriftRToFill),
+    partialTP: partialTPConfig(),
+    newsState: currentNewsState(),
+    gradeFloor: (document.getElementById('aMinGrade') || {}).value || AUTONOMY_DEFAULTS.gradeFloor
+  });
+}
+
+function saveAutonomyState() {
+  try {
+    localStorage.setItem(AUTONOMY_KEY, JSON.stringify({
+      enabled: autonomy.enabled,
+      cycles: autonomy.cycles,
+      gateTally: autonomy.gateTally,
+      signalsTaken: autonomy.signalsTaken,
+      autoResolved: autonomy.autoResolved,
+      lastAnalysisAt: autonomy.lastAnalysisAt,
+      lastBacktestAt: autonomy.lastBacktestAt,
+      lastSignalAt: autonomy.lastSignalAt,
+      cfg: {
+        aMinConf: document.getElementById('aMinConf').value,
+        aCooldown: document.getElementById('aCooldown').value,
+        aKillFill: document.getElementById('aKillFill').value,
+        aKillOpen: document.getElementById('aKillOpen').value,
+        aKillDrift: document.getElementById('aKillDrift').value,
+        aMaxOpen: document.getElementById('aMaxOpen').value,
+        aInterval: document.getElementById('aInterval').value,
+        aBtHours: document.getElementById('aBtHours').value,
+        aMinMeta: document.getElementById('aMinMeta').value,
+        aDailyCap: document.getElementById('aDailyCap').value,
+        aMinGrade: document.getElementById('aMinGrade').value
+      }
+    }));
+  } catch (e) { /* storage unavailable — autonomy still works, it just won't remember across reloads */ }
+}
+
+function loadAutonomyState() {
+  try {
+    const raw = localStorage.getItem(AUTONOMY_KEY);
+    if (!raw) return;
+    const saved = JSON.parse(raw);
+    Object.assign(autonomy, {
+      enabled: !!saved.enabled,
+      cycles: saved.cycles || 0,
+      gateTally: saved.gateTally || {},
+      signalsTaken: saved.signalsTaken || 0,
+      autoResolved: saved.autoResolved || 0,
+      lastAnalysisAt: saved.lastAnalysisAt || null,
+      lastBacktestAt: saved.lastBacktestAt || null,
+      lastSignalAt: saved.lastSignalAt || null
+    });
+    if (saved.cfg) {
+      Object.keys(saved.cfg).forEach(id => {
+        const el = document.getElementById(id);
+        if (el && saved.cfg[id] != null) el.value = saved.cfg[id];
+      });
+    }
+    document.getElementById('autonomyEnabled').checked = autonomy.enabled;
+  } catch (e) { /* nothing saved yet */ }
+}
+
+function setAutonomyStatus(text, tone, reason) {
+  const dot = document.getElementById('autonomyDot');
+  const status = document.getElementById('autonomyStatus');
+  const reasonEl = document.getElementById('autonomyReason');
+  if (!status) return;
+  status.textContent = text;
+  const colours = { live: '#3ecf8e', warn: '#ffa726', error: '#ef4d5f', idle: '#454a56' };
+  const c = colours[tone] || colours.idle;
+  dot.style.background = c;
+  dot.style.boxShadow = tone === 'live' ? '0 0 7px ' + c : 'none';
+  status.style.color = tone === 'idle' ? '#9298a5' : c;
+  if (reason !== undefined) reasonEl.textContent = reason || '';
+}
+
+function renderAutonomyStats() {
+  const live = signalLog.filter(s => s.status === 'pending' || s.status === 'open');
+  document.getElementById('aCycles').textContent = autonomy.cycles;
+  document.getElementById('aSignals').textContent = autonomy.signalsTaken;
+  document.getElementById('aResolved').textContent = autonomy.autoResolved;
+  document.getElementById('aOpen').textContent = live.length;
+
+  const killedEl = document.getElementById('aKilled');
+  if (killedEl) killedEl.textContent = signalLog.filter(s => s.status === 'expired').length;
+
+  // How long the oldest live trade has been sitting. This is the number that
+  // was invisible before: an order resting for a day looked identical to one
+  // placed a minute ago.
+  const oldestEl = document.getElementById('aOldest');
+  if (oldestEl) {
+    const cfg = autonomyConfig();
+    // Each trade is aged against the limit that actually applies to it: a
+    // resting order against the fill limit, a filled one against the hold
+    // limit. Using the larger of the two would leave an order 2.5x past its own
+    // deadline showing no warning at all.
+    const ages = live.map(s => {
+      const filled = s.status === 'open';
+      const t = Date.parse(filled ? (s.filledAt || s.time) : s.time);
+      if (!isFinite(t)) return null;
+      const hours = (Date.now() - t) / 3600000;
+      const limit = filled ? cfg.maxHoursOpen : cfg.maxHoursToFill;
+      return { hours, ratio: limit > 0 ? hours / limit : 0 };
+    }).filter(v => v != null);
+    if (!ages.length) {
+      oldestEl.textContent = '—';
+      oldestEl.style.color = '';
+    } else {
+      const worst = ages.reduce((a, b) => b.hours > a.hours ? b : a, ages[0]);
+      const closest = ages.reduce((a, b) => b.ratio > a.ratio ? b : a, ages[0]);
+      oldestEl.textContent = worst.hours < 1 ? Math.round(worst.hours * 60) + 'm' : worst.hours.toFixed(1) + 'h';
+      // Amber as a trade approaches its own kill limit, red once past it, so
+      // one about to be culled is visible before it disappears.
+      oldestEl.style.color = closest.ratio >= 1 ? '#ef4d5f' : closest.ratio >= 0.75 ? '#ffa726' : '';
+    }
+  }
+
+  const el = document.getElementById('gateTally');
+  if (!el) return;
+  const entries = Object.keys(autonomy.gateTally || {})
+    .map(k => ({ code: k, n: autonomy.gateTally[k] }))
+    .sort((a, b) => b.n - a.n);
+  if (!entries.length) { el.innerHTML = ''; return; }
+  el.innerHTML = '<div style="font-size:10px;color:#454a56;margin:8px 0 4px;">Why cycles ended this way</div>'
+    + entries.map(e => '<div class="zone-item" style="padding:3px 0;"><span style="font-size:11px;">'
+        + (GATE_LABELS[e.code] || e.code) + '</span><span class="mono" style="font-size:11px;color:'
+        + (e.code === 'taken' ? '#3ecf8e' : '#5c6270') + ';">' + e.n + '</span></div>').join('');
+}
+
+// Grade every unresolved signal against `candles`. Used both by the heartbeat
+// (fresh candles each cycle) and by catchUp() (deep history after downtime).
+// Returns how many signals reached a win/loss verdict.
+function resolveOpenSignals(candles, cfg) {
+  if (!candles || candles.length < 2) return 0;
+  let resolved = 0, killed = 0, changed = false;
+
+  // The auditor decides which live trades are past saving, not the engine.
+  // Letting the engine judge whether its own trade has gone bad is the thing
+  // the auditor exists to avoid — and it re-derives fill state from raw candles
+  // rather than trusting the signal's own status, so a "pending" order price
+  // actually traded through is caught rather than aged as if it never filled.
+  const tradeAudit = auditOpenTrades(signalLog, candles, {
+    maxHoursToFill: cfg.maxHoursToFill,
+    maxHoursOpen: cfg.maxHoursOpen,
+    maxDriftRToFill: cfg.maxDriftRToFill
+  });
+  lastTradeAudit = tradeAudit;
+  const killedBy = new Map(tradeAudit.kills.map(k => [k.id, k]));
+
+  signalLog.forEach(sig => {
+    if (sig.status !== 'pending' && sig.status !== 'open') return;
+    // An auditor kill outranks whatever the resolver would have said, EXCEPT
+    // when price has already settled the trade: a stop or target that has
+    // genuinely been hit is a real outcome and real evidence, and discarding it
+    // to enforce a time limit would throw away the data the limit exists to
+    // protect.
+    const verdict = resolveSignal(sig, candles, cfg);
+    const kill = killedBy.get(sig.id);
+    if (kill && verdict.status !== 'won' && verdict.status !== 'lost') {
+      sig.status = 'expired';
+      sig.expiryReason = 'auditor: ' + kill.reason;
+      sig.killSwitch = kill.code;
+      sig.resolvedAt = new Date().toISOString();
+      sig.resolvedBy = 'auditor';
+      paperCloseForSignal(sig.id, 'expired');
+      killed++; changed = true;
+      return;
+    }
+    if (verdict.status === 'won' || verdict.status === 'lost') {
+      if (applySignalOutcome(sig, verdict.status === 'won', {
+        auto: true, exitPrice: verdict.exitPrice, ambiguousBar: verdict.ambiguousBar, partial: verdict.partial
+      })) { resolved++; changed = true; }
+    } else if (verdict.status === 'expired') {
+      sig.status = 'expired';
+      sig.expiryReason = verdict.reason || null;
+      sig.killSwitch = verdict.killSwitch || null;
+      sig.resolvedAt = new Date().toISOString();
+      sig.resolvedBy = 'auto';
+      paperCloseForSignal(sig.id, 'expired');
+      if (verdict.killSwitch) killed++;
+      changed = true; // expired signals never become training data — no outcome to learn from
+    } else if (verdict.status === 'open' && sig.status === 'pending') {
+      sig.status = 'open'; // limit entry got tagged; it's a live position now
+      sig.filledAt = new Date().toISOString();
+      paperFillForSignal(sig.id, sig.filledAt);
+      changed = true;
+    }
+  });
+  if (changed) { saveSignalLog(); renderSignalLog(); }
+  if (resolved) autonomy.autoResolved += resolved;
+  if (killed) autonomy.killed = (autonomy.killed || 0) + killed;
+  resolveShadowSignals(candles, cfg);
+  return resolved;
+}
+
+// Shadows get the same treatment, minus the learning updates — a setup the
+// engine declined should inform the audit, not train the weights as though it
+// had been traded.
+function resolveShadowSignals(candles, cfg) {
+  if (!candles || candles.length < 2 || !shadowLog.length) return;
+  let changed = false;
+  shadowLog.forEach(sig => {
+    if (sig.status !== 'pending' && sig.status !== 'open') return;
+    const verdict = resolveSignal(sig, candles, cfg);
+    if (verdict.status === 'won' || verdict.status === 'lost') {
+      sig.status = verdict.status;
+      sig.resolvedAt = new Date().toISOString();
+      changed = true;
+    } else if (verdict.status === 'expired') {
+      sig.status = 'expired'; sig.expiryReason = verdict.reason || null; changed = true;
+    } else if (verdict.status === 'open' && sig.status === 'pending') {
+      sig.status = 'open'; changed = true;
+    }
+  });
+  if (changed) { saveShadowLog(); renderAnalysisQuality(); }
+}
+
+// One unattended pass. Everything that can fail is inside the caller's try.
+async function autonomyCycle() {
+  const cfg = autonomyConfig();
+  const now = Date.now();
+
+  // 0. Calendar first. It gates whether a signal may be taken at all, so it has
+  // to be current BEFORE the gate reads it — refreshing at the end of the cycle
+  // meant the first pass after a reconnect ran against an empty calendar and
+  // could take a position straight into a release window.
+  await refreshCalendar(false);
+
+  // 1. Fresh candles. resyncCandles() already refreshes liveData from the provider.
+  await resyncCandles();
+
+  // 2. Grade what the market has already decided since the last pass.
+  const graded = resolveOpenSignals(liveData, cfg);
+
+  // 3. Re-analyse on the new data.
+  refreshAll();
+  autonomy.lastAnalysisAt = now;
+
+  // 4. Commit a signal only if the gate clears.
+  let reason;
+  if (lastComposite) {
+    const plan = buildTradePlan(lastComposite, getTargetRR());
+    // The auditor is advisory everywhere except here. A critical finding means
+    // the analysis contradicts itself or the data it was built on — that is not
+    // a risk preference, and no confidence score should be able to override it.
+    const audit = runAudit();
+    renderAudit();
+    let gate;
+    if (audit && audit.blocking) {
+      gate = { take: false, code: 'audit',
+        reason: 'independent audit found ' + audit.critical + ' critical issue(s): ' + audit.findings[0].title };
+    } else {
+      gate = autonomyGate(lastComposite, plan, signalLog, autonomy.lastSignalAt, cfg);
+    }
+    // Tally why each cycle ended as it did. One latest-reason line cannot show
+    // whether 13 quiet cycles mean "no setup existed" or "the filter blocked
+    // every one" — and those need opposite responses.
+    const code = gate.code || 'unknown';
+    autonomy.gateTally[code] = (autonomy.gateTally[code] || 0) + 1;
+    if (gate.take) {
+      updateSignalUI(lastComposite, plan, true, 'auto'); // logIt = true -> addSignalToLog
+      autonomy.signalsTaken++;
+      autonomy.lastSignalAt = now;
+      reason = 'Took a ' + lastComposite.direction + ' at $' + fmt(plan.entry) +
+               ' (' + lastComposite.confidence + '% confidence' + (gate.grade ? ', grade ' + gate.grade : '') + ').';
+    } else {
+      updateSignalUI(lastComposite, plan, false); // keep the panel current without logging
+      // Track what was passed on, so the filter can be audited later rather
+      // than trusted forever.
+      addShadowSignal(lastComposite, plan, gate.reason);
+      reason = 'No signal taken — ' + gate.reason + '.';
+    }
+  } else {
+    reason = 'Analysis produced no result this cycle.';
+  }
+  if (graded) reason = 'Self-graded ' + graded + ' signal' + (graded === 1 ? '' : 's') + '. ' + reason;
+  autonomy.lastReason = reason;
+
+  // 5. Periodic re-backtest / retrain on the accumulated record.
+  const btDue = !autonomy.lastBacktestAt || (now - autonomy.lastBacktestAt) >= cfg.backtestIntervalHours * 3600 * 1000;
+  if (btDue) {
+    autonomy.lastBacktestAt = now;
+    await runBacktestCycle(true);
+  }
+
+  renderAnalysisQuality();
+  renderDataInventory();
+  renderCalendar();
+  renderReasoning();
+  runAudit();
+  renderAudit();
+  autonomy.cycles++;
+  autonomy.consecutiveErrors = 0;
+  autonomy.lastError = null;
+  saveAutonomyState();
+  renderAutonomyStats();
+  if (candlesStaleForBudget) {
+    setAutonomyStatus('Running on cached candles — daily API budget spent, resumes 00:00 UTC.', 'warn',
+      'Still grading open signals and re-analysing, but on the last candles fetched rather than fresh ones. ' + reason);
+  } else {
+    setAutonomyStatus('Running autonomously — last pass ' + new Date(now).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) + '.', 'live', reason);
+  }
+}
+
+// The heartbeat: decides whether a cycle is due, and handles every reason it
+// might not be. Deliberately does no analysis itself.
+async function autonomyHeartbeat() {
+  if (!autonomy.enabled || autonomyBusy) return;
+
+  if (!navigator.onLine) {
+    setAutonomyStatus('Paused — no internet connection. Resumes automatically.', 'warn',
+      'Nothing is lost while offline; the gap gets replayed from candle history once the connection is back.');
+    return;
+  }
+  if (dataMode !== 'live') {
+    setAutonomyStatus('Waiting for a live data provider — connect an API key above.', 'warn',
+      'Autonomous mode needs real candles; it will not run on the simulated feed.');
+    return;
+  }
+  // Gold is shut from Friday ~21:00 UTC to Sunday ~22:00 UTC. Analysing a frozen
+  // feed produces confident-looking signals off Friday's last bar, and every one
+  // of them enters the learning record as a real read of a market that was not
+  // trading. Nothing to analyse, so nothing runs.
+  if (!isMarketOpen(Date.now())) {
+    const clock = marketClock(Date.now());
+    const h = clock.hoursUntilOpen;
+    setAutonomyStatus('Market closed — resumes when gold reopens in ' +
+      (h < 1 ? Math.round(h * 60) + 'm' : h.toFixed(1) + 'h') + '.', 'warn',
+      'The feed is frozen at Friday\u2019s close. Analysing it would generate signals from a market that is not trading.');
+    return;
+  }
+  if (autonomy.skipCycles > 0) {
+    autonomy.skipCycles--;
+    setAutonomyStatus('Backing off after an error — retrying in ' + (autonomy.skipCycles + 1) + ' min.', 'warn', autonomy.lastError);
+    return;
+  }
+
+  const cfg = autonomyConfig();
+  const dueAt = (autonomy.lastAnalysisAt || 0) + cfg.analysisIntervalMinutes * 60 * 1000;
+  if (Date.now() < dueAt) {
+    const mins = Math.ceil((dueAt - Date.now()) / 60000);
+    setAutonomyStatus('Running autonomously — next pass in ' + mins + ' min.', 'live', autonomy.lastReason);
+    return;
+  }
+
+  autonomyBusy = true;
+  try {
+    await autonomyCycle();
+  } catch (e) {
+    autonomy.consecutiveErrors++;
+    autonomy.lastError = (e && e.message) || String(e);
+    // Exponential backoff, capped at ~30 min. A rate-limited or expired key
+    // should not turn into a request every minute for the rest of the day.
+    autonomy.skipCycles = Math.min(Math.pow(2, autonomy.consecutiveErrors), 30);
+    setAutonomyStatus('Cycle failed (' + autonomy.consecutiveErrors + ' in a row) — backing off ' + autonomy.skipCycles + ' min.', 'error', autonomy.lastError);
+    saveAutonomyState();
+  } finally {
+    autonomyBusy = false;
+  }
+}
+
+// Replay the time the app was closed or disconnected. Pulls the deepest history
+// the provider allows and grades every still-open signal against it, so a signal
+// that hit its target overnight is training data by the time the user looks.
+async function autonomyCatchUp() {
+  if (dataMode !== 'live' || !navigator.onLine) return;
+  const stillOpen = signalLog.filter(s => s.status === 'pending' || s.status === 'open');
+  if (!stillOpen.length) return;
+  setAutonomyStatus('Catching up — replaying ' + stillOpen.length + ' unresolved signal(s) against real history…', 'warn', '');
+  try {
+    const history = await PROVIDERS[activeProvider].timeSeries(apiKey, LIVE_INTERVAL, 5000);
+    const n = resolveOpenSignals(history, autonomyConfig());
+    renderAutonomyStats();
+    saveAutonomyState();
+    setAutonomyStatus('Catch-up complete.', autonomy.enabled ? 'live' : 'idle',
+      n ? 'Graded ' + n + ' signal(s) that resolved while the app was closed.'
+        : 'No signals had resolved while the app was closed.');
+  } catch (e) {
+    // Not fatal — the regular heartbeat will keep trying against live candles.
+    setAutonomyStatus('Catch-up could not fetch history — continuing on live candles.', 'warn', (e && e.message) || String(e));
+  }
+}
+
+function startAutonomy() {
+  if (autonomyHandle) clearInterval(autonomyHandle);
+  autonomyHandle = setInterval(autonomyHeartbeat, AUTONOMY_HEARTBEAT_MS);
+  autonomy.skipCycles = 0;
+  autonomy.consecutiveErrors = 0;
+  setAutonomyStatus('Autonomous mode on — first pass starting…', 'live', '');
+  autonomy.lastAnalysisAt = null; // force an immediate first pass
+  autonomyHeartbeat();
+}
+
+function stopAutonomy() {
+  if (autonomyHandle) { clearInterval(autonomyHandle); autonomyHandle = null; }
+  setAutonomyStatus('Off — check the box above to start.', 'idle', '');
+}
+
+document.getElementById('autonomyEnabled').addEventListener('change', function () {
+  autonomy.enabled = this.checked;
+  saveAutonomyState();
+  if (autonomy.enabled) startAutonomy(); else stopAutonomy();
+});
+providerSelect.addEventListener('change', renderQuota);
+const umm = document.getElementById('useMacroModel');
+if (umm) umm.addEventListener('change', () => { renderKnowledge(); renderReasoning(); });
+
+// A posture for building up a record rather than protecting capital. The engine
+// learns from resolved trades, and at the default B floor a ranging market
+// simply never qualifies — so a cautious setup collects nothing and the
+// knowledge base never starts.
+document.getElementById('aPresetCollect').addEventListener('click', () => {
+  // D, not C: even a perfect five-timeframe alignment only scores ~49%, so a C
+  // floor (>=30%) still rejects ordinary conditions and collects almost nothing.
+  document.getElementById('aMinGrade').value = 'D';
+  document.getElementById('aMinConf').value = 15;
+  document.getElementById('aCooldown').value = 30;
+  document.getElementById('aMaxOpen').value = 5;
+  document.getElementById('aMinMeta').value = -0.5;
+  saveAutonomyState();
+  autonomy.lastAnalysisAt = null; // re-evaluate immediately under the new thresholds
+  setAutonomyStatus('Data-collection thresholds applied — re-evaluating now.', 'live', '');
+  autonomyHeartbeat();
+});
+document.getElementById('autonomyAdvancedToggle').addEventListener('click', () => {
+  document.getElementById('autonomyAdvanced').classList.toggle('hidden');
+});
+['aMinConf', 'aCooldown', 'aMaxOpen', 'aInterval', 'aBtHours', 'aMinMeta', 'aDailyCap', 'aMinGrade',
+ 'aKillFill', 'aKillOpen', 'aKillDrift'].forEach(id => {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener('change', () => { saveAutonomyState(); renderQuota(); });
+});
+
+// React to connectivity changes straight away rather than waiting out a heartbeat.
+window.addEventListener('online', () => {
+  if (!autonomy.enabled) return;
+  autonomy.skipCycles = 0;
+  autonomy.consecutiveErrors = 0;
+  setAutonomyStatus('Back online — catching up…', 'warn', '');
+  autonomyCatchUp().then(autonomyHeartbeat);
+});
+window.addEventListener('offline', () => {
+  if (autonomy.enabled) setAutonomyStatus('Paused — no internet connection. Resumes automatically.', 'warn', '');
+});
+// Coming back to a backgrounded tab is a good moment to check for missed work:
+// mobile browsers in particular throttle timers hard once a tab is hidden.
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && autonomy.enabled) autonomyHeartbeat();
+});
+
+// ============================================================
+// BOOTSTRAP
+// ------------------------------------------------------------
+// Ordering matters here, which is why it is one explicit sequence rather than
+// scattered top-level calls: persisted learning state has to be restored (and
+// its weights applied) before the first analysis, and every DOM const further
+// up this file has to exist before anything reads it.
+// ============================================================
+// ============================================================
+// SETTINGS THAT SURVIVE A RELOAD
+// ------------------------------------------------------------
+// Only the paper account's balance and the autonomy thresholds were ever
+// persisted. Everything else a person could change — risk per trade, spread,
+// slippage, max concurrent, the partial-take-profit rules, all fourteen factor
+// weights, the target R:R, every backtest parameter, the news-window settings —
+// was read straight off the DOM and lost the moment the page reloaded. Tuning
+// the system was therefore something you had to redo from memory each session,
+// and an autonomous run would quietly revert to defaults after any refresh.
+//
+// One store, one list, restored before the first analysis so the weights are in
+// force when it runs. Ids that already have an owner are deliberately absent —
+// autonomy keeps its own (AUTONOMY_KEY), the paper on/off switches live with the
+// account, and the API keys are opt-in through "remember keys" rather than
+// swept up here.
+const SETTINGS_KEY = 'smc-settings-v1';
+const SETTINGS_IDS = [
+  // paper account
+  'pStartBalance', 'pRiskPct', 'pSpread', 'pSlippage', 'pMaxPos',
+  'pSizingMode', 'pFixedLots', 'pContractSize', 'pLotStep', 'pMinLots',
+  'pPartialPct', 'pHoldMeta', 'pPartialEnabled',
+  // factor weights
+  'wWeekly', 'wDaily', 'wHtf', 'wMtf', 'wLtf', 'wOb', 'wFvg', 'wLiq',
+  'wPd', 'wPriceAction', 'wClassic', 'wCorrelation', 'wFundamental', 'wNews',
+  // signal + backtest
+  'targetRR', 'pBars', 'pCapital', 'pRisk', 'pCostPips', 'pMinConf', 'pTargetRR',
+  // news window and macro model
+  'newsBeforeMin', 'newsAfterMin', 'newsBlockEnabled', 'newsBlockMedium',
+  'newsFlattenEnabled', 'newsFlattenMin', 'newsAlertMin', 'useMacroModel',
+  'weekendFlattenEnabled', 'weekendFlattenMin'
+];
+
+function saveSettings() {
+  const out = {};
+  SETTINGS_IDS.forEach(id => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    out[id] = el.type === 'checkbox' ? !!el.checked : el.value;
+  });
+  try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(out)); }
+  catch (e) { return false; }
+  return true;
+}
+
+function loadSettings() {
+  let saved;
+  try { saved = JSON.parse(localStorage.getItem(SETTINGS_KEY) || 'null'); }
+  catch (e) { return; }
+  if (!saved || typeof saved !== 'object') return;
+  SETTINGS_IDS.forEach(id => {
+    if (!(id in saved)) return;
+    const el = document.getElementById(id);
+    if (!el) return;
+    if (el.type === 'checkbox') el.checked = !!saved[id];
+    else if (saved[id] != null) el.value = saved[id];
+  });
+  // Sliders carry a printed value beside them that does not follow a
+  // programmatic change, so a restored weight would show the old number.
+  syncSliderLabels();
+}
+
+function syncSliderLabels() {
+  weightIds.forEach(id => {
+    const el = document.getElementById(id), out = document.getElementById(id + 'V');
+    if (el && out) out.textContent = el.value;
+  });
+  const rr = document.getElementById('targetRR'), rrOut = document.getElementById('targetRRV');
+  if (rr && rrOut) rrOut.textContent = '1:' + rr.value;
+}
+
+let settingsSaveTimer = null;
+function flagSettingsSaved() {
+  const el = document.getElementById('settingsSavedNote');
+  if (!el) return;
+  el.textContent = 'Settings saved.';
+  el.style.color = '#3ecf8e';
+  clearTimeout(settingsSaveTimer);
+  settingsSaveTimer = setTimeout(() => { el.textContent = ''; }, 2500);
+}
+
+function wireSettingsPersistence() {
+  SETTINGS_IDS.forEach(id => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    const handler = () => { if (saveSettings()) flagSettingsSaved(); };
+    el.addEventListener('change', handler);
+    // Sliders and number spinners fire `input` continuously; `change` alone
+    // would miss a drag that never blurs.
+    if (el.type === 'range' || el.type === 'number') el.addEventListener('input', handler);
+  });
+}
+
+// ============================================================
+// IS THIS TAB STILL RUNNING THE CURRENT CODE?
+// ------------------------------------------------------------
+// This app is built to be left open for days doing unattended analysis, which
+// means a tab can go on running the modules it loaded at open time long after a
+// fix has shipped. That is not hypothetical: the macro engine ran on 1976-2006
+// FRED data, the fix deployed, and an open tab would have carried on producing
+// confident, wrong numbers with nothing on screen to say so.
+//
+// The check compares the ETag of app.js now against the one seen at startup, so
+// it needs no version constant to keep in sync and no build step. `no-store`
+// forces the request past the browser cache; the server already sends
+// must-revalidate, so this is cheap.
+const UPDATE_CHECK_MS = 30 * 60 * 1000;
+let loadedBuildTag = null;
+let updateWatchHandle = null;
+
+async function currentBuildTag() {
+  try {
+    const r = await fetch('app.js', { method: 'HEAD', cache: 'no-store' });
+    return r.headers.get('etag') || r.headers.get('last-modified') || null;
+  } catch (e) {
+    return null; // offline, or the check is blocked — try again next time
+  }
+}
+
+async function checkForNewBuild() {
+  const tag = await currentBuildTag();
+  if (!tag) return;
+  if (loadedBuildTag == null) { loadedBuildTag = tag; return; }
+  if (tag === loadedBuildTag) return;
+  const banner = document.getElementById('updateBanner');
+  if (banner) banner.classList.remove('hidden');
+}
+
+function startUpdateWatch() {
+  const reload = document.getElementById('updateReload');
+  if (reload) reload.addEventListener('click', () => window.location.reload());
+  checkForNewBuild();
+  if (updateWatchHandle) clearInterval(updateWatchHandle);
+  updateWatchHandle = setInterval(checkForNewBuild, UPDATE_CHECK_MS);
+}
+
+async function bootstrap() {
+  // Before anything reads a control: the weights, risk settings and thresholds
+  // have to be the saved ones by the time the first analysis runs.
+  loadSettings();
+  wireSettingsPersistence();
+  await loadLearningState();
+  await loadSignalLog();
+  await loadShadowLog();
+  applyKnowledgeBaseWeights();
+  await loadPaper();
+  await loadKnowledge();
+  await loadCalendarCache();
+  loadAutonomyState();
+  loadQuota();
+  // Every store the merge touches is loaded by this point — the log it merges
+  // into, the paper account it books positions in, the learning state it
+  // updates. Replay anything the worker sent while that was still loading.
+  flushPendingIngest();
+  renderSignalLog();   // first render happened before the paper account loaded
+  startLivenessTicker();
+  startUpdateWatch();
+  startNewsWatch();
+  renderQuota();
+  renderAutonomyStats();
+  renderAnalysisQuality();
+  renderPaper();
+  renderDataInventory();
+  renderCalendar();
+  renderReasoning();
+  renderKnowledge();
+  runAudit();
+  renderAudit();
+  refreshWorkerTotals().then(renderDataInventory);
+  refreshAll();
+
+  const saved = await loadSavedKeys();
+  if (!saved) {
+    document.getElementById('autoBacktestStatus').textContent = 'Connect a data provider to enable auto-backtesting.';
+  } else {
+    document.getElementById('rememberKeysCheckbox').checked = true;
+    if (saved.provider) providerSelect.value = saved.provider;
+    if (saved.fredKey) document.getElementById('fredKeyInput').value = saved.fredKey;
+    if (saved.newsKey) document.getElementById('newsKeyInput').value = saved.newsKey;
+    if (typeof saved.autoBacktest === 'boolean') document.getElementById('autoBacktestCheckbox').checked = saved.autoBacktest;
+    if (saved.apiKey) {
+      document.getElementById('apiKeyInput').value = saved.apiKey;
+      connStatus.textContent = 'Restoring saved connection...';
+      await connectProvider(); // also re-fetches correlation/fundamentals/news with the restored keys
+    } else if (saved.fredKey || saved.newsKey) {
+      // No price provider was connected, but FRED/news keys were saved independently — restore those engines too.
+      await refreshCorrelation(activeProvider, apiKey, saved.fredKey || '');
+      await refreshFundamentals(saved.fredKey || '');
+      await refreshNewsSentiment(saved.newsKey || '');
+      refreshAll();
+      document.getElementById('autoBacktestStatus').textContent = 'Connect a data provider to enable auto-backtesting.';
+    } else {
+      document.getElementById('autoBacktestStatus').textContent = 'Connect a data provider to enable auto-backtesting.';
+    }
+  }
+
+  // The calendar gates trading, so it must be loaded before autonomy's first pass.
+  await refreshCalendar(false);
+  renderCalendar();
+  renderReasoning();
+
+  // Recover anything that resolved while the app was closed, then pick the loop back up.
+  if (autonomy.enabled) {
+    await autonomyCatchUp();
+    startAutonomy();
+  } else {
+    setAutonomyStatus('Off — check the box above to start.', 'idle', '');
+  }
+}
+bootstrap();
+ + fmt(p.entryFill) + ' · SL 
+  }
+
+  const closed = paper.positions.filter(p => p.status === 'closed' && inEra(p)).slice(0, 8);
+  if (closed.length) {
+    html += '<div style="font-size:10px;color:#454a56;margin:10px 0 6px;">Recent closed</div>';
+    html += closed.map(p =>
+      '<div class="zone-item"><span><span class="dirtag ' + p.dir + '">' + p.dir + '</span> ' + (p.outcome === 'won' ? (p.partial ? '◐' : '✓') : p.outcome === 'lost' ? '✗' : '–')
+      + ' <span style="color:#454a56;">' + lotLabel(p) + ' · exit $' + fmt(p.exitPrice) + '</span></span>'
+      + '<span class="mono ' + pnlCls(p.pnl) + '">' + money(p.pnl) + (p.rMultiple != null ? ' <span style="color:#454a56;">' + (p.rMultiple >= 0 ? '+' : '') + fmt(p.rMultiple) + 'R</span>' : '') + '</span></div>'
+    ).join('');
+  }
+
+  if (!resting.length && !open.length && !closed.length) {
+    html += '<div class="zone-empty">' + (a.archivedCount
+      ? 'Account reset — no trades in this era yet. The record above is intact.'
+      : 'No paper trades yet. Positions open automatically as the engine logs signals.') + '</div>';
+  }
+  root.innerHTML = html;
+}
+
+function renderPaperStatusNote() {
+  const note = document.getElementById('paperStatus');
+  if (!note) return;
+  if (!paper.enabled) { note.textContent = 'Off — no positions will be opened.'; return; }
+  note.textContent = paper.manual
+    ? 'On — new signals will open simulated positions. No real orders are placed.'
+    : 'On for the engine\'s own signals. Signals you generate by hand are excluded (signal panel).';
+}
+
+document.getElementById('paperEnabled').addEventListener('change', function () {
+  paper.enabled = this.checked;
+  savePaper();
+  renderPaper();
+  renderPaperStatusNote();
+  renderPaperManualHint();
+});
+
+const paperManualCb = document.getElementById('paperManual');
+if (paperManualCb) paperManualCb.addEventListener('change', function () {
+  paper.manual = this.checked;
+  // Ticking it with the account off is a request to paper-trade, so honour it
+  // rather than silently doing nothing.
+  if (paper.manual && !paper.enabled) {
+    paper.enabled = true;
+    const master = document.getElementById('paperEnabled');
+    if (master) master.checked = true;
+  }
+  savePaper();
+  renderPaper();
+  renderPaperStatusNote();
+  renderPaperManualHint();
+});
+document.getElementById('paperAdvancedToggle').addEventListener('click', () => {
+  document.getElementById('paperAdvanced').classList.toggle('hidden');
+});
+['pStartBalance', 'pRiskPct', 'pSpread', 'pSlippage', 'pMaxPos', 'pPartialPct', 'pHoldMeta', 'pPartialEnabled'].forEach(id => {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener('change', () => { paper.startingBalance = paperConfig().startingBalance; savePaper(); renderPaper(); });
+});
+document.getElementById('paperReset').addEventListener('click', async () => {
+  const price = currentMarkPrice();
+  const live = paper.positions.filter(p => p.status === 'open' || p.status === 'pending').length;
+  const keeping = paper.positions.filter(p => p.status === 'closed').length;
+  const msg = 'Reset the paper account back to $' + fmt(paperConfig().startingBalance) + '?\n\n'
+    + (live ? live + ' live position(s) will be closed at the current price first.\n' : '')
+    + keeping + ' completed trade(s) stay on record — they are what the system learns from, '
+    + 'and they keep counting towards the lifetime win rate. They just stop counting towards the balance.';
+  if (!window.confirm(msg)) return;
+  const out = resetPaperAccount(paper.positions, isFinite(price) ? price : undefined, Date.now());
+  paper.positions = out.positions;
+  paper.epoch = out.epoch;
+  await savePaper();
+  renderPaper();
+  renderDataInventory();
+});
+
+// ============================================================
+// ANALYSIS QUALITY PANEL
+// ------------------------------------------------------------
+// Renders the three self-audits. Every number here is deliberately allowed to
+// say "not enough data yet" rather than show a confident-looking figure built
+// on four trades — a reassuring number from a tiny sample is worse than no
+// number, because it gets believed.
+// ============================================================
+function fmtR(v) { return v == null ? '—' : (v >= 0 ? '+' : '') + v.toFixed(2) + 'R'; }
+function fmtPct(v) { return v == null ? '—' : (v * 100).toFixed(0) + '%'; }
+function rClass(v) { return v == null ? 'fneu' : v > 0.05 ? 'fpos' : v < -0.05 ? 'fneg' : 'fneu'; }
+
+function renderAnalysisQuality() {
+  const root = document.getElementById('qualityContent');
+  if (!root) return;
+
+  const cal = computeCalibration(signalLog);
+  const bd = computeConditionBreakdown(signalLog);
+  const audit = computeGateAudit(signalLog, shadowLog);
+
+  const rows = (list, label) => {
+    const usable = list.filter(r => r.n >= 3);
+    if (!usable.length) return '<div class="zone-empty">' + label + ': not enough resolved trades yet (need 3+ per group).</div>';
+    return usable.map(r =>
+      '<div class="zone-item"><span>' + r.key + ' <span style="color:#454a56;">(' + r.n + ')</span></span>' +
+      '<span class="mono ' + rClass(r.expectancyR) + '">' + fmtR(r.expectancyR) + ' · ' + fmtPct(r.winRate) + '</span></div>'
+    ).join('');
+  };
+
+  const o = bd.overall;
+  let html = '';
+
+  html += '<div class="data-source-note" style="margin-bottom:8px;">Expectancy is shown in R — average profit per unit risked. At a 1:4 target a 30% win rate is already profitable, so win rate alone is a poor scorecard and R is the honest one.</div>';
+
+  html += '<div class="metrics" style="margin-bottom:10px;">'
+    + '<div class="card"><div class="label">Resolved</div><div class="value mono">' + o.n + '</div></div>'
+    + '<div class="card"><div class="label">Win Rate</div><div class="value mono">' + fmtPct(o.winRate) + '</div></div>'
+    + '<div class="card"><div class="label">Expectancy</div><div class="value mono ' + rClass(o.expectancyR) + '">' + fmtR(o.expectancyR) + '</div></div>'
+    + '<div class="card"><div class="label">Total</div><div class="value mono ' + rClass(o.totalR) + '">' + fmtR(o.totalR) + '</div></div>'
+    + '</div>';
+
+  // 1. Is the confidence number worth anything?
+  html += '<div class="panel-title" style="font-size:11px;margin-top:12px;">Is the confidence score meaningful?</div>';
+  html += '<div class="event-line" style="border-left-color:#e8c37a;">' + cal.verdict + '</div>';
+  if (cal.discrimination != null) {
+    html += '<div class="zone-item"><span>High-confidence half vs low-confidence half</span><span class="mono ' + rClass(cal.discrimination) + '">'
+      + (cal.discrimination >= 0 ? '+' : '') + (cal.discrimination * 100).toFixed(0) + ' pp win rate</span></div>';
+  }
+  if (cal.buckets.length) {
+    html += '<table class="factor-table"><tr><th style="text-align:left;color:#5c6270;font-weight:500;">Confidence band</th><th style="color:#5c6270;font-weight:500;">Win rate</th><th style="color:#5c6270;font-weight:500;">Expectancy</th></tr>';
+    html += cal.buckets.map(b =>
+      '<tr><td>' + b.lo + '–' + b.hi + '% <span style="color:#454a56;">(' + b.n + ')</span></td>'
+      + '<td>' + fmtPct(b.winRate) + '</td>'
+      + '<td class="' + rClass(b.expectancyR) + '">' + fmtR(b.expectancyR) + '</td></tr>').join('');
+    html += '</table>';
+  }
+
+  // 2. Where does the edge actually live?
+  html += '<div class="panel-title" style="font-size:11px;margin-top:14px;">Where the edge actually lives</div>';
+  html += '<div style="font-size:10px;color:#454a56;margin-bottom:6px;">By session</div>' + rows(bd.bySession, 'Session');
+  html += '<div style="font-size:10px;color:#454a56;margin:8px 0 6px;">By market regime</div>' + rows(bd.byRegime, 'Regime');
+  html += '<div style="font-size:10px;color:#454a56;margin:8px 0 6px;">By grade</div>' + rows(bd.byGrade, 'Grade');
+  html += '<div style="font-size:10px;color:#454a56;margin:8px 0 6px;">By direction</div>' + rows(bd.byDirection, 'Direction');
+
+  // 3. The roads not taken.
+  html += '<div class="panel-title" style="font-size:11px;margin-top:14px;">The setups it turned down</div>';
+  html += '<div class="data-source-note" style="margin-bottom:6px;">Every setup the filter rejected is tracked and resolved against real price anyway. This is the comparison a human journal can never make, because nobody records their non-trades.</div>';
+  html += '<div class="zone-item"><span>Taken</span><span class="mono ' + rClass(audit.taken.expectancyR) + '">'
+    + fmtR(audit.taken.expectancyR) + ' <span style="color:#454a56;">(' + audit.taken.n + ')</span></span></div>';
+  html += '<div class="zone-item"><span>Declined</span><span class="mono ' + rClass(audit.declined.expectancyR) + '">'
+    + fmtR(audit.declined.expectancyR) + ' <span style="color:#454a56;">(' + audit.declined.n + ')</span></span></div>';
+  const pending = shadowLog.filter(s => s.status === 'pending' || s.status === 'open').length;
+  if (pending) html += '<div class="zone-item"><span>Declined, still running</span><span class="mono">' + pending + '</span></div>';
+  html += '<div class="event-line" style="border-left-color:#c99bff;margin-top:6px;">' + audit.verdict + '</div>';
+
+  root.innerHTML = html;
+}
+document.getElementById('resetQuality').addEventListener('click', async () => {
+  shadowLog = [];
+  await saveShadowLog();
+  renderAnalysisQuality();
+});
+
+// ============================================================
+// AUTONOMOUS MODE
+// ------------------------------------------------------------
+// The unattended operator. Once the user ticks the box, a single heartbeat
+// drives everything: fetch fresh candles, grade any signal that has since hit
+// its stop or target, re-analyse, commit a new signal if the gate clears, and
+// periodically re-backtest and retrain on the record it has built.
+//
+// Three things make this survive real-world conditions rather than only a tab
+// left open on a desk:
+//   * One 60s heartbeat with due-time checks, not a pile of setIntervals. A
+//     laptop that sleeps for six hours wakes up, sees every task is overdue,
+//     and runs them once — rather than firing a backlog of missed timers.
+//   * Losing the connection is expected, not exceptional. Offline is a quiet
+//     pause; repeated failures back off exponentially instead of hammering a
+//     rate-limited provider until the key is blocked.
+//   * Time with the tab closed is recovered, not lost. catchUp() replays the
+//     gap from real candle history on the next load, so signals that resolved
+//     while nobody was watching still become training data.
+// ============================================================
+
+const AUTONOMY_KEY = 'smc-autonomy-v1';
+const AUTONOMY_HEARTBEAT_MS = 60 * 1000;
+
+let autonomyHandle = null;
+let autonomyBusy = false;
+
+function autonomyConfig() {
+  const num = (id, fallback) => {
+    const el = document.getElementById(id);
+    const v = el ? parseFloat(el.value) : NaN;
+    return isFinite(v) ? v : fallback;
+  };
+  return Object.assign({}, AUTONOMY_DEFAULTS, {
+    minConfidence: num('aMinConf', AUTONOMY_DEFAULTS.minConfidence),
+    cooldownMinutes: num('aCooldown', AUTONOMY_DEFAULTS.cooldownMinutes),
+    maxOpenSignals: num('aMaxOpen', AUTONOMY_DEFAULTS.maxOpenSignals),
+    analysisIntervalMinutes: num('aInterval', AUTONOMY_DEFAULTS.analysisIntervalMinutes),
+    backtestIntervalHours: num('aBtHours', AUTONOMY_DEFAULTS.backtestIntervalHours),
+    minMetaScore: num('aMinMeta', AUTONOMY_DEFAULTS.minMetaScore),
+    // Kill switch. 0 in any field disables that arm rather than expiring
+    // everything instantly, which is what a 0 limit would otherwise mean.
+    maxHoursToFill: num('aKillFill', AUTONOMY_DEFAULTS.maxHoursToFill),
+    maxHoursOpen: num('aKillOpen', AUTONOMY_DEFAULTS.maxHoursOpen),
+    maxDriftRToFill: num('aKillDrift', AUTONOMY_DEFAULTS.maxDriftRToFill),
+    partialTP: partialTPConfig(),
+    newsState: currentNewsState(),
+    gradeFloor: (document.getElementById('aMinGrade') || {}).value || AUTONOMY_DEFAULTS.gradeFloor
+  });
+}
+
+function saveAutonomyState() {
+  try {
+    localStorage.setItem(AUTONOMY_KEY, JSON.stringify({
+      enabled: autonomy.enabled,
+      cycles: autonomy.cycles,
+      gateTally: autonomy.gateTally,
+      signalsTaken: autonomy.signalsTaken,
+      autoResolved: autonomy.autoResolved,
+      lastAnalysisAt: autonomy.lastAnalysisAt,
+      lastBacktestAt: autonomy.lastBacktestAt,
+      lastSignalAt: autonomy.lastSignalAt,
+      cfg: {
+        aMinConf: document.getElementById('aMinConf').value,
+        aCooldown: document.getElementById('aCooldown').value,
+        aKillFill: document.getElementById('aKillFill').value,
+        aKillOpen: document.getElementById('aKillOpen').value,
+        aKillDrift: document.getElementById('aKillDrift').value,
+        aMaxOpen: document.getElementById('aMaxOpen').value,
+        aInterval: document.getElementById('aInterval').value,
+        aBtHours: document.getElementById('aBtHours').value,
+        aMinMeta: document.getElementById('aMinMeta').value,
+        aDailyCap: document.getElementById('aDailyCap').value,
+        aMinGrade: document.getElementById('aMinGrade').value
+      }
+    }));
+  } catch (e) { /* storage unavailable — autonomy still works, it just won't remember across reloads */ }
+}
+
+function loadAutonomyState() {
+  try {
+    const raw = localStorage.getItem(AUTONOMY_KEY);
+    if (!raw) return;
+    const saved = JSON.parse(raw);
+    Object.assign(autonomy, {
+      enabled: !!saved.enabled,
+      cycles: saved.cycles || 0,
+      gateTally: saved.gateTally || {},
+      signalsTaken: saved.signalsTaken || 0,
+      autoResolved: saved.autoResolved || 0,
+      lastAnalysisAt: saved.lastAnalysisAt || null,
+      lastBacktestAt: saved.lastBacktestAt || null,
+      lastSignalAt: saved.lastSignalAt || null
+    });
+    if (saved.cfg) {
+      Object.keys(saved.cfg).forEach(id => {
+        const el = document.getElementById(id);
+        if (el && saved.cfg[id] != null) el.value = saved.cfg[id];
+      });
+    }
+    document.getElementById('autonomyEnabled').checked = autonomy.enabled;
+  } catch (e) { /* nothing saved yet */ }
+}
+
+function setAutonomyStatus(text, tone, reason) {
+  const dot = document.getElementById('autonomyDot');
+  const status = document.getElementById('autonomyStatus');
+  const reasonEl = document.getElementById('autonomyReason');
+  if (!status) return;
+  status.textContent = text;
+  const colours = { live: '#3ecf8e', warn: '#ffa726', error: '#ef4d5f', idle: '#454a56' };
+  const c = colours[tone] || colours.idle;
+  dot.style.background = c;
+  dot.style.boxShadow = tone === 'live' ? '0 0 7px ' + c : 'none';
+  status.style.color = tone === 'idle' ? '#9298a5' : c;
+  if (reason !== undefined) reasonEl.textContent = reason || '';
+}
+
+function renderAutonomyStats() {
+  const live = signalLog.filter(s => s.status === 'pending' || s.status === 'open');
+  document.getElementById('aCycles').textContent = autonomy.cycles;
+  document.getElementById('aSignals').textContent = autonomy.signalsTaken;
+  document.getElementById('aResolved').textContent = autonomy.autoResolved;
+  document.getElementById('aOpen').textContent = live.length;
+
+  const killedEl = document.getElementById('aKilled');
+  if (killedEl) killedEl.textContent = signalLog.filter(s => s.status === 'expired').length;
+
+  // How long the oldest live trade has been sitting. This is the number that
+  // was invisible before: an order resting for a day looked identical to one
+  // placed a minute ago.
+  const oldestEl = document.getElementById('aOldest');
+  if (oldestEl) {
+    const cfg = autonomyConfig();
+    // Each trade is aged against the limit that actually applies to it: a
+    // resting order against the fill limit, a filled one against the hold
+    // limit. Using the larger of the two would leave an order 2.5x past its own
+    // deadline showing no warning at all.
+    const ages = live.map(s => {
+      const filled = s.status === 'open';
+      const t = Date.parse(filled ? (s.filledAt || s.time) : s.time);
+      if (!isFinite(t)) return null;
+      const hours = (Date.now() - t) / 3600000;
+      const limit = filled ? cfg.maxHoursOpen : cfg.maxHoursToFill;
+      return { hours, ratio: limit > 0 ? hours / limit : 0 };
+    }).filter(v => v != null);
+    if (!ages.length) {
+      oldestEl.textContent = '—';
+      oldestEl.style.color = '';
+    } else {
+      const worst = ages.reduce((a, b) => b.hours > a.hours ? b : a, ages[0]);
+      const closest = ages.reduce((a, b) => b.ratio > a.ratio ? b : a, ages[0]);
+      oldestEl.textContent = worst.hours < 1 ? Math.round(worst.hours * 60) + 'm' : worst.hours.toFixed(1) + 'h';
+      // Amber as a trade approaches its own kill limit, red once past it, so
+      // one about to be culled is visible before it disappears.
+      oldestEl.style.color = closest.ratio >= 1 ? '#ef4d5f' : closest.ratio >= 0.75 ? '#ffa726' : '';
+    }
+  }
+
+  const el = document.getElementById('gateTally');
+  if (!el) return;
+  const entries = Object.keys(autonomy.gateTally || {})
+    .map(k => ({ code: k, n: autonomy.gateTally[k] }))
+    .sort((a, b) => b.n - a.n);
+  if (!entries.length) { el.innerHTML = ''; return; }
+  el.innerHTML = '<div style="font-size:10px;color:#454a56;margin:8px 0 4px;">Why cycles ended this way</div>'
+    + entries.map(e => '<div class="zone-item" style="padding:3px 0;"><span style="font-size:11px;">'
+        + (GATE_LABELS[e.code] || e.code) + '</span><span class="mono" style="font-size:11px;color:'
+        + (e.code === 'taken' ? '#3ecf8e' : '#5c6270') + ';">' + e.n + '</span></div>').join('');
+}
+
+// Grade every unresolved signal against `candles`. Used both by the heartbeat
+// (fresh candles each cycle) and by catchUp() (deep history after downtime).
+// Returns how many signals reached a win/loss verdict.
+function resolveOpenSignals(candles, cfg) {
+  if (!candles || candles.length < 2) return 0;
+  let resolved = 0, killed = 0, changed = false;
+
+  // The auditor decides which live trades are past saving, not the engine.
+  // Letting the engine judge whether its own trade has gone bad is the thing
+  // the auditor exists to avoid — and it re-derives fill state from raw candles
+  // rather than trusting the signal's own status, so a "pending" order price
+  // actually traded through is caught rather than aged as if it never filled.
+  const tradeAudit = auditOpenTrades(signalLog, candles, {
+    maxHoursToFill: cfg.maxHoursToFill,
+    maxHoursOpen: cfg.maxHoursOpen,
+    maxDriftRToFill: cfg.maxDriftRToFill
+  });
+  lastTradeAudit = tradeAudit;
+  const killedBy = new Map(tradeAudit.kills.map(k => [k.id, k]));
+
+  signalLog.forEach(sig => {
+    if (sig.status !== 'pending' && sig.status !== 'open') return;
+    // An auditor kill outranks whatever the resolver would have said, EXCEPT
+    // when price has already settled the trade: a stop or target that has
+    // genuinely been hit is a real outcome and real evidence, and discarding it
+    // to enforce a time limit would throw away the data the limit exists to
+    // protect.
+    const verdict = resolveSignal(sig, candles, cfg);
+    const kill = killedBy.get(sig.id);
+    if (kill && verdict.status !== 'won' && verdict.status !== 'lost') {
+      sig.status = 'expired';
+      sig.expiryReason = 'auditor: ' + kill.reason;
+      sig.killSwitch = kill.code;
+      sig.resolvedAt = new Date().toISOString();
+      sig.resolvedBy = 'auditor';
+      paperCloseForSignal(sig.id, 'expired');
+      killed++; changed = true;
+      return;
+    }
+    if (verdict.status === 'won' || verdict.status === 'lost') {
+      if (applySignalOutcome(sig, verdict.status === 'won', {
+        auto: true, exitPrice: verdict.exitPrice, ambiguousBar: verdict.ambiguousBar, partial: verdict.partial
+      })) { resolved++; changed = true; }
+    } else if (verdict.status === 'expired') {
+      sig.status = 'expired';
+      sig.expiryReason = verdict.reason || null;
+      sig.killSwitch = verdict.killSwitch || null;
+      sig.resolvedAt = new Date().toISOString();
+      sig.resolvedBy = 'auto';
+      paperCloseForSignal(sig.id, 'expired');
+      if (verdict.killSwitch) killed++;
+      changed = true; // expired signals never become training data — no outcome to learn from
+    } else if (verdict.status === 'open' && sig.status === 'pending') {
+      sig.status = 'open'; // limit entry got tagged; it's a live position now
+      sig.filledAt = new Date().toISOString();
+      paperFillForSignal(sig.id, sig.filledAt);
+      changed = true;
+    }
+  });
+  if (changed) { saveSignalLog(); renderSignalLog(); }
+  if (resolved) autonomy.autoResolved += resolved;
+  if (killed) autonomy.killed = (autonomy.killed || 0) + killed;
+  resolveShadowSignals(candles, cfg);
+  return resolved;
+}
+
+// Shadows get the same treatment, minus the learning updates — a setup the
+// engine declined should inform the audit, not train the weights as though it
+// had been traded.
+function resolveShadowSignals(candles, cfg) {
+  if (!candles || candles.length < 2 || !shadowLog.length) return;
+  let changed = false;
+  shadowLog.forEach(sig => {
+    if (sig.status !== 'pending' && sig.status !== 'open') return;
+    const verdict = resolveSignal(sig, candles, cfg);
+    if (verdict.status === 'won' || verdict.status === 'lost') {
+      sig.status = verdict.status;
+      sig.resolvedAt = new Date().toISOString();
+      changed = true;
+    } else if (verdict.status === 'expired') {
+      sig.status = 'expired'; sig.expiryReason = verdict.reason || null; changed = true;
+    } else if (verdict.status === 'open' && sig.status === 'pending') {
+      sig.status = 'open'; changed = true;
+    }
+  });
+  if (changed) { saveShadowLog(); renderAnalysisQuality(); }
+}
+
+// One unattended pass. Everything that can fail is inside the caller's try.
+async function autonomyCycle() {
+  const cfg = autonomyConfig();
+  const now = Date.now();
+
+  // 0. Calendar first. It gates whether a signal may be taken at all, so it has
+  // to be current BEFORE the gate reads it — refreshing at the end of the cycle
+  // meant the first pass after a reconnect ran against an empty calendar and
+  // could take a position straight into a release window.
+  await refreshCalendar(false);
+
+  // 1. Fresh candles. resyncCandles() already refreshes liveData from the provider.
+  await resyncCandles();
+
+  // 2. Grade what the market has already decided since the last pass.
+  const graded = resolveOpenSignals(liveData, cfg);
+
+  // 3. Re-analyse on the new data.
+  refreshAll();
+  autonomy.lastAnalysisAt = now;
+
+  // 4. Commit a signal only if the gate clears.
+  let reason;
+  if (lastComposite) {
+    const plan = buildTradePlan(lastComposite, getTargetRR());
+    // The auditor is advisory everywhere except here. A critical finding means
+    // the analysis contradicts itself or the data it was built on — that is not
+    // a risk preference, and no confidence score should be able to override it.
+    const audit = runAudit();
+    renderAudit();
+    let gate;
+    if (audit && audit.blocking) {
+      gate = { take: false, code: 'audit',
+        reason: 'independent audit found ' + audit.critical + ' critical issue(s): ' + audit.findings[0].title };
+    } else {
+      gate = autonomyGate(lastComposite, plan, signalLog, autonomy.lastSignalAt, cfg);
+    }
+    // Tally why each cycle ended as it did. One latest-reason line cannot show
+    // whether 13 quiet cycles mean "no setup existed" or "the filter blocked
+    // every one" — and those need opposite responses.
+    const code = gate.code || 'unknown';
+    autonomy.gateTally[code] = (autonomy.gateTally[code] || 0) + 1;
+    if (gate.take) {
+      updateSignalUI(lastComposite, plan, true, 'auto'); // logIt = true -> addSignalToLog
+      autonomy.signalsTaken++;
+      autonomy.lastSignalAt = now;
+      reason = 'Took a ' + lastComposite.direction + ' at $' + fmt(plan.entry) +
+               ' (' + lastComposite.confidence + '% confidence' + (gate.grade ? ', grade ' + gate.grade : '') + ').';
+    } else {
+      updateSignalUI(lastComposite, plan, false); // keep the panel current without logging
+      // Track what was passed on, so the filter can be audited later rather
+      // than trusted forever.
+      addShadowSignal(lastComposite, plan, gate.reason);
+      reason = 'No signal taken — ' + gate.reason + '.';
+    }
+  } else {
+    reason = 'Analysis produced no result this cycle.';
+  }
+  if (graded) reason = 'Self-graded ' + graded + ' signal' + (graded === 1 ? '' : 's') + '. ' + reason;
+  autonomy.lastReason = reason;
+
+  // 5. Periodic re-backtest / retrain on the accumulated record.
+  const btDue = !autonomy.lastBacktestAt || (now - autonomy.lastBacktestAt) >= cfg.backtestIntervalHours * 3600 * 1000;
+  if (btDue) {
+    autonomy.lastBacktestAt = now;
+    await runBacktestCycle(true);
+  }
+
+  renderAnalysisQuality();
+  renderDataInventory();
+  renderCalendar();
+  renderReasoning();
+  runAudit();
+  renderAudit();
+  autonomy.cycles++;
+  autonomy.consecutiveErrors = 0;
+  autonomy.lastError = null;
+  saveAutonomyState();
+  renderAutonomyStats();
+  if (candlesStaleForBudget) {
+    setAutonomyStatus('Running on cached candles — daily API budget spent, resumes 00:00 UTC.', 'warn',
+      'Still grading open signals and re-analysing, but on the last candles fetched rather than fresh ones. ' + reason);
+  } else {
+    setAutonomyStatus('Running autonomously — last pass ' + new Date(now).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) + '.', 'live', reason);
+  }
+}
+
+// The heartbeat: decides whether a cycle is due, and handles every reason it
+// might not be. Deliberately does no analysis itself.
+async function autonomyHeartbeat() {
+  if (!autonomy.enabled || autonomyBusy) return;
+
+  if (!navigator.onLine) {
+    setAutonomyStatus('Paused — no internet connection. Resumes automatically.', 'warn',
+      'Nothing is lost while offline; the gap gets replayed from candle history once the connection is back.');
+    return;
+  }
+  if (dataMode !== 'live') {
+    setAutonomyStatus('Waiting for a live data provider — connect an API key above.', 'warn',
+      'Autonomous mode needs real candles; it will not run on the simulated feed.');
+    return;
+  }
+  // Gold is shut from Friday ~21:00 UTC to Sunday ~22:00 UTC. Analysing a frozen
+  // feed produces confident-looking signals off Friday's last bar, and every one
+  // of them enters the learning record as a real read of a market that was not
+  // trading. Nothing to analyse, so nothing runs.
+  if (!isMarketOpen(Date.now())) {
+    const clock = marketClock(Date.now());
+    const h = clock.hoursUntilOpen;
+    setAutonomyStatus('Market closed — resumes when gold reopens in ' +
+      (h < 1 ? Math.round(h * 60) + 'm' : h.toFixed(1) + 'h') + '.', 'warn',
+      'The feed is frozen at Friday\u2019s close. Analysing it would generate signals from a market that is not trading.');
+    return;
+  }
+  if (autonomy.skipCycles > 0) {
+    autonomy.skipCycles--;
+    setAutonomyStatus('Backing off after an error — retrying in ' + (autonomy.skipCycles + 1) + ' min.', 'warn', autonomy.lastError);
+    return;
+  }
+
+  const cfg = autonomyConfig();
+  const dueAt = (autonomy.lastAnalysisAt || 0) + cfg.analysisIntervalMinutes * 60 * 1000;
+  if (Date.now() < dueAt) {
+    const mins = Math.ceil((dueAt - Date.now()) / 60000);
+    setAutonomyStatus('Running autonomously — next pass in ' + mins + ' min.', 'live', autonomy.lastReason);
+    return;
+  }
+
+  autonomyBusy = true;
+  try {
+    await autonomyCycle();
+  } catch (e) {
+    autonomy.consecutiveErrors++;
+    autonomy.lastError = (e && e.message) || String(e);
+    // Exponential backoff, capped at ~30 min. A rate-limited or expired key
+    // should not turn into a request every minute for the rest of the day.
+    autonomy.skipCycles = Math.min(Math.pow(2, autonomy.consecutiveErrors), 30);
+    setAutonomyStatus('Cycle failed (' + autonomy.consecutiveErrors + ' in a row) — backing off ' + autonomy.skipCycles + ' min.', 'error', autonomy.lastError);
+    saveAutonomyState();
+  } finally {
+    autonomyBusy = false;
+  }
+}
+
+// Replay the time the app was closed or disconnected. Pulls the deepest history
+// the provider allows and grades every still-open signal against it, so a signal
+// that hit its target overnight is training data by the time the user looks.
+async function autonomyCatchUp() {
+  if (dataMode !== 'live' || !navigator.onLine) return;
+  const stillOpen = signalLog.filter(s => s.status === 'pending' || s.status === 'open');
+  if (!stillOpen.length) return;
+  setAutonomyStatus('Catching up — replaying ' + stillOpen.length + ' unresolved signal(s) against real history…', 'warn', '');
+  try {
+    const history = await PROVIDERS[activeProvider].timeSeries(apiKey, LIVE_INTERVAL, 5000);
+    const n = resolveOpenSignals(history, autonomyConfig());
+    renderAutonomyStats();
+    saveAutonomyState();
+    setAutonomyStatus('Catch-up complete.', autonomy.enabled ? 'live' : 'idle',
+      n ? 'Graded ' + n + ' signal(s) that resolved while the app was closed.'
+        : 'No signals had resolved while the app was closed.');
+  } catch (e) {
+    // Not fatal — the regular heartbeat will keep trying against live candles.
+    setAutonomyStatus('Catch-up could not fetch history — continuing on live candles.', 'warn', (e && e.message) || String(e));
+  }
+}
+
+function startAutonomy() {
+  if (autonomyHandle) clearInterval(autonomyHandle);
+  autonomyHandle = setInterval(autonomyHeartbeat, AUTONOMY_HEARTBEAT_MS);
+  autonomy.skipCycles = 0;
+  autonomy.consecutiveErrors = 0;
+  setAutonomyStatus('Autonomous mode on — first pass starting…', 'live', '');
+  autonomy.lastAnalysisAt = null; // force an immediate first pass
+  autonomyHeartbeat();
+}
+
+function stopAutonomy() {
+  if (autonomyHandle) { clearInterval(autonomyHandle); autonomyHandle = null; }
+  setAutonomyStatus('Off — check the box above to start.', 'idle', '');
+}
+
+document.getElementById('autonomyEnabled').addEventListener('change', function () {
+  autonomy.enabled = this.checked;
+  saveAutonomyState();
+  if (autonomy.enabled) startAutonomy(); else stopAutonomy();
+});
+providerSelect.addEventListener('change', renderQuota);
+const umm = document.getElementById('useMacroModel');
+if (umm) umm.addEventListener('change', () => { renderKnowledge(); renderReasoning(); });
+
+// A posture for building up a record rather than protecting capital. The engine
+// learns from resolved trades, and at the default B floor a ranging market
+// simply never qualifies — so a cautious setup collects nothing and the
+// knowledge base never starts.
+document.getElementById('aPresetCollect').addEventListener('click', () => {
+  // D, not C: even a perfect five-timeframe alignment only scores ~49%, so a C
+  // floor (>=30%) still rejects ordinary conditions and collects almost nothing.
+  document.getElementById('aMinGrade').value = 'D';
+  document.getElementById('aMinConf').value = 15;
+  document.getElementById('aCooldown').value = 30;
+  document.getElementById('aMaxOpen').value = 5;
+  document.getElementById('aMinMeta').value = -0.5;
+  saveAutonomyState();
+  autonomy.lastAnalysisAt = null; // re-evaluate immediately under the new thresholds
+  setAutonomyStatus('Data-collection thresholds applied — re-evaluating now.', 'live', '');
+  autonomyHeartbeat();
+});
+document.getElementById('autonomyAdvancedToggle').addEventListener('click', () => {
+  document.getElementById('autonomyAdvanced').classList.toggle('hidden');
+});
+['aMinConf', 'aCooldown', 'aMaxOpen', 'aInterval', 'aBtHours', 'aMinMeta', 'aDailyCap', 'aMinGrade',
+ 'aKillFill', 'aKillOpen', 'aKillDrift'].forEach(id => {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener('change', () => { saveAutonomyState(); renderQuota(); });
+});
+
+// React to connectivity changes straight away rather than waiting out a heartbeat.
+window.addEventListener('online', () => {
+  if (!autonomy.enabled) return;
+  autonomy.skipCycles = 0;
+  autonomy.consecutiveErrors = 0;
+  setAutonomyStatus('Back online — catching up…', 'warn', '');
+  autonomyCatchUp().then(autonomyHeartbeat);
+});
+window.addEventListener('offline', () => {
+  if (autonomy.enabled) setAutonomyStatus('Paused — no internet connection. Resumes automatically.', 'warn', '');
+});
+// Coming back to a backgrounded tab is a good moment to check for missed work:
+// mobile browsers in particular throttle timers hard once a tab is hidden.
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && autonomy.enabled) autonomyHeartbeat();
+});
+
+// ============================================================
+// BOOTSTRAP
+// ------------------------------------------------------------
+// Ordering matters here, which is why it is one explicit sequence rather than
+// scattered top-level calls: persisted learning state has to be restored (and
+// its weights applied) before the first analysis, and every DOM const further
+// up this file has to exist before anything reads it.
+// ============================================================
+// ============================================================
+// SETTINGS THAT SURVIVE A RELOAD
+// ------------------------------------------------------------
+// Only the paper account's balance and the autonomy thresholds were ever
+// persisted. Everything else a person could change — risk per trade, spread,
+// slippage, max concurrent, the partial-take-profit rules, all fourteen factor
+// weights, the target R:R, every backtest parameter, the news-window settings —
+// was read straight off the DOM and lost the moment the page reloaded. Tuning
+// the system was therefore something you had to redo from memory each session,
+// and an autonomous run would quietly revert to defaults after any refresh.
+//
+// One store, one list, restored before the first analysis so the weights are in
+// force when it runs. Ids that already have an owner are deliberately absent —
+// autonomy keeps its own (AUTONOMY_KEY), the paper on/off switches live with the
+// account, and the API keys are opt-in through "remember keys" rather than
+// swept up here.
+const SETTINGS_KEY = 'smc-settings-v1';
+const SETTINGS_IDS = [
+  // paper account
+  'pStartBalance', 'pRiskPct', 'pSpread', 'pSlippage', 'pMaxPos',
+  'pSizingMode', 'pFixedLots', 'pContractSize', 'pLotStep', 'pMinLots',
+  'pPartialPct', 'pHoldMeta', 'pPartialEnabled',
+  // factor weights
+  'wWeekly', 'wDaily', 'wHtf', 'wMtf', 'wLtf', 'wOb', 'wFvg', 'wLiq',
+  'wPd', 'wPriceAction', 'wClassic', 'wCorrelation', 'wFundamental', 'wNews',
+  // signal + backtest
+  'targetRR', 'pBars', 'pCapital', 'pRisk', 'pCostPips', 'pMinConf', 'pTargetRR',
+  // news window and macro model
+  'newsBeforeMin', 'newsAfterMin', 'newsBlockEnabled', 'newsBlockMedium',
+  'newsFlattenEnabled', 'newsFlattenMin', 'newsAlertMin', 'useMacroModel',
+  'weekendFlattenEnabled', 'weekendFlattenMin'
+];
+
+function saveSettings() {
+  const out = {};
+  SETTINGS_IDS.forEach(id => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    out[id] = el.type === 'checkbox' ? !!el.checked : el.value;
+  });
+  try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(out)); }
+  catch (e) { return false; }
+  return true;
+}
+
+function loadSettings() {
+  let saved;
+  try { saved = JSON.parse(localStorage.getItem(SETTINGS_KEY) || 'null'); }
+  catch (e) { return; }
+  if (!saved || typeof saved !== 'object') return;
+  SETTINGS_IDS.forEach(id => {
+    if (!(id in saved)) return;
+    const el = document.getElementById(id);
+    if (!el) return;
+    if (el.type === 'checkbox') el.checked = !!saved[id];
+    else if (saved[id] != null) el.value = saved[id];
+  });
+  // Sliders carry a printed value beside them that does not follow a
+  // programmatic change, so a restored weight would show the old number.
+  syncSliderLabels();
+}
+
+function syncSliderLabels() {
+  weightIds.forEach(id => {
+    const el = document.getElementById(id), out = document.getElementById(id + 'V');
+    if (el && out) out.textContent = el.value;
+  });
+  const rr = document.getElementById('targetRR'), rrOut = document.getElementById('targetRRV');
+  if (rr && rrOut) rrOut.textContent = '1:' + rr.value;
+}
+
+let settingsSaveTimer = null;
+function flagSettingsSaved() {
+  const el = document.getElementById('settingsSavedNote');
+  if (!el) return;
+  el.textContent = 'Settings saved.';
+  el.style.color = '#3ecf8e';
+  clearTimeout(settingsSaveTimer);
+  settingsSaveTimer = setTimeout(() => { el.textContent = ''; }, 2500);
+}
+
+function wireSettingsPersistence() {
+  SETTINGS_IDS.forEach(id => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    const handler = () => { if (saveSettings()) flagSettingsSaved(); };
+    el.addEventListener('change', handler);
+    // Sliders and number spinners fire `input` continuously; `change` alone
+    // would miss a drag that never blurs.
+    if (el.type === 'range' || el.type === 'number') el.addEventListener('input', handler);
+  });
+}
+
+// ============================================================
+// IS THIS TAB STILL RUNNING THE CURRENT CODE?
+// ------------------------------------------------------------
+// This app is built to be left open for days doing unattended analysis, which
+// means a tab can go on running the modules it loaded at open time long after a
+// fix has shipped. That is not hypothetical: the macro engine ran on 1976-2006
+// FRED data, the fix deployed, and an open tab would have carried on producing
+// confident, wrong numbers with nothing on screen to say so.
+//
+// The check compares the ETag of app.js now against the one seen at startup, so
+// it needs no version constant to keep in sync and no build step. `no-store`
+// forces the request past the browser cache; the server already sends
+// must-revalidate, so this is cheap.
+const UPDATE_CHECK_MS = 30 * 60 * 1000;
+let loadedBuildTag = null;
+let updateWatchHandle = null;
+
+async function currentBuildTag() {
+  try {
+    const r = await fetch('app.js', { method: 'HEAD', cache: 'no-store' });
+    return r.headers.get('etag') || r.headers.get('last-modified') || null;
+  } catch (e) {
+    return null; // offline, or the check is blocked — try again next time
+  }
+}
+
+async function checkForNewBuild() {
+  const tag = await currentBuildTag();
+  if (!tag) return;
+  if (loadedBuildTag == null) { loadedBuildTag = tag; return; }
+  if (tag === loadedBuildTag) return;
+  const banner = document.getElementById('updateBanner');
+  if (banner) banner.classList.remove('hidden');
+}
+
+function startUpdateWatch() {
+  const reload = document.getElementById('updateReload');
+  if (reload) reload.addEventListener('click', () => window.location.reload());
+  checkForNewBuild();
+  if (updateWatchHandle) clearInterval(updateWatchHandle);
+  updateWatchHandle = setInterval(checkForNewBuild, UPDATE_CHECK_MS);
+}
+
+async function bootstrap() {
+  // Before anything reads a control: the weights, risk settings and thresholds
+  // have to be the saved ones by the time the first analysis runs.
+  loadSettings();
+  wireSettingsPersistence();
+  await loadLearningState();
+  await loadSignalLog();
+  await loadShadowLog();
+  applyKnowledgeBaseWeights();
+  await loadPaper();
+  await loadKnowledge();
+  await loadCalendarCache();
+  loadAutonomyState();
+  loadQuota();
+  // Every store the merge touches is loaded by this point — the log it merges
+  // into, the paper account it books positions in, the learning state it
+  // updates. Replay anything the worker sent while that was still loading.
+  flushPendingIngest();
+  renderSignalLog();   // first render happened before the paper account loaded
+  startLivenessTicker();
+  startUpdateWatch();
+  startNewsWatch();
+  renderQuota();
+  renderAutonomyStats();
+  renderAnalysisQuality();
+  renderPaper();
+  renderDataInventory();
+  renderCalendar();
+  renderReasoning();
+  renderKnowledge();
+  runAudit();
+  renderAudit();
+  refreshWorkerTotals().then(renderDataInventory);
+  refreshAll();
+
+  const saved = await loadSavedKeys();
+  if (!saved) {
+    document.getElementById('autoBacktestStatus').textContent = 'Connect a data provider to enable auto-backtesting.';
+  } else {
+    document.getElementById('rememberKeysCheckbox').checked = true;
+    if (saved.provider) providerSelect.value = saved.provider;
+    if (saved.fredKey) document.getElementById('fredKeyInput').value = saved.fredKey;
+    if (saved.newsKey) document.getElementById('newsKeyInput').value = saved.newsKey;
+    if (typeof saved.autoBacktest === 'boolean') document.getElementById('autoBacktestCheckbox').checked = saved.autoBacktest;
+    if (saved.apiKey) {
+      document.getElementById('apiKeyInput').value = saved.apiKey;
+      connStatus.textContent = 'Restoring saved connection...';
+      await connectProvider(); // also re-fetches correlation/fundamentals/news with the restored keys
+    } else if (saved.fredKey || saved.newsKey) {
+      // No price provider was connected, but FRED/news keys were saved independently — restore those engines too.
+      await refreshCorrelation(activeProvider, apiKey, saved.fredKey || '');
+      await refreshFundamentals(saved.fredKey || '');
+      await refreshNewsSentiment(saved.newsKey || '');
+      refreshAll();
+      document.getElementById('autoBacktestStatus').textContent = 'Connect a data provider to enable auto-backtesting.';
+    } else {
+      document.getElementById('autoBacktestStatus').textContent = 'Connect a data provider to enable auto-backtesting.';
+    }
+  }
+
+  // The calendar gates trading, so it must be loaded before autonomy's first pass.
+  await refreshCalendar(false);
+  renderCalendar();
+  renderReasoning();
+
+  // Recover anything that resolved while the app was closed, then pick the loop back up.
+  if (autonomy.enabled) {
+    await autonomyCatchUp();
+    startAutonomy();
+  } else {
+    setAutonomyStatus('Off — check the box above to start.', 'idle', '');
+  }
+}
+bootstrap();
+ + fmt(p.sl) + ' · TP 
+  }
+
+  const closed = paper.positions.filter(p => p.status === 'closed' && inEra(p)).slice(0, 8);
+  if (closed.length) {
+    html += '<div style="font-size:10px;color:#454a56;margin:10px 0 6px;">Recent closed</div>';
+    html += closed.map(p =>
+      '<div class="zone-item"><span><span class="dirtag ' + p.dir + '">' + p.dir + '</span> ' + (p.outcome === 'won' ? (p.partial ? '◐' : '✓') : p.outcome === 'lost' ? '✗' : '–')
+      + ' <span style="color:#454a56;">' + lotLabel(p) + ' · exit $' + fmt(p.exitPrice) + '</span></span>'
+      + '<span class="mono ' + pnlCls(p.pnl) + '">' + money(p.pnl) + (p.rMultiple != null ? ' <span style="color:#454a56;">' + (p.rMultiple >= 0 ? '+' : '') + fmt(p.rMultiple) + 'R</span>' : '') + '</span></div>'
+    ).join('');
+  }
+
+  if (!resting.length && !open.length && !closed.length) {
+    html += '<div class="zone-empty">' + (a.archivedCount
+      ? 'Account reset — no trades in this era yet. The record above is intact.'
+      : 'No paper trades yet. Positions open automatically as the engine logs signals.') + '</div>';
+  }
+  root.innerHTML = html;
+}
+
+function renderPaperStatusNote() {
+  const note = document.getElementById('paperStatus');
+  if (!note) return;
+  if (!paper.enabled) { note.textContent = 'Off — no positions will be opened.'; return; }
+  note.textContent = paper.manual
+    ? 'On — new signals will open simulated positions. No real orders are placed.'
+    : 'On for the engine\'s own signals. Signals you generate by hand are excluded (signal panel).';
+}
+
+document.getElementById('paperEnabled').addEventListener('change', function () {
+  paper.enabled = this.checked;
+  savePaper();
+  renderPaper();
+  renderPaperStatusNote();
+  renderPaperManualHint();
+});
+
+const paperManualCb = document.getElementById('paperManual');
+if (paperManualCb) paperManualCb.addEventListener('change', function () {
+  paper.manual = this.checked;
+  // Ticking it with the account off is a request to paper-trade, so honour it
+  // rather than silently doing nothing.
+  if (paper.manual && !paper.enabled) {
+    paper.enabled = true;
+    const master = document.getElementById('paperEnabled');
+    if (master) master.checked = true;
+  }
+  savePaper();
+  renderPaper();
+  renderPaperStatusNote();
+  renderPaperManualHint();
+});
+document.getElementById('paperAdvancedToggle').addEventListener('click', () => {
+  document.getElementById('paperAdvanced').classList.toggle('hidden');
+});
+['pStartBalance', 'pRiskPct', 'pSpread', 'pSlippage', 'pMaxPos', 'pPartialPct', 'pHoldMeta', 'pPartialEnabled'].forEach(id => {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener('change', () => { paper.startingBalance = paperConfig().startingBalance; savePaper(); renderPaper(); });
+});
+document.getElementById('paperReset').addEventListener('click', async () => {
+  const price = currentMarkPrice();
+  const live = paper.positions.filter(p => p.status === 'open' || p.status === 'pending').length;
+  const keeping = paper.positions.filter(p => p.status === 'closed').length;
+  const msg = 'Reset the paper account back to $' + fmt(paperConfig().startingBalance) + '?\n\n'
+    + (live ? live + ' live position(s) will be closed at the current price first.\n' : '')
+    + keeping + ' completed trade(s) stay on record — they are what the system learns from, '
+    + 'and they keep counting towards the lifetime win rate. They just stop counting towards the balance.';
+  if (!window.confirm(msg)) return;
+  const out = resetPaperAccount(paper.positions, isFinite(price) ? price : undefined, Date.now());
+  paper.positions = out.positions;
+  paper.epoch = out.epoch;
+  await savePaper();
+  renderPaper();
+  renderDataInventory();
+});
+
+// ============================================================
+// ANALYSIS QUALITY PANEL
+// ------------------------------------------------------------
+// Renders the three self-audits. Every number here is deliberately allowed to
+// say "not enough data yet" rather than show a confident-looking figure built
+// on four trades — a reassuring number from a tiny sample is worse than no
+// number, because it gets believed.
+// ============================================================
+function fmtR(v) { return v == null ? '—' : (v >= 0 ? '+' : '') + v.toFixed(2) + 'R'; }
+function fmtPct(v) { return v == null ? '—' : (v * 100).toFixed(0) + '%'; }
+function rClass(v) { return v == null ? 'fneu' : v > 0.05 ? 'fpos' : v < -0.05 ? 'fneg' : 'fneu'; }
+
+function renderAnalysisQuality() {
+  const root = document.getElementById('qualityContent');
+  if (!root) return;
+
+  const cal = computeCalibration(signalLog);
+  const bd = computeConditionBreakdown(signalLog);
+  const audit = computeGateAudit(signalLog, shadowLog);
+
+  const rows = (list, label) => {
+    const usable = list.filter(r => r.n >= 3);
+    if (!usable.length) return '<div class="zone-empty">' + label + ': not enough resolved trades yet (need 3+ per group).</div>';
+    return usable.map(r =>
+      '<div class="zone-item"><span>' + r.key + ' <span style="color:#454a56;">(' + r.n + ')</span></span>' +
+      '<span class="mono ' + rClass(r.expectancyR) + '">' + fmtR(r.expectancyR) + ' · ' + fmtPct(r.winRate) + '</span></div>'
+    ).join('');
+  };
+
+  const o = bd.overall;
+  let html = '';
+
+  html += '<div class="data-source-note" style="margin-bottom:8px;">Expectancy is shown in R — average profit per unit risked. At a 1:4 target a 30% win rate is already profitable, so win rate alone is a poor scorecard and R is the honest one.</div>';
+
+  html += '<div class="metrics" style="margin-bottom:10px;">'
+    + '<div class="card"><div class="label">Resolved</div><div class="value mono">' + o.n + '</div></div>'
+    + '<div class="card"><div class="label">Win Rate</div><div class="value mono">' + fmtPct(o.winRate) + '</div></div>'
+    + '<div class="card"><div class="label">Expectancy</div><div class="value mono ' + rClass(o.expectancyR) + '">' + fmtR(o.expectancyR) + '</div></div>'
+    + '<div class="card"><div class="label">Total</div><div class="value mono ' + rClass(o.totalR) + '">' + fmtR(o.totalR) + '</div></div>'
+    + '</div>';
+
+  // 1. Is the confidence number worth anything?
+  html += '<div class="panel-title" style="font-size:11px;margin-top:12px;">Is the confidence score meaningful?</div>';
+  html += '<div class="event-line" style="border-left-color:#e8c37a;">' + cal.verdict + '</div>';
+  if (cal.discrimination != null) {
+    html += '<div class="zone-item"><span>High-confidence half vs low-confidence half</span><span class="mono ' + rClass(cal.discrimination) + '">'
+      + (cal.discrimination >= 0 ? '+' : '') + (cal.discrimination * 100).toFixed(0) + ' pp win rate</span></div>';
+  }
+  if (cal.buckets.length) {
+    html += '<table class="factor-table"><tr><th style="text-align:left;color:#5c6270;font-weight:500;">Confidence band</th><th style="color:#5c6270;font-weight:500;">Win rate</th><th style="color:#5c6270;font-weight:500;">Expectancy</th></tr>';
+    html += cal.buckets.map(b =>
+      '<tr><td>' + b.lo + '–' + b.hi + '% <span style="color:#454a56;">(' + b.n + ')</span></td>'
+      + '<td>' + fmtPct(b.winRate) + '</td>'
+      + '<td class="' + rClass(b.expectancyR) + '">' + fmtR(b.expectancyR) + '</td></tr>').join('');
+    html += '</table>';
+  }
+
+  // 2. Where does the edge actually live?
+  html += '<div class="panel-title" style="font-size:11px;margin-top:14px;">Where the edge actually lives</div>';
+  html += '<div style="font-size:10px;color:#454a56;margin-bottom:6px;">By session</div>' + rows(bd.bySession, 'Session');
+  html += '<div style="font-size:10px;color:#454a56;margin:8px 0 6px;">By market regime</div>' + rows(bd.byRegime, 'Regime');
+  html += '<div style="font-size:10px;color:#454a56;margin:8px 0 6px;">By grade</div>' + rows(bd.byGrade, 'Grade');
+  html += '<div style="font-size:10px;color:#454a56;margin:8px 0 6px;">By direction</div>' + rows(bd.byDirection, 'Direction');
+
+  // 3. The roads not taken.
+  html += '<div class="panel-title" style="font-size:11px;margin-top:14px;">The setups it turned down</div>';
+  html += '<div class="data-source-note" style="margin-bottom:6px;">Every setup the filter rejected is tracked and resolved against real price anyway. This is the comparison a human journal can never make, because nobody records their non-trades.</div>';
+  html += '<div class="zone-item"><span>Taken</span><span class="mono ' + rClass(audit.taken.expectancyR) + '">'
+    + fmtR(audit.taken.expectancyR) + ' <span style="color:#454a56;">(' + audit.taken.n + ')</span></span></div>';
+  html += '<div class="zone-item"><span>Declined</span><span class="mono ' + rClass(audit.declined.expectancyR) + '">'
+    + fmtR(audit.declined.expectancyR) + ' <span style="color:#454a56;">(' + audit.declined.n + ')</span></span></div>';
+  const pending = shadowLog.filter(s => s.status === 'pending' || s.status === 'open').length;
+  if (pending) html += '<div class="zone-item"><span>Declined, still running</span><span class="mono">' + pending + '</span></div>';
+  html += '<div class="event-line" style="border-left-color:#c99bff;margin-top:6px;">' + audit.verdict + '</div>';
+
+  root.innerHTML = html;
+}
+document.getElementById('resetQuality').addEventListener('click', async () => {
+  shadowLog = [];
+  await saveShadowLog();
+  renderAnalysisQuality();
+});
+
+// ============================================================
+// AUTONOMOUS MODE
+// ------------------------------------------------------------
+// The unattended operator. Once the user ticks the box, a single heartbeat
+// drives everything: fetch fresh candles, grade any signal that has since hit
+// its stop or target, re-analyse, commit a new signal if the gate clears, and
+// periodically re-backtest and retrain on the record it has built.
+//
+// Three things make this survive real-world conditions rather than only a tab
+// left open on a desk:
+//   * One 60s heartbeat with due-time checks, not a pile of setIntervals. A
+//     laptop that sleeps for six hours wakes up, sees every task is overdue,
+//     and runs them once — rather than firing a backlog of missed timers.
+//   * Losing the connection is expected, not exceptional. Offline is a quiet
+//     pause; repeated failures back off exponentially instead of hammering a
+//     rate-limited provider until the key is blocked.
+//   * Time with the tab closed is recovered, not lost. catchUp() replays the
+//     gap from real candle history on the next load, so signals that resolved
+//     while nobody was watching still become training data.
+// ============================================================
+
+const AUTONOMY_KEY = 'smc-autonomy-v1';
+const AUTONOMY_HEARTBEAT_MS = 60 * 1000;
+
+let autonomyHandle = null;
+let autonomyBusy = false;
+
+function autonomyConfig() {
+  const num = (id, fallback) => {
+    const el = document.getElementById(id);
+    const v = el ? parseFloat(el.value) : NaN;
+    return isFinite(v) ? v : fallback;
+  };
+  return Object.assign({}, AUTONOMY_DEFAULTS, {
+    minConfidence: num('aMinConf', AUTONOMY_DEFAULTS.minConfidence),
+    cooldownMinutes: num('aCooldown', AUTONOMY_DEFAULTS.cooldownMinutes),
+    maxOpenSignals: num('aMaxOpen', AUTONOMY_DEFAULTS.maxOpenSignals),
+    analysisIntervalMinutes: num('aInterval', AUTONOMY_DEFAULTS.analysisIntervalMinutes),
+    backtestIntervalHours: num('aBtHours', AUTONOMY_DEFAULTS.backtestIntervalHours),
+    minMetaScore: num('aMinMeta', AUTONOMY_DEFAULTS.minMetaScore),
+    // Kill switch. 0 in any field disables that arm rather than expiring
+    // everything instantly, which is what a 0 limit would otherwise mean.
+    maxHoursToFill: num('aKillFill', AUTONOMY_DEFAULTS.maxHoursToFill),
+    maxHoursOpen: num('aKillOpen', AUTONOMY_DEFAULTS.maxHoursOpen),
+    maxDriftRToFill: num('aKillDrift', AUTONOMY_DEFAULTS.maxDriftRToFill),
+    partialTP: partialTPConfig(),
+    newsState: currentNewsState(),
+    gradeFloor: (document.getElementById('aMinGrade') || {}).value || AUTONOMY_DEFAULTS.gradeFloor
+  });
+}
+
+function saveAutonomyState() {
+  try {
+    localStorage.setItem(AUTONOMY_KEY, JSON.stringify({
+      enabled: autonomy.enabled,
+      cycles: autonomy.cycles,
+      gateTally: autonomy.gateTally,
+      signalsTaken: autonomy.signalsTaken,
+      autoResolved: autonomy.autoResolved,
+      lastAnalysisAt: autonomy.lastAnalysisAt,
+      lastBacktestAt: autonomy.lastBacktestAt,
+      lastSignalAt: autonomy.lastSignalAt,
+      cfg: {
+        aMinConf: document.getElementById('aMinConf').value,
+        aCooldown: document.getElementById('aCooldown').value,
+        aKillFill: document.getElementById('aKillFill').value,
+        aKillOpen: document.getElementById('aKillOpen').value,
+        aKillDrift: document.getElementById('aKillDrift').value,
+        aMaxOpen: document.getElementById('aMaxOpen').value,
+        aInterval: document.getElementById('aInterval').value,
+        aBtHours: document.getElementById('aBtHours').value,
+        aMinMeta: document.getElementById('aMinMeta').value,
+        aDailyCap: document.getElementById('aDailyCap').value,
+        aMinGrade: document.getElementById('aMinGrade').value
+      }
+    }));
+  } catch (e) { /* storage unavailable — autonomy still works, it just won't remember across reloads */ }
+}
+
+function loadAutonomyState() {
+  try {
+    const raw = localStorage.getItem(AUTONOMY_KEY);
+    if (!raw) return;
+    const saved = JSON.parse(raw);
+    Object.assign(autonomy, {
+      enabled: !!saved.enabled,
+      cycles: saved.cycles || 0,
+      gateTally: saved.gateTally || {},
+      signalsTaken: saved.signalsTaken || 0,
+      autoResolved: saved.autoResolved || 0,
+      lastAnalysisAt: saved.lastAnalysisAt || null,
+      lastBacktestAt: saved.lastBacktestAt || null,
+      lastSignalAt: saved.lastSignalAt || null
+    });
+    if (saved.cfg) {
+      Object.keys(saved.cfg).forEach(id => {
+        const el = document.getElementById(id);
+        if (el && saved.cfg[id] != null) el.value = saved.cfg[id];
+      });
+    }
+    document.getElementById('autonomyEnabled').checked = autonomy.enabled;
+  } catch (e) { /* nothing saved yet */ }
+}
+
+function setAutonomyStatus(text, tone, reason) {
+  const dot = document.getElementById('autonomyDot');
+  const status = document.getElementById('autonomyStatus');
+  const reasonEl = document.getElementById('autonomyReason');
+  if (!status) return;
+  status.textContent = text;
+  const colours = { live: '#3ecf8e', warn: '#ffa726', error: '#ef4d5f', idle: '#454a56' };
+  const c = colours[tone] || colours.idle;
+  dot.style.background = c;
+  dot.style.boxShadow = tone === 'live' ? '0 0 7px ' + c : 'none';
+  status.style.color = tone === 'idle' ? '#9298a5' : c;
+  if (reason !== undefined) reasonEl.textContent = reason || '';
+}
+
+function renderAutonomyStats() {
+  const live = signalLog.filter(s => s.status === 'pending' || s.status === 'open');
+  document.getElementById('aCycles').textContent = autonomy.cycles;
+  document.getElementById('aSignals').textContent = autonomy.signalsTaken;
+  document.getElementById('aResolved').textContent = autonomy.autoResolved;
+  document.getElementById('aOpen').textContent = live.length;
+
+  const killedEl = document.getElementById('aKilled');
+  if (killedEl) killedEl.textContent = signalLog.filter(s => s.status === 'expired').length;
+
+  // How long the oldest live trade has been sitting. This is the number that
+  // was invisible before: an order resting for a day looked identical to one
+  // placed a minute ago.
+  const oldestEl = document.getElementById('aOldest');
+  if (oldestEl) {
+    const cfg = autonomyConfig();
+    // Each trade is aged against the limit that actually applies to it: a
+    // resting order against the fill limit, a filled one against the hold
+    // limit. Using the larger of the two would leave an order 2.5x past its own
+    // deadline showing no warning at all.
+    const ages = live.map(s => {
+      const filled = s.status === 'open';
+      const t = Date.parse(filled ? (s.filledAt || s.time) : s.time);
+      if (!isFinite(t)) return null;
+      const hours = (Date.now() - t) / 3600000;
+      const limit = filled ? cfg.maxHoursOpen : cfg.maxHoursToFill;
+      return { hours, ratio: limit > 0 ? hours / limit : 0 };
+    }).filter(v => v != null);
+    if (!ages.length) {
+      oldestEl.textContent = '—';
+      oldestEl.style.color = '';
+    } else {
+      const worst = ages.reduce((a, b) => b.hours > a.hours ? b : a, ages[0]);
+      const closest = ages.reduce((a, b) => b.ratio > a.ratio ? b : a, ages[0]);
+      oldestEl.textContent = worst.hours < 1 ? Math.round(worst.hours * 60) + 'm' : worst.hours.toFixed(1) + 'h';
+      // Amber as a trade approaches its own kill limit, red once past it, so
+      // one about to be culled is visible before it disappears.
+      oldestEl.style.color = closest.ratio >= 1 ? '#ef4d5f' : closest.ratio >= 0.75 ? '#ffa726' : '';
+    }
+  }
+
+  const el = document.getElementById('gateTally');
+  if (!el) return;
+  const entries = Object.keys(autonomy.gateTally || {})
+    .map(k => ({ code: k, n: autonomy.gateTally[k] }))
+    .sort((a, b) => b.n - a.n);
+  if (!entries.length) { el.innerHTML = ''; return; }
+  el.innerHTML = '<div style="font-size:10px;color:#454a56;margin:8px 0 4px;">Why cycles ended this way</div>'
+    + entries.map(e => '<div class="zone-item" style="padding:3px 0;"><span style="font-size:11px;">'
+        + (GATE_LABELS[e.code] || e.code) + '</span><span class="mono" style="font-size:11px;color:'
+        + (e.code === 'taken' ? '#3ecf8e' : '#5c6270') + ';">' + e.n + '</span></div>').join('');
+}
+
+// Grade every unresolved signal against `candles`. Used both by the heartbeat
+// (fresh candles each cycle) and by catchUp() (deep history after downtime).
+// Returns how many signals reached a win/loss verdict.
+function resolveOpenSignals(candles, cfg) {
+  if (!candles || candles.length < 2) return 0;
+  let resolved = 0, killed = 0, changed = false;
+
+  // The auditor decides which live trades are past saving, not the engine.
+  // Letting the engine judge whether its own trade has gone bad is the thing
+  // the auditor exists to avoid — and it re-derives fill state from raw candles
+  // rather than trusting the signal's own status, so a "pending" order price
+  // actually traded through is caught rather than aged as if it never filled.
+  const tradeAudit = auditOpenTrades(signalLog, candles, {
+    maxHoursToFill: cfg.maxHoursToFill,
+    maxHoursOpen: cfg.maxHoursOpen,
+    maxDriftRToFill: cfg.maxDriftRToFill
+  });
+  lastTradeAudit = tradeAudit;
+  const killedBy = new Map(tradeAudit.kills.map(k => [k.id, k]));
+
+  signalLog.forEach(sig => {
+    if (sig.status !== 'pending' && sig.status !== 'open') return;
+    // An auditor kill outranks whatever the resolver would have said, EXCEPT
+    // when price has already settled the trade: a stop or target that has
+    // genuinely been hit is a real outcome and real evidence, and discarding it
+    // to enforce a time limit would throw away the data the limit exists to
+    // protect.
+    const verdict = resolveSignal(sig, candles, cfg);
+    const kill = killedBy.get(sig.id);
+    if (kill && verdict.status !== 'won' && verdict.status !== 'lost') {
+      sig.status = 'expired';
+      sig.expiryReason = 'auditor: ' + kill.reason;
+      sig.killSwitch = kill.code;
+      sig.resolvedAt = new Date().toISOString();
+      sig.resolvedBy = 'auditor';
+      paperCloseForSignal(sig.id, 'expired');
+      killed++; changed = true;
+      return;
+    }
+    if (verdict.status === 'won' || verdict.status === 'lost') {
+      if (applySignalOutcome(sig, verdict.status === 'won', {
+        auto: true, exitPrice: verdict.exitPrice, ambiguousBar: verdict.ambiguousBar, partial: verdict.partial
+      })) { resolved++; changed = true; }
+    } else if (verdict.status === 'expired') {
+      sig.status = 'expired';
+      sig.expiryReason = verdict.reason || null;
+      sig.killSwitch = verdict.killSwitch || null;
+      sig.resolvedAt = new Date().toISOString();
+      sig.resolvedBy = 'auto';
+      paperCloseForSignal(sig.id, 'expired');
+      if (verdict.killSwitch) killed++;
+      changed = true; // expired signals never become training data — no outcome to learn from
+    } else if (verdict.status === 'open' && sig.status === 'pending') {
+      sig.status = 'open'; // limit entry got tagged; it's a live position now
+      sig.filledAt = new Date().toISOString();
+      paperFillForSignal(sig.id, sig.filledAt);
+      changed = true;
+    }
+  });
+  if (changed) { saveSignalLog(); renderSignalLog(); }
+  if (resolved) autonomy.autoResolved += resolved;
+  if (killed) autonomy.killed = (autonomy.killed || 0) + killed;
+  resolveShadowSignals(candles, cfg);
+  return resolved;
+}
+
+// Shadows get the same treatment, minus the learning updates — a setup the
+// engine declined should inform the audit, not train the weights as though it
+// had been traded.
+function resolveShadowSignals(candles, cfg) {
+  if (!candles || candles.length < 2 || !shadowLog.length) return;
+  let changed = false;
+  shadowLog.forEach(sig => {
+    if (sig.status !== 'pending' && sig.status !== 'open') return;
+    const verdict = resolveSignal(sig, candles, cfg);
+    if (verdict.status === 'won' || verdict.status === 'lost') {
+      sig.status = verdict.status;
+      sig.resolvedAt = new Date().toISOString();
+      changed = true;
+    } else if (verdict.status === 'expired') {
+      sig.status = 'expired'; sig.expiryReason = verdict.reason || null; changed = true;
+    } else if (verdict.status === 'open' && sig.status === 'pending') {
+      sig.status = 'open'; changed = true;
+    }
+  });
+  if (changed) { saveShadowLog(); renderAnalysisQuality(); }
+}
+
+// One unattended pass. Everything that can fail is inside the caller's try.
+async function autonomyCycle() {
+  const cfg = autonomyConfig();
+  const now = Date.now();
+
+  // 0. Calendar first. It gates whether a signal may be taken at all, so it has
+  // to be current BEFORE the gate reads it — refreshing at the end of the cycle
+  // meant the first pass after a reconnect ran against an empty calendar and
+  // could take a position straight into a release window.
+  await refreshCalendar(false);
+
+  // 1. Fresh candles. resyncCandles() already refreshes liveData from the provider.
+  await resyncCandles();
+
+  // 2. Grade what the market has already decided since the last pass.
+  const graded = resolveOpenSignals(liveData, cfg);
+
+  // 3. Re-analyse on the new data.
+  refreshAll();
+  autonomy.lastAnalysisAt = now;
+
+  // 4. Commit a signal only if the gate clears.
+  let reason;
+  if (lastComposite) {
+    const plan = buildTradePlan(lastComposite, getTargetRR());
+    // The auditor is advisory everywhere except here. A critical finding means
+    // the analysis contradicts itself or the data it was built on — that is not
+    // a risk preference, and no confidence score should be able to override it.
+    const audit = runAudit();
+    renderAudit();
+    let gate;
+    if (audit && audit.blocking) {
+      gate = { take: false, code: 'audit',
+        reason: 'independent audit found ' + audit.critical + ' critical issue(s): ' + audit.findings[0].title };
+    } else {
+      gate = autonomyGate(lastComposite, plan, signalLog, autonomy.lastSignalAt, cfg);
+    }
+    // Tally why each cycle ended as it did. One latest-reason line cannot show
+    // whether 13 quiet cycles mean "no setup existed" or "the filter blocked
+    // every one" — and those need opposite responses.
+    const code = gate.code || 'unknown';
+    autonomy.gateTally[code] = (autonomy.gateTally[code] || 0) + 1;
+    if (gate.take) {
+      updateSignalUI(lastComposite, plan, true, 'auto'); // logIt = true -> addSignalToLog
+      autonomy.signalsTaken++;
+      autonomy.lastSignalAt = now;
+      reason = 'Took a ' + lastComposite.direction + ' at $' + fmt(plan.entry) +
+               ' (' + lastComposite.confidence + '% confidence' + (gate.grade ? ', grade ' + gate.grade : '') + ').';
+    } else {
+      updateSignalUI(lastComposite, plan, false); // keep the panel current without logging
+      // Track what was passed on, so the filter can be audited later rather
+      // than trusted forever.
+      addShadowSignal(lastComposite, plan, gate.reason);
+      reason = 'No signal taken — ' + gate.reason + '.';
+    }
+  } else {
+    reason = 'Analysis produced no result this cycle.';
+  }
+  if (graded) reason = 'Self-graded ' + graded + ' signal' + (graded === 1 ? '' : 's') + '. ' + reason;
+  autonomy.lastReason = reason;
+
+  // 5. Periodic re-backtest / retrain on the accumulated record.
+  const btDue = !autonomy.lastBacktestAt || (now - autonomy.lastBacktestAt) >= cfg.backtestIntervalHours * 3600 * 1000;
+  if (btDue) {
+    autonomy.lastBacktestAt = now;
+    await runBacktestCycle(true);
+  }
+
+  renderAnalysisQuality();
+  renderDataInventory();
+  renderCalendar();
+  renderReasoning();
+  runAudit();
+  renderAudit();
+  autonomy.cycles++;
+  autonomy.consecutiveErrors = 0;
+  autonomy.lastError = null;
+  saveAutonomyState();
+  renderAutonomyStats();
+  if (candlesStaleForBudget) {
+    setAutonomyStatus('Running on cached candles — daily API budget spent, resumes 00:00 UTC.', 'warn',
+      'Still grading open signals and re-analysing, but on the last candles fetched rather than fresh ones. ' + reason);
+  } else {
+    setAutonomyStatus('Running autonomously — last pass ' + new Date(now).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) + '.', 'live', reason);
+  }
+}
+
+// The heartbeat: decides whether a cycle is due, and handles every reason it
+// might not be. Deliberately does no analysis itself.
+async function autonomyHeartbeat() {
+  if (!autonomy.enabled || autonomyBusy) return;
+
+  if (!navigator.onLine) {
+    setAutonomyStatus('Paused — no internet connection. Resumes automatically.', 'warn',
+      'Nothing is lost while offline; the gap gets replayed from candle history once the connection is back.');
+    return;
+  }
+  if (dataMode !== 'live') {
+    setAutonomyStatus('Waiting for a live data provider — connect an API key above.', 'warn',
+      'Autonomous mode needs real candles; it will not run on the simulated feed.');
+    return;
+  }
+  // Gold is shut from Friday ~21:00 UTC to Sunday ~22:00 UTC. Analysing a frozen
+  // feed produces confident-looking signals off Friday's last bar, and every one
+  // of them enters the learning record as a real read of a market that was not
+  // trading. Nothing to analyse, so nothing runs.
+  if (!isMarketOpen(Date.now())) {
+    const clock = marketClock(Date.now());
+    const h = clock.hoursUntilOpen;
+    setAutonomyStatus('Market closed — resumes when gold reopens in ' +
+      (h < 1 ? Math.round(h * 60) + 'm' : h.toFixed(1) + 'h') + '.', 'warn',
+      'The feed is frozen at Friday\u2019s close. Analysing it would generate signals from a market that is not trading.');
+    return;
+  }
+  if (autonomy.skipCycles > 0) {
+    autonomy.skipCycles--;
+    setAutonomyStatus('Backing off after an error — retrying in ' + (autonomy.skipCycles + 1) + ' min.', 'warn', autonomy.lastError);
+    return;
+  }
+
+  const cfg = autonomyConfig();
+  const dueAt = (autonomy.lastAnalysisAt || 0) + cfg.analysisIntervalMinutes * 60 * 1000;
+  if (Date.now() < dueAt) {
+    const mins = Math.ceil((dueAt - Date.now()) / 60000);
+    setAutonomyStatus('Running autonomously — next pass in ' + mins + ' min.', 'live', autonomy.lastReason);
+    return;
+  }
+
+  autonomyBusy = true;
+  try {
+    await autonomyCycle();
+  } catch (e) {
+    autonomy.consecutiveErrors++;
+    autonomy.lastError = (e && e.message) || String(e);
+    // Exponential backoff, capped at ~30 min. A rate-limited or expired key
+    // should not turn into a request every minute for the rest of the day.
+    autonomy.skipCycles = Math.min(Math.pow(2, autonomy.consecutiveErrors), 30);
+    setAutonomyStatus('Cycle failed (' + autonomy.consecutiveErrors + ' in a row) — backing off ' + autonomy.skipCycles + ' min.', 'error', autonomy.lastError);
+    saveAutonomyState();
+  } finally {
+    autonomyBusy = false;
+  }
+}
+
+// Replay the time the app was closed or disconnected. Pulls the deepest history
+// the provider allows and grades every still-open signal against it, so a signal
+// that hit its target overnight is training data by the time the user looks.
+async function autonomyCatchUp() {
+  if (dataMode !== 'live' || !navigator.onLine) return;
+  const stillOpen = signalLog.filter(s => s.status === 'pending' || s.status === 'open');
+  if (!stillOpen.length) return;
+  setAutonomyStatus('Catching up — replaying ' + stillOpen.length + ' unresolved signal(s) against real history…', 'warn', '');
+  try {
+    const history = await PROVIDERS[activeProvider].timeSeries(apiKey, LIVE_INTERVAL, 5000);
+    const n = resolveOpenSignals(history, autonomyConfig());
+    renderAutonomyStats();
+    saveAutonomyState();
+    setAutonomyStatus('Catch-up complete.', autonomy.enabled ? 'live' : 'idle',
+      n ? 'Graded ' + n + ' signal(s) that resolved while the app was closed.'
+        : 'No signals had resolved while the app was closed.');
+  } catch (e) {
+    // Not fatal — the regular heartbeat will keep trying against live candles.
+    setAutonomyStatus('Catch-up could not fetch history — continuing on live candles.', 'warn', (e && e.message) || String(e));
+  }
+}
+
+function startAutonomy() {
+  if (autonomyHandle) clearInterval(autonomyHandle);
+  autonomyHandle = setInterval(autonomyHeartbeat, AUTONOMY_HEARTBEAT_MS);
+  autonomy.skipCycles = 0;
+  autonomy.consecutiveErrors = 0;
+  setAutonomyStatus('Autonomous mode on — first pass starting…', 'live', '');
+  autonomy.lastAnalysisAt = null; // force an immediate first pass
+  autonomyHeartbeat();
+}
+
+function stopAutonomy() {
+  if (autonomyHandle) { clearInterval(autonomyHandle); autonomyHandle = null; }
+  setAutonomyStatus('Off — check the box above to start.', 'idle', '');
+}
+
+document.getElementById('autonomyEnabled').addEventListener('change', function () {
+  autonomy.enabled = this.checked;
+  saveAutonomyState();
+  if (autonomy.enabled) startAutonomy(); else stopAutonomy();
+});
+providerSelect.addEventListener('change', renderQuota);
+const umm = document.getElementById('useMacroModel');
+if (umm) umm.addEventListener('change', () => { renderKnowledge(); renderReasoning(); });
+
+// A posture for building up a record rather than protecting capital. The engine
+// learns from resolved trades, and at the default B floor a ranging market
+// simply never qualifies — so a cautious setup collects nothing and the
+// knowledge base never starts.
+document.getElementById('aPresetCollect').addEventListener('click', () => {
+  // D, not C: even a perfect five-timeframe alignment only scores ~49%, so a C
+  // floor (>=30%) still rejects ordinary conditions and collects almost nothing.
+  document.getElementById('aMinGrade').value = 'D';
+  document.getElementById('aMinConf').value = 15;
+  document.getElementById('aCooldown').value = 30;
+  document.getElementById('aMaxOpen').value = 5;
+  document.getElementById('aMinMeta').value = -0.5;
+  saveAutonomyState();
+  autonomy.lastAnalysisAt = null; // re-evaluate immediately under the new thresholds
+  setAutonomyStatus('Data-collection thresholds applied — re-evaluating now.', 'live', '');
+  autonomyHeartbeat();
+});
+document.getElementById('autonomyAdvancedToggle').addEventListener('click', () => {
+  document.getElementById('autonomyAdvanced').classList.toggle('hidden');
+});
+['aMinConf', 'aCooldown', 'aMaxOpen', 'aInterval', 'aBtHours', 'aMinMeta', 'aDailyCap', 'aMinGrade',
+ 'aKillFill', 'aKillOpen', 'aKillDrift'].forEach(id => {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener('change', () => { saveAutonomyState(); renderQuota(); });
+});
+
+// React to connectivity changes straight away rather than waiting out a heartbeat.
+window.addEventListener('online', () => {
+  if (!autonomy.enabled) return;
+  autonomy.skipCycles = 0;
+  autonomy.consecutiveErrors = 0;
+  setAutonomyStatus('Back online — catching up…', 'warn', '');
+  autonomyCatchUp().then(autonomyHeartbeat);
+});
+window.addEventListener('offline', () => {
+  if (autonomy.enabled) setAutonomyStatus('Paused — no internet connection. Resumes automatically.', 'warn', '');
+});
+// Coming back to a backgrounded tab is a good moment to check for missed work:
+// mobile browsers in particular throttle timers hard once a tab is hidden.
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && autonomy.enabled) autonomyHeartbeat();
+});
+
+// ============================================================
+// BOOTSTRAP
+// ------------------------------------------------------------
+// Ordering matters here, which is why it is one explicit sequence rather than
+// scattered top-level calls: persisted learning state has to be restored (and
+// its weights applied) before the first analysis, and every DOM const further
+// up this file has to exist before anything reads it.
+// ============================================================
+// ============================================================
+// SETTINGS THAT SURVIVE A RELOAD
+// ------------------------------------------------------------
+// Only the paper account's balance and the autonomy thresholds were ever
+// persisted. Everything else a person could change — risk per trade, spread,
+// slippage, max concurrent, the partial-take-profit rules, all fourteen factor
+// weights, the target R:R, every backtest parameter, the news-window settings —
+// was read straight off the DOM and lost the moment the page reloaded. Tuning
+// the system was therefore something you had to redo from memory each session,
+// and an autonomous run would quietly revert to defaults after any refresh.
+//
+// One store, one list, restored before the first analysis so the weights are in
+// force when it runs. Ids that already have an owner are deliberately absent —
+// autonomy keeps its own (AUTONOMY_KEY), the paper on/off switches live with the
+// account, and the API keys are opt-in through "remember keys" rather than
+// swept up here.
+const SETTINGS_KEY = 'smc-settings-v1';
+const SETTINGS_IDS = [
+  // paper account
+  'pStartBalance', 'pRiskPct', 'pSpread', 'pSlippage', 'pMaxPos',
+  'pSizingMode', 'pFixedLots', 'pContractSize', 'pLotStep', 'pMinLots',
+  'pPartialPct', 'pHoldMeta', 'pPartialEnabled',
+  // factor weights
+  'wWeekly', 'wDaily', 'wHtf', 'wMtf', 'wLtf', 'wOb', 'wFvg', 'wLiq',
+  'wPd', 'wPriceAction', 'wClassic', 'wCorrelation', 'wFundamental', 'wNews',
+  // signal + backtest
+  'targetRR', 'pBars', 'pCapital', 'pRisk', 'pCostPips', 'pMinConf', 'pTargetRR',
+  // news window and macro model
+  'newsBeforeMin', 'newsAfterMin', 'newsBlockEnabled', 'newsBlockMedium',
+  'newsFlattenEnabled', 'newsFlattenMin', 'newsAlertMin', 'useMacroModel',
+  'weekendFlattenEnabled', 'weekendFlattenMin'
+];
+
+function saveSettings() {
+  const out = {};
+  SETTINGS_IDS.forEach(id => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    out[id] = el.type === 'checkbox' ? !!el.checked : el.value;
+  });
+  try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(out)); }
+  catch (e) { return false; }
+  return true;
+}
+
+function loadSettings() {
+  let saved;
+  try { saved = JSON.parse(localStorage.getItem(SETTINGS_KEY) || 'null'); }
+  catch (e) { return; }
+  if (!saved || typeof saved !== 'object') return;
+  SETTINGS_IDS.forEach(id => {
+    if (!(id in saved)) return;
+    const el = document.getElementById(id);
+    if (!el) return;
+    if (el.type === 'checkbox') el.checked = !!saved[id];
+    else if (saved[id] != null) el.value = saved[id];
+  });
+  // Sliders carry a printed value beside them that does not follow a
+  // programmatic change, so a restored weight would show the old number.
+  syncSliderLabels();
+}
+
+function syncSliderLabels() {
+  weightIds.forEach(id => {
+    const el = document.getElementById(id), out = document.getElementById(id + 'V');
+    if (el && out) out.textContent = el.value;
+  });
+  const rr = document.getElementById('targetRR'), rrOut = document.getElementById('targetRRV');
+  if (rr && rrOut) rrOut.textContent = '1:' + rr.value;
+}
+
+let settingsSaveTimer = null;
+function flagSettingsSaved() {
+  const el = document.getElementById('settingsSavedNote');
+  if (!el) return;
+  el.textContent = 'Settings saved.';
+  el.style.color = '#3ecf8e';
+  clearTimeout(settingsSaveTimer);
+  settingsSaveTimer = setTimeout(() => { el.textContent = ''; }, 2500);
+}
+
+function wireSettingsPersistence() {
+  SETTINGS_IDS.forEach(id => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    const handler = () => { if (saveSettings()) flagSettingsSaved(); };
+    el.addEventListener('change', handler);
+    // Sliders and number spinners fire `input` continuously; `change` alone
+    // would miss a drag that never blurs.
+    if (el.type === 'range' || el.type === 'number') el.addEventListener('input', handler);
+  });
+}
+
+// ============================================================
+// IS THIS TAB STILL RUNNING THE CURRENT CODE?
+// ------------------------------------------------------------
+// This app is built to be left open for days doing unattended analysis, which
+// means a tab can go on running the modules it loaded at open time long after a
+// fix has shipped. That is not hypothetical: the macro engine ran on 1976-2006
+// FRED data, the fix deployed, and an open tab would have carried on producing
+// confident, wrong numbers with nothing on screen to say so.
+//
+// The check compares the ETag of app.js now against the one seen at startup, so
+// it needs no version constant to keep in sync and no build step. `no-store`
+// forces the request past the browser cache; the server already sends
+// must-revalidate, so this is cheap.
+const UPDATE_CHECK_MS = 30 * 60 * 1000;
+let loadedBuildTag = null;
+let updateWatchHandle = null;
+
+async function currentBuildTag() {
+  try {
+    const r = await fetch('app.js', { method: 'HEAD', cache: 'no-store' });
+    return r.headers.get('etag') || r.headers.get('last-modified') || null;
+  } catch (e) {
+    return null; // offline, or the check is blocked — try again next time
+  }
+}
+
+async function checkForNewBuild() {
+  const tag = await currentBuildTag();
+  if (!tag) return;
+  if (loadedBuildTag == null) { loadedBuildTag = tag; return; }
+  if (tag === loadedBuildTag) return;
+  const banner = document.getElementById('updateBanner');
+  if (banner) banner.classList.remove('hidden');
+}
+
+function startUpdateWatch() {
+  const reload = document.getElementById('updateReload');
+  if (reload) reload.addEventListener('click', () => window.location.reload());
+  checkForNewBuild();
+  if (updateWatchHandle) clearInterval(updateWatchHandle);
+  updateWatchHandle = setInterval(checkForNewBuild, UPDATE_CHECK_MS);
+}
+
+async function bootstrap() {
+  // Before anything reads a control: the weights, risk settings and thresholds
+  // have to be the saved ones by the time the first analysis runs.
+  loadSettings();
+  wireSettingsPersistence();
+  await loadLearningState();
+  await loadSignalLog();
+  await loadShadowLog();
+  applyKnowledgeBaseWeights();
+  await loadPaper();
+  await loadKnowledge();
+  await loadCalendarCache();
+  loadAutonomyState();
+  loadQuota();
+  // Every store the merge touches is loaded by this point — the log it merges
+  // into, the paper account it books positions in, the learning state it
+  // updates. Replay anything the worker sent while that was still loading.
+  flushPendingIngest();
+  renderSignalLog();   // first render happened before the paper account loaded
+  startLivenessTicker();
+  startUpdateWatch();
+  startNewsWatch();
+  renderQuota();
+  renderAutonomyStats();
+  renderAnalysisQuality();
+  renderPaper();
+  renderDataInventory();
+  renderCalendar();
+  renderReasoning();
+  renderKnowledge();
+  runAudit();
+  renderAudit();
+  refreshWorkerTotals().then(renderDataInventory);
+  refreshAll();
+
+  const saved = await loadSavedKeys();
+  if (!saved) {
+    document.getElementById('autoBacktestStatus').textContent = 'Connect a data provider to enable auto-backtesting.';
+  } else {
+    document.getElementById('rememberKeysCheckbox').checked = true;
+    if (saved.provider) providerSelect.value = saved.provider;
+    if (saved.fredKey) document.getElementById('fredKeyInput').value = saved.fredKey;
+    if (saved.newsKey) document.getElementById('newsKeyInput').value = saved.newsKey;
+    if (typeof saved.autoBacktest === 'boolean') document.getElementById('autoBacktestCheckbox').checked = saved.autoBacktest;
+    if (saved.apiKey) {
+      document.getElementById('apiKeyInput').value = saved.apiKey;
+      connStatus.textContent = 'Restoring saved connection...';
+      await connectProvider(); // also re-fetches correlation/fundamentals/news with the restored keys
+    } else if (saved.fredKey || saved.newsKey) {
+      // No price provider was connected, but FRED/news keys were saved independently — restore those engines too.
+      await refreshCorrelation(activeProvider, apiKey, saved.fredKey || '');
+      await refreshFundamentals(saved.fredKey || '');
+      await refreshNewsSentiment(saved.newsKey || '');
+      refreshAll();
+      document.getElementById('autoBacktestStatus').textContent = 'Connect a data provider to enable auto-backtesting.';
+    } else {
+      document.getElementById('autoBacktestStatus').textContent = 'Connect a data provider to enable auto-backtesting.';
+    }
+  }
+
+  // The calendar gates trading, so it must be loaded before autonomy's first pass.
+  await refreshCalendar(false);
+  renderCalendar();
+  renderReasoning();
+
+  // Recover anything that resolved while the app was closed, then pick the loop back up.
+  if (autonomy.enabled) {
+    await autonomyCatchUp();
+    startAutonomy();
+  } else {
+    setAutonomyStatus('Off — check the box above to start.', 'idle', '');
+  }
+}
+bootstrap();
+ + fmt(p.tp)
+        + '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:5px;">'
+        + '<button class="btn" data-paper-action="edit-sl" data-paper-id="' + p.id + '" style="padding:3px 7px;font-size:10px;">Edit SL</button>'
+        + '<button class="btn" data-paper-action="close" data-paper-id="' + p.id + '" style="padding:3px 7px;font-size:10px;border-color:#ef4d5f;color:#ef4d5f;">Close at market</button>'
+        + '</div></span><span class="mono ' + pnlCls(u) + '">' + money(u) + '</span></div>';
+    }).join('');
+  }
+
+  const closed = paper.positions.filter(p => p.status === 'closed' && inEra(p)).slice(0, 8);
+  if (closed.length) {
+    html += '<div style="font-size:10px;color:#454a56;margin:10px 0 6px;">Recent closed</div>';
+    html += closed.map(p =>
+      '<div class="zone-item"><span><span class="dirtag ' + p.dir + '">' + p.dir + '</span> ' + (p.outcome === 'won' ? (p.partial ? '◐' : '✓') : p.outcome === 'lost' ? '✗' : '–')
+      + ' <span style="color:#454a56;">' + lotLabel(p) + ' · exit $' + fmt(p.exitPrice) + '</span></span>'
+      + '<span class="mono ' + pnlCls(p.pnl) + '">' + money(p.pnl) + (p.rMultiple != null ? ' <span style="color:#454a56;">' + (p.rMultiple >= 0 ? '+' : '') + fmt(p.rMultiple) + 'R</span>' : '') + '</span></div>'
+    ).join('');
+  }
+
+  if (!resting.length && !open.length && !closed.length) {
+    html += '<div class="zone-empty">' + (a.archivedCount
+      ? 'Account reset — no trades in this era yet. The record above is intact.'
+      : 'No paper trades yet. Positions open automatically as the engine logs signals.') + '</div>';
+  }
+  root.innerHTML = html;
+}
+
+function renderPaperStatusNote() {
+  const note = document.getElementById('paperStatus');
+  if (!note) return;
+  if (!paper.enabled) { note.textContent = 'Off — no positions will be opened.'; return; }
+  note.textContent = paper.manual
+    ? 'On — new signals will open simulated positions. No real orders are placed.'
+    : 'On for the engine\'s own signals. Signals you generate by hand are excluded (signal panel).';
+}
+
+document.getElementById('paperEnabled').addEventListener('change', function () {
+  paper.enabled = this.checked;
+  savePaper();
+  renderPaper();
+  renderPaperStatusNote();
+  renderPaperManualHint();
+});
+
+const paperManualCb = document.getElementById('paperManual');
+if (paperManualCb) paperManualCb.addEventListener('change', function () {
+  paper.manual = this.checked;
+  // Ticking it with the account off is a request to paper-trade, so honour it
+  // rather than silently doing nothing.
+  if (paper.manual && !paper.enabled) {
+    paper.enabled = true;
+    const master = document.getElementById('paperEnabled');
+    if (master) master.checked = true;
+  }
+  savePaper();
+  renderPaper();
+  renderPaperStatusNote();
+  renderPaperManualHint();
+});
+document.getElementById('paperAdvancedToggle').addEventListener('click', () => {
+  document.getElementById('paperAdvanced').classList.toggle('hidden');
+});
+['pStartBalance', 'pRiskPct', 'pSpread', 'pSlippage', 'pMaxPos', 'pPartialPct', 'pHoldMeta', 'pPartialEnabled'].forEach(id => {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener('change', () => { paper.startingBalance = paperConfig().startingBalance; savePaper(); renderPaper(); });
+});
+document.getElementById('paperReset').addEventListener('click', async () => {
+  const price = currentMarkPrice();
+  const live = paper.positions.filter(p => p.status === 'open' || p.status === 'pending').length;
+  const keeping = paper.positions.filter(p => p.status === 'closed').length;
+  const msg = 'Reset the paper account back to $' + fmt(paperConfig().startingBalance) + '?\n\n'
+    + (live ? live + ' live position(s) will be closed at the current price first.\n' : '')
+    + keeping + ' completed trade(s) stay on record — they are what the system learns from, '
+    + 'and they keep counting towards the lifetime win rate. They just stop counting towards the balance.';
+  if (!window.confirm(msg)) return;
+  const out = resetPaperAccount(paper.positions, isFinite(price) ? price : undefined, Date.now());
+  paper.positions = out.positions;
+  paper.epoch = out.epoch;
+  await savePaper();
+  renderPaper();
+  renderDataInventory();
+});
+
+// ============================================================
+// ANALYSIS QUALITY PANEL
+// ------------------------------------------------------------
+// Renders the three self-audits. Every number here is deliberately allowed to
+// say "not enough data yet" rather than show a confident-looking figure built
+// on four trades — a reassuring number from a tiny sample is worse than no
+// number, because it gets believed.
+// ============================================================
+function fmtR(v) { return v == null ? '—' : (v >= 0 ? '+' : '') + v.toFixed(2) + 'R'; }
+function fmtPct(v) { return v == null ? '—' : (v * 100).toFixed(0) + '%'; }
+function rClass(v) { return v == null ? 'fneu' : v > 0.05 ? 'fpos' : v < -0.05 ? 'fneg' : 'fneu'; }
+
+function renderAnalysisQuality() {
+  const root = document.getElementById('qualityContent');
+  if (!root) return;
+
+  const cal = computeCalibration(signalLog);
+  const bd = computeConditionBreakdown(signalLog);
+  const audit = computeGateAudit(signalLog, shadowLog);
+
+  const rows = (list, label) => {
+    const usable = list.filter(r => r.n >= 3);
+    if (!usable.length) return '<div class="zone-empty">' + label + ': not enough resolved trades yet (need 3+ per group).</div>';
+    return usable.map(r =>
+      '<div class="zone-item"><span>' + r.key + ' <span style="color:#454a56;">(' + r.n + ')</span></span>' +
+      '<span class="mono ' + rClass(r.expectancyR) + '">' + fmtR(r.expectancyR) + ' · ' + fmtPct(r.winRate) + '</span></div>'
+    ).join('');
+  };
+
+  const o = bd.overall;
+  let html = '';
+
+  html += '<div class="data-source-note" style="margin-bottom:8px;">Expectancy is shown in R — average profit per unit risked. At a 1:4 target a 30% win rate is already profitable, so win rate alone is a poor scorecard and R is the honest one.</div>';
+
+  html += '<div class="metrics" style="margin-bottom:10px;">'
+    + '<div class="card"><div class="label">Resolved</div><div class="value mono">' + o.n + '</div></div>'
+    + '<div class="card"><div class="label">Win Rate</div><div class="value mono">' + fmtPct(o.winRate) + '</div></div>'
+    + '<div class="card"><div class="label">Expectancy</div><div class="value mono ' + rClass(o.expectancyR) + '">' + fmtR(o.expectancyR) + '</div></div>'
+    + '<div class="card"><div class="label">Total</div><div class="value mono ' + rClass(o.totalR) + '">' + fmtR(o.totalR) + '</div></div>'
+    + '</div>';
+
+  // 1. Is the confidence number worth anything?
+  html += '<div class="panel-title" style="font-size:11px;margin-top:12px;">Is the confidence score meaningful?</div>';
+  html += '<div class="event-line" style="border-left-color:#e8c37a;">' + cal.verdict + '</div>';
+  if (cal.discrimination != null) {
+    html += '<div class="zone-item"><span>High-confidence half vs low-confidence half</span><span class="mono ' + rClass(cal.discrimination) + '">'
+      + (cal.discrimination >= 0 ? '+' : '') + (cal.discrimination * 100).toFixed(0) + ' pp win rate</span></div>';
+  }
+  if (cal.buckets.length) {
+    html += '<table class="factor-table"><tr><th style="text-align:left;color:#5c6270;font-weight:500;">Confidence band</th><th style="color:#5c6270;font-weight:500;">Win rate</th><th style="color:#5c6270;font-weight:500;">Expectancy</th></tr>';
+    html += cal.buckets.map(b =>
+      '<tr><td>' + b.lo + '–' + b.hi + '% <span style="color:#454a56;">(' + b.n + ')</span></td>'
+      + '<td>' + fmtPct(b.winRate) + '</td>'
+      + '<td class="' + rClass(b.expectancyR) + '">' + fmtR(b.expectancyR) + '</td></tr>').join('');
+    html += '</table>';
+  }
+
+  // 2. Where does the edge actually live?
+  html += '<div class="panel-title" style="font-size:11px;margin-top:14px;">Where the edge actually lives</div>';
+  html += '<div style="font-size:10px;color:#454a56;margin-bottom:6px;">By session</div>' + rows(bd.bySession, 'Session');
+  html += '<div style="font-size:10px;color:#454a56;margin:8px 0 6px;">By market regime</div>' + rows(bd.byRegime, 'Regime');
+  html += '<div style="font-size:10px;color:#454a56;margin:8px 0 6px;">By grade</div>' + rows(bd.byGrade, 'Grade');
+  html += '<div style="font-size:10px;color:#454a56;margin:8px 0 6px;">By direction</div>' + rows(bd.byDirection, 'Direction');
+
+  // 3. The roads not taken.
+  html += '<div class="panel-title" style="font-size:11px;margin-top:14px;">The setups it turned down</div>';
+  html += '<div class="data-source-note" style="margin-bottom:6px;">Every setup the filter rejected is tracked and resolved against real price anyway. This is the comparison a human journal can never make, because nobody records their non-trades.</div>';
+  html += '<div class="zone-item"><span>Taken</span><span class="mono ' + rClass(audit.taken.expectancyR) + '">'
+    + fmtR(audit.taken.expectancyR) + ' <span style="color:#454a56;">(' + audit.taken.n + ')</span></span></div>';
+  html += '<div class="zone-item"><span>Declined</span><span class="mono ' + rClass(audit.declined.expectancyR) + '">'
+    + fmtR(audit.declined.expectancyR) + ' <span style="color:#454a56;">(' + audit.declined.n + ')</span></span></div>';
+  const pending = shadowLog.filter(s => s.status === 'pending' || s.status === 'open').length;
+  if (pending) html += '<div class="zone-item"><span>Declined, still running</span><span class="mono">' + pending + '</span></div>';
+  html += '<div class="event-line" style="border-left-color:#c99bff;margin-top:6px;">' + audit.verdict + '</div>';
+
+  root.innerHTML = html;
+}
+document.getElementById('resetQuality').addEventListener('click', async () => {
+  shadowLog = [];
+  await saveShadowLog();
+  renderAnalysisQuality();
+});
+
+// ============================================================
+// AUTONOMOUS MODE
+// ------------------------------------------------------------
+// The unattended operator. Once the user ticks the box, a single heartbeat
+// drives everything: fetch fresh candles, grade any signal that has since hit
+// its stop or target, re-analyse, commit a new signal if the gate clears, and
+// periodically re-backtest and retrain on the record it has built.
+//
+// Three things make this survive real-world conditions rather than only a tab
+// left open on a desk:
+//   * One 60s heartbeat with due-time checks, not a pile of setIntervals. A
+//     laptop that sleeps for six hours wakes up, sees every task is overdue,
+//     and runs them once — rather than firing a backlog of missed timers.
+//   * Losing the connection is expected, not exceptional. Offline is a quiet
+//     pause; repeated failures back off exponentially instead of hammering a
+//     rate-limited provider until the key is blocked.
+//   * Time with the tab closed is recovered, not lost. catchUp() replays the
+//     gap from real candle history on the next load, so signals that resolved
+//     while nobody was watching still become training data.
+// ============================================================
+
+const AUTONOMY_KEY = 'smc-autonomy-v1';
+const AUTONOMY_HEARTBEAT_MS = 60 * 1000;
+
+let autonomyHandle = null;
+let autonomyBusy = false;
+
+function autonomyConfig() {
+  const num = (id, fallback) => {
+    const el = document.getElementById(id);
+    const v = el ? parseFloat(el.value) : NaN;
+    return isFinite(v) ? v : fallback;
+  };
+  return Object.assign({}, AUTONOMY_DEFAULTS, {
+    minConfidence: num('aMinConf', AUTONOMY_DEFAULTS.minConfidence),
+    cooldownMinutes: num('aCooldown', AUTONOMY_DEFAULTS.cooldownMinutes),
+    maxOpenSignals: num('aMaxOpen', AUTONOMY_DEFAULTS.maxOpenSignals),
+    analysisIntervalMinutes: num('aInterval', AUTONOMY_DEFAULTS.analysisIntervalMinutes),
+    backtestIntervalHours: num('aBtHours', AUTONOMY_DEFAULTS.backtestIntervalHours),
+    minMetaScore: num('aMinMeta', AUTONOMY_DEFAULTS.minMetaScore),
+    // Kill switch. 0 in any field disables that arm rather than expiring
+    // everything instantly, which is what a 0 limit would otherwise mean.
+    maxHoursToFill: num('aKillFill', AUTONOMY_DEFAULTS.maxHoursToFill),
+    maxHoursOpen: num('aKillOpen', AUTONOMY_DEFAULTS.maxHoursOpen),
+    maxDriftRToFill: num('aKillDrift', AUTONOMY_DEFAULTS.maxDriftRToFill),
+    partialTP: partialTPConfig(),
+    newsState: currentNewsState(),
+    gradeFloor: (document.getElementById('aMinGrade') || {}).value || AUTONOMY_DEFAULTS.gradeFloor
+  });
+}
+
+function saveAutonomyState() {
+  try {
+    localStorage.setItem(AUTONOMY_KEY, JSON.stringify({
+      enabled: autonomy.enabled,
+      cycles: autonomy.cycles,
+      gateTally: autonomy.gateTally,
+      signalsTaken: autonomy.signalsTaken,
+      autoResolved: autonomy.autoResolved,
+      lastAnalysisAt: autonomy.lastAnalysisAt,
+      lastBacktestAt: autonomy.lastBacktestAt,
+      lastSignalAt: autonomy.lastSignalAt,
+      cfg: {
+        aMinConf: document.getElementById('aMinConf').value,
+        aCooldown: document.getElementById('aCooldown').value,
+        aKillFill: document.getElementById('aKillFill').value,
+        aKillOpen: document.getElementById('aKillOpen').value,
+        aKillDrift: document.getElementById('aKillDrift').value,
+        aMaxOpen: document.getElementById('aMaxOpen').value,
+        aInterval: document.getElementById('aInterval').value,
+        aBtHours: document.getElementById('aBtHours').value,
+        aMinMeta: document.getElementById('aMinMeta').value,
+        aDailyCap: document.getElementById('aDailyCap').value,
+        aMinGrade: document.getElementById('aMinGrade').value
+      }
+    }));
+  } catch (e) { /* storage unavailable — autonomy still works, it just won't remember across reloads */ }
+}
+
+function loadAutonomyState() {
+  try {
+    const raw = localStorage.getItem(AUTONOMY_KEY);
+    if (!raw) return;
+    const saved = JSON.parse(raw);
+    Object.assign(autonomy, {
+      enabled: !!saved.enabled,
+      cycles: saved.cycles || 0,
+      gateTally: saved.gateTally || {},
+      signalsTaken: saved.signalsTaken || 0,
+      autoResolved: saved.autoResolved || 0,
+      lastAnalysisAt: saved.lastAnalysisAt || null,
+      lastBacktestAt: saved.lastBacktestAt || null,
+      lastSignalAt: saved.lastSignalAt || null
+    });
+    if (saved.cfg) {
+      Object.keys(saved.cfg).forEach(id => {
+        const el = document.getElementById(id);
+        if (el && saved.cfg[id] != null) el.value = saved.cfg[id];
+      });
+    }
+    document.getElementById('autonomyEnabled').checked = autonomy.enabled;
+  } catch (e) { /* nothing saved yet */ }
+}
+
+function setAutonomyStatus(text, tone, reason) {
+  const dot = document.getElementById('autonomyDot');
+  const status = document.getElementById('autonomyStatus');
+  const reasonEl = document.getElementById('autonomyReason');
+  if (!status) return;
+  status.textContent = text;
+  const colours = { live: '#3ecf8e', warn: '#ffa726', error: '#ef4d5f', idle: '#454a56' };
+  const c = colours[tone] || colours.idle;
+  dot.style.background = c;
+  dot.style.boxShadow = tone === 'live' ? '0 0 7px ' + c : 'none';
+  status.style.color = tone === 'idle' ? '#9298a5' : c;
+  if (reason !== undefined) reasonEl.textContent = reason || '';
+}
+
+function renderAutonomyStats() {
+  const live = signalLog.filter(s => s.status === 'pending' || s.status === 'open');
+  document.getElementById('aCycles').textContent = autonomy.cycles;
+  document.getElementById('aSignals').textContent = autonomy.signalsTaken;
+  document.getElementById('aResolved').textContent = autonomy.autoResolved;
+  document.getElementById('aOpen').textContent = live.length;
+
+  const killedEl = document.getElementById('aKilled');
+  if (killedEl) killedEl.textContent = signalLog.filter(s => s.status === 'expired').length;
+
+  // How long the oldest live trade has been sitting. This is the number that
+  // was invisible before: an order resting for a day looked identical to one
+  // placed a minute ago.
+  const oldestEl = document.getElementById('aOldest');
+  if (oldestEl) {
+    const cfg = autonomyConfig();
+    // Each trade is aged against the limit that actually applies to it: a
+    // resting order against the fill limit, a filled one against the hold
+    // limit. Using the larger of the two would leave an order 2.5x past its own
+    // deadline showing no warning at all.
+    const ages = live.map(s => {
+      const filled = s.status === 'open';
+      const t = Date.parse(filled ? (s.filledAt || s.time) : s.time);
+      if (!isFinite(t)) return null;
+      const hours = (Date.now() - t) / 3600000;
+      const limit = filled ? cfg.maxHoursOpen : cfg.maxHoursToFill;
+      return { hours, ratio: limit > 0 ? hours / limit : 0 };
+    }).filter(v => v != null);
+    if (!ages.length) {
+      oldestEl.textContent = '—';
+      oldestEl.style.color = '';
+    } else {
+      const worst = ages.reduce((a, b) => b.hours > a.hours ? b : a, ages[0]);
+      const closest = ages.reduce((a, b) => b.ratio > a.ratio ? b : a, ages[0]);
+      oldestEl.textContent = worst.hours < 1 ? Math.round(worst.hours * 60) + 'm' : worst.hours.toFixed(1) + 'h';
+      // Amber as a trade approaches its own kill limit, red once past it, so
+      // one about to be culled is visible before it disappears.
+      oldestEl.style.color = closest.ratio >= 1 ? '#ef4d5f' : closest.ratio >= 0.75 ? '#ffa726' : '';
+    }
+  }
+
+  const el = document.getElementById('gateTally');
+  if (!el) return;
+  const entries = Object.keys(autonomy.gateTally || {})
+    .map(k => ({ code: k, n: autonomy.gateTally[k] }))
+    .sort((a, b) => b.n - a.n);
+  if (!entries.length) { el.innerHTML = ''; return; }
+  el.innerHTML = '<div style="font-size:10px;color:#454a56;margin:8px 0 4px;">Why cycles ended this way</div>'
+    + entries.map(e => '<div class="zone-item" style="padding:3px 0;"><span style="font-size:11px;">'
+        + (GATE_LABELS[e.code] || e.code) + '</span><span class="mono" style="font-size:11px;color:'
+        + (e.code === 'taken' ? '#3ecf8e' : '#5c6270') + ';">' + e.n + '</span></div>').join('');
+}
+
+// Grade every unresolved signal against `candles`. Used both by the heartbeat
+// (fresh candles each cycle) and by catchUp() (deep history after downtime).
+// Returns how many signals reached a win/loss verdict.
+function resolveOpenSignals(candles, cfg) {
+  if (!candles || candles.length < 2) return 0;
+  let resolved = 0, killed = 0, changed = false;
+
+  // The auditor decides which live trades are past saving, not the engine.
+  // Letting the engine judge whether its own trade has gone bad is the thing
+  // the auditor exists to avoid — and it re-derives fill state from raw candles
+  // rather than trusting the signal's own status, so a "pending" order price
+  // actually traded through is caught rather than aged as if it never filled.
+  const tradeAudit = auditOpenTrades(signalLog, candles, {
+    maxHoursToFill: cfg.maxHoursToFill,
+    maxHoursOpen: cfg.maxHoursOpen,
+    maxDriftRToFill: cfg.maxDriftRToFill
+  });
+  lastTradeAudit = tradeAudit;
+  const killedBy = new Map(tradeAudit.kills.map(k => [k.id, k]));
+
+  signalLog.forEach(sig => {
+    if (sig.status !== 'pending' && sig.status !== 'open') return;
+    // An auditor kill outranks whatever the resolver would have said, EXCEPT
+    // when price has already settled the trade: a stop or target that has
+    // genuinely been hit is a real outcome and real evidence, and discarding it
+    // to enforce a time limit would throw away the data the limit exists to
+    // protect.
+    const verdict = resolveSignal(sig, candles, cfg);
+    const kill = killedBy.get(sig.id);
+    if (kill && verdict.status !== 'won' && verdict.status !== 'lost') {
+      sig.status = 'expired';
+      sig.expiryReason = 'auditor: ' + kill.reason;
+      sig.killSwitch = kill.code;
+      sig.resolvedAt = new Date().toISOString();
+      sig.resolvedBy = 'auditor';
+      paperCloseForSignal(sig.id, 'expired');
+      killed++; changed = true;
+      return;
+    }
+    if (verdict.status === 'won' || verdict.status === 'lost') {
+      if (applySignalOutcome(sig, verdict.status === 'won', {
+        auto: true, exitPrice: verdict.exitPrice, ambiguousBar: verdict.ambiguousBar, partial: verdict.partial
+      })) { resolved++; changed = true; }
+    } else if (verdict.status === 'expired') {
+      sig.status = 'expired';
+      sig.expiryReason = verdict.reason || null;
+      sig.killSwitch = verdict.killSwitch || null;
+      sig.resolvedAt = new Date().toISOString();
+      sig.resolvedBy = 'auto';
+      paperCloseForSignal(sig.id, 'expired');
+      if (verdict.killSwitch) killed++;
+      changed = true; // expired signals never become training data — no outcome to learn from
+    } else if (verdict.status === 'open' && sig.status === 'pending') {
+      sig.status = 'open'; // limit entry got tagged; it's a live position now
+      sig.filledAt = new Date().toISOString();
+      paperFillForSignal(sig.id, sig.filledAt);
+      changed = true;
+    }
+  });
+  if (changed) { saveSignalLog(); renderSignalLog(); }
+  if (resolved) autonomy.autoResolved += resolved;
+  if (killed) autonomy.killed = (autonomy.killed || 0) + killed;
+  resolveShadowSignals(candles, cfg);
+  return resolved;
+}
+
+// Shadows get the same treatment, minus the learning updates — a setup the
+// engine declined should inform the audit, not train the weights as though it
+// had been traded.
+function resolveShadowSignals(candles, cfg) {
+  if (!candles || candles.length < 2 || !shadowLog.length) return;
+  let changed = false;
+  shadowLog.forEach(sig => {
+    if (sig.status !== 'pending' && sig.status !== 'open') return;
+    const verdict = resolveSignal(sig, candles, cfg);
+    if (verdict.status === 'won' || verdict.status === 'lost') {
+      sig.status = verdict.status;
+      sig.resolvedAt = new Date().toISOString();
+      changed = true;
+    } else if (verdict.status === 'expired') {
+      sig.status = 'expired'; sig.expiryReason = verdict.reason || null; changed = true;
+    } else if (verdict.status === 'open' && sig.status === 'pending') {
+      sig.status = 'open'; changed = true;
+    }
+  });
+  if (changed) { saveShadowLog(); renderAnalysisQuality(); }
+}
+
+// One unattended pass. Everything that can fail is inside the caller's try.
+async function autonomyCycle() {
+  const cfg = autonomyConfig();
+  const now = Date.now();
+
+  // 0. Calendar first. It gates whether a signal may be taken at all, so it has
+  // to be current BEFORE the gate reads it — refreshing at the end of the cycle
+  // meant the first pass after a reconnect ran against an empty calendar and
+  // could take a position straight into a release window.
+  await refreshCalendar(false);
+
+  // 1. Fresh candles. resyncCandles() already refreshes liveData from the provider.
+  await resyncCandles();
+
+  // 2. Grade what the market has already decided since the last pass.
+  const graded = resolveOpenSignals(liveData, cfg);
+
+  // 3. Re-analyse on the new data.
+  refreshAll();
+  autonomy.lastAnalysisAt = now;
+
+  // 4. Commit a signal only if the gate clears.
+  let reason;
+  if (lastComposite) {
+    const plan = buildTradePlan(lastComposite, getTargetRR());
+    // The auditor is advisory everywhere except here. A critical finding means
+    // the analysis contradicts itself or the data it was built on — that is not
+    // a risk preference, and no confidence score should be able to override it.
+    const audit = runAudit();
+    renderAudit();
+    let gate;
+    if (audit && audit.blocking) {
+      gate = { take: false, code: 'audit',
+        reason: 'independent audit found ' + audit.critical + ' critical issue(s): ' + audit.findings[0].title };
+    } else {
+      gate = autonomyGate(lastComposite, plan, signalLog, autonomy.lastSignalAt, cfg);
+    }
+    // Tally why each cycle ended as it did. One latest-reason line cannot show
+    // whether 13 quiet cycles mean "no setup existed" or "the filter blocked
+    // every one" — and those need opposite responses.
+    const code = gate.code || 'unknown';
+    autonomy.gateTally[code] = (autonomy.gateTally[code] || 0) + 1;
+    if (gate.take) {
+      updateSignalUI(lastComposite, plan, true, 'auto'); // logIt = true -> addSignalToLog
+      autonomy.signalsTaken++;
+      autonomy.lastSignalAt = now;
+      reason = 'Took a ' + lastComposite.direction + ' at $' + fmt(plan.entry) +
+               ' (' + lastComposite.confidence + '% confidence' + (gate.grade ? ', grade ' + gate.grade : '') + ').';
+    } else {
+      updateSignalUI(lastComposite, plan, false); // keep the panel current without logging
+      // Track what was passed on, so the filter can be audited later rather
+      // than trusted forever.
+      addShadowSignal(lastComposite, plan, gate.reason);
+      reason = 'No signal taken — ' + gate.reason + '.';
+    }
+  } else {
+    reason = 'Analysis produced no result this cycle.';
+  }
+  if (graded) reason = 'Self-graded ' + graded + ' signal' + (graded === 1 ? '' : 's') + '. ' + reason;
+  autonomy.lastReason = reason;
+
+  // 5. Periodic re-backtest / retrain on the accumulated record.
+  const btDue = !autonomy.lastBacktestAt || (now - autonomy.lastBacktestAt) >= cfg.backtestIntervalHours * 3600 * 1000;
+  if (btDue) {
+    autonomy.lastBacktestAt = now;
+    await runBacktestCycle(true);
+  }
+
+  renderAnalysisQuality();
+  renderDataInventory();
+  renderCalendar();
+  renderReasoning();
+  runAudit();
+  renderAudit();
+  autonomy.cycles++;
+  autonomy.consecutiveErrors = 0;
+  autonomy.lastError = null;
+  saveAutonomyState();
+  renderAutonomyStats();
+  if (candlesStaleForBudget) {
+    setAutonomyStatus('Running on cached candles — daily API budget spent, resumes 00:00 UTC.', 'warn',
+      'Still grading open signals and re-analysing, but on the last candles fetched rather than fresh ones. ' + reason);
+  } else {
+    setAutonomyStatus('Running autonomously — last pass ' + new Date(now).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) + '.', 'live', reason);
+  }
+}
+
+// The heartbeat: decides whether a cycle is due, and handles every reason it
+// might not be. Deliberately does no analysis itself.
+async function autonomyHeartbeat() {
+  if (!autonomy.enabled || autonomyBusy) return;
+
+  if (!navigator.onLine) {
+    setAutonomyStatus('Paused — no internet connection. Resumes automatically.', 'warn',
+      'Nothing is lost while offline; the gap gets replayed from candle history once the connection is back.');
+    return;
+  }
+  if (dataMode !== 'live') {
+    setAutonomyStatus('Waiting for a live data provider — connect an API key above.', 'warn',
+      'Autonomous mode needs real candles; it will not run on the simulated feed.');
+    return;
+  }
+  // Gold is shut from Friday ~21:00 UTC to Sunday ~22:00 UTC. Analysing a frozen
+  // feed produces confident-looking signals off Friday's last bar, and every one
+  // of them enters the learning record as a real read of a market that was not
+  // trading. Nothing to analyse, so nothing runs.
+  if (!isMarketOpen(Date.now())) {
+    const clock = marketClock(Date.now());
+    const h = clock.hoursUntilOpen;
+    setAutonomyStatus('Market closed — resumes when gold reopens in ' +
+      (h < 1 ? Math.round(h * 60) + 'm' : h.toFixed(1) + 'h') + '.', 'warn',
+      'The feed is frozen at Friday\u2019s close. Analysing it would generate signals from a market that is not trading.');
+    return;
+  }
+  if (autonomy.skipCycles > 0) {
+    autonomy.skipCycles--;
+    setAutonomyStatus('Backing off after an error — retrying in ' + (autonomy.skipCycles + 1) + ' min.', 'warn', autonomy.lastError);
+    return;
+  }
+
+  const cfg = autonomyConfig();
+  const dueAt = (autonomy.lastAnalysisAt || 0) + cfg.analysisIntervalMinutes * 60 * 1000;
+  if (Date.now() < dueAt) {
+    const mins = Math.ceil((dueAt - Date.now()) / 60000);
+    setAutonomyStatus('Running autonomously — next pass in ' + mins + ' min.', 'live', autonomy.lastReason);
+    return;
+  }
+
+  autonomyBusy = true;
+  try {
+    await autonomyCycle();
+  } catch (e) {
+    autonomy.consecutiveErrors++;
+    autonomy.lastError = (e && e.message) || String(e);
+    // Exponential backoff, capped at ~30 min. A rate-limited or expired key
+    // should not turn into a request every minute for the rest of the day.
+    autonomy.skipCycles = Math.min(Math.pow(2, autonomy.consecutiveErrors), 30);
+    setAutonomyStatus('Cycle failed (' + autonomy.consecutiveErrors + ' in a row) — backing off ' + autonomy.skipCycles + ' min.', 'error', autonomy.lastError);
+    saveAutonomyState();
+  } finally {
+    autonomyBusy = false;
+  }
+}
+
+// Replay the time the app was closed or disconnected. Pulls the deepest history
+// the provider allows and grades every still-open signal against it, so a signal
+// that hit its target overnight is training data by the time the user looks.
+async function autonomyCatchUp() {
+  if (dataMode !== 'live' || !navigator.onLine) return;
+  const stillOpen = signalLog.filter(s => s.status === 'pending' || s.status === 'open');
+  if (!stillOpen.length) return;
+  setAutonomyStatus('Catching up — replaying ' + stillOpen.length + ' unresolved signal(s) against real history…', 'warn', '');
+  try {
+    const history = await PROVIDERS[activeProvider].timeSeries(apiKey, LIVE_INTERVAL, 5000);
+    const n = resolveOpenSignals(history, autonomyConfig());
+    renderAutonomyStats();
+    saveAutonomyState();
+    setAutonomyStatus('Catch-up complete.', autonomy.enabled ? 'live' : 'idle',
+      n ? 'Graded ' + n + ' signal(s) that resolved while the app was closed.'
+        : 'No signals had resolved while the app was closed.');
+  } catch (e) {
+    // Not fatal — the regular heartbeat will keep trying against live candles.
+    setAutonomyStatus('Catch-up could not fetch history — continuing on live candles.', 'warn', (e && e.message) || String(e));
+  }
+}
+
+function startAutonomy() {
+  if (autonomyHandle) clearInterval(autonomyHandle);
+  autonomyHandle = setInterval(autonomyHeartbeat, AUTONOMY_HEARTBEAT_MS);
+  autonomy.skipCycles = 0;
+  autonomy.consecutiveErrors = 0;
+  setAutonomyStatus('Autonomous mode on — first pass starting…', 'live', '');
+  autonomy.lastAnalysisAt = null; // force an immediate first pass
+  autonomyHeartbeat();
+}
+
+function stopAutonomy() {
+  if (autonomyHandle) { clearInterval(autonomyHandle); autonomyHandle = null; }
+  setAutonomyStatus('Off — check the box above to start.', 'idle', '');
+}
+
+document.getElementById('autonomyEnabled').addEventListener('change', function () {
+  autonomy.enabled = this.checked;
+  saveAutonomyState();
+  if (autonomy.enabled) startAutonomy(); else stopAutonomy();
+});
+providerSelect.addEventListener('change', renderQuota);
+const umm = document.getElementById('useMacroModel');
+if (umm) umm.addEventListener('change', () => { renderKnowledge(); renderReasoning(); });
+
+// A posture for building up a record rather than protecting capital. The engine
+// learns from resolved trades, and at the default B floor a ranging market
+// simply never qualifies — so a cautious setup collects nothing and the
+// knowledge base never starts.
+document.getElementById('aPresetCollect').addEventListener('click', () => {
+  // D, not C: even a perfect five-timeframe alignment only scores ~49%, so a C
+  // floor (>=30%) still rejects ordinary conditions and collects almost nothing.
+  document.getElementById('aMinGrade').value = 'D';
+  document.getElementById('aMinConf').value = 15;
+  document.getElementById('aCooldown').value = 30;
+  document.getElementById('aMaxOpen').value = 5;
+  document.getElementById('aMinMeta').value = -0.5;
+  saveAutonomyState();
+  autonomy.lastAnalysisAt = null; // re-evaluate immediately under the new thresholds
+  setAutonomyStatus('Data-collection thresholds applied — re-evaluating now.', 'live', '');
+  autonomyHeartbeat();
+});
+document.getElementById('autonomyAdvancedToggle').addEventListener('click', () => {
+  document.getElementById('autonomyAdvanced').classList.toggle('hidden');
+});
+['aMinConf', 'aCooldown', 'aMaxOpen', 'aInterval', 'aBtHours', 'aMinMeta', 'aDailyCap', 'aMinGrade',
+ 'aKillFill', 'aKillOpen', 'aKillDrift'].forEach(id => {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener('change', () => { saveAutonomyState(); renderQuota(); });
+});
+
+// React to connectivity changes straight away rather than waiting out a heartbeat.
+window.addEventListener('online', () => {
+  if (!autonomy.enabled) return;
+  autonomy.skipCycles = 0;
+  autonomy.consecutiveErrors = 0;
+  setAutonomyStatus('Back online — catching up…', 'warn', '');
+  autonomyCatchUp().then(autonomyHeartbeat);
+});
+window.addEventListener('offline', () => {
+  if (autonomy.enabled) setAutonomyStatus('Paused — no internet connection. Resumes automatically.', 'warn', '');
+});
+// Coming back to a backgrounded tab is a good moment to check for missed work:
+// mobile browsers in particular throttle timers hard once a tab is hidden.
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && autonomy.enabled) autonomyHeartbeat();
+});
+
+// ============================================================
+// BOOTSTRAP
+// ------------------------------------------------------------
+// Ordering matters here, which is why it is one explicit sequence rather than
+// scattered top-level calls: persisted learning state has to be restored (and
+// its weights applied) before the first analysis, and every DOM const further
+// up this file has to exist before anything reads it.
+// ============================================================
+// ============================================================
+// SETTINGS THAT SURVIVE A RELOAD
+// ------------------------------------------------------------
+// Only the paper account's balance and the autonomy thresholds were ever
+// persisted. Everything else a person could change — risk per trade, spread,
+// slippage, max concurrent, the partial-take-profit rules, all fourteen factor
+// weights, the target R:R, every backtest parameter, the news-window settings —
+// was read straight off the DOM and lost the moment the page reloaded. Tuning
+// the system was therefore something you had to redo from memory each session,
+// and an autonomous run would quietly revert to defaults after any refresh.
+//
+// One store, one list, restored before the first analysis so the weights are in
+// force when it runs. Ids that already have an owner are deliberately absent —
+// autonomy keeps its own (AUTONOMY_KEY), the paper on/off switches live with the
+// account, and the API keys are opt-in through "remember keys" rather than
+// swept up here.
+const SETTINGS_KEY = 'smc-settings-v1';
+const SETTINGS_IDS = [
+  // paper account
+  'pStartBalance', 'pRiskPct', 'pSpread', 'pSlippage', 'pMaxPos',
+  'pSizingMode', 'pFixedLots', 'pContractSize', 'pLotStep', 'pMinLots',
+  'pPartialPct', 'pHoldMeta', 'pPartialEnabled',
+  // factor weights
+  'wWeekly', 'wDaily', 'wHtf', 'wMtf', 'wLtf', 'wOb', 'wFvg', 'wLiq',
+  'wPd', 'wPriceAction', 'wClassic', 'wCorrelation', 'wFundamental', 'wNews',
+  // signal + backtest
+  'targetRR', 'pBars', 'pCapital', 'pRisk', 'pCostPips', 'pMinConf', 'pTargetRR',
+  // news window and macro model
+  'newsBeforeMin', 'newsAfterMin', 'newsBlockEnabled', 'newsBlockMedium',
+  'newsFlattenEnabled', 'newsFlattenMin', 'newsAlertMin', 'useMacroModel',
+  'weekendFlattenEnabled', 'weekendFlattenMin'
+];
+
+function saveSettings() {
+  const out = {};
+  SETTINGS_IDS.forEach(id => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    out[id] = el.type === 'checkbox' ? !!el.checked : el.value;
+  });
+  try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(out)); }
+  catch (e) { return false; }
+  return true;
+}
+
+function loadSettings() {
+  let saved;
+  try { saved = JSON.parse(localStorage.getItem(SETTINGS_KEY) || 'null'); }
+  catch (e) { return; }
+  if (!saved || typeof saved !== 'object') return;
+  SETTINGS_IDS.forEach(id => {
+    if (!(id in saved)) return;
+    const el = document.getElementById(id);
+    if (!el) return;
+    if (el.type === 'checkbox') el.checked = !!saved[id];
+    else if (saved[id] != null) el.value = saved[id];
+  });
+  // Sliders carry a printed value beside them that does not follow a
+  // programmatic change, so a restored weight would show the old number.
+  syncSliderLabels();
+}
+
+function syncSliderLabels() {
+  weightIds.forEach(id => {
+    const el = document.getElementById(id), out = document.getElementById(id + 'V');
+    if (el && out) out.textContent = el.value;
+  });
+  const rr = document.getElementById('targetRR'), rrOut = document.getElementById('targetRRV');
+  if (rr && rrOut) rrOut.textContent = '1:' + rr.value;
+}
+
+let settingsSaveTimer = null;
+function flagSettingsSaved() {
+  const el = document.getElementById('settingsSavedNote');
+  if (!el) return;
+  el.textContent = 'Settings saved.';
+  el.style.color = '#3ecf8e';
+  clearTimeout(settingsSaveTimer);
+  settingsSaveTimer = setTimeout(() => { el.textContent = ''; }, 2500);
+}
+
+function wireSettingsPersistence() {
+  SETTINGS_IDS.forEach(id => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    const handler = () => { if (saveSettings()) flagSettingsSaved(); };
+    el.addEventListener('change', handler);
+    // Sliders and number spinners fire `input` continuously; `change` alone
+    // would miss a drag that never blurs.
+    if (el.type === 'range' || el.type === 'number') el.addEventListener('input', handler);
+  });
+}
+
+// ============================================================
+// IS THIS TAB STILL RUNNING THE CURRENT CODE?
+// ------------------------------------------------------------
+// This app is built to be left open for days doing unattended analysis, which
+// means a tab can go on running the modules it loaded at open time long after a
+// fix has shipped. That is not hypothetical: the macro engine ran on 1976-2006
+// FRED data, the fix deployed, and an open tab would have carried on producing
+// confident, wrong numbers with nothing on screen to say so.
+//
+// The check compares the ETag of app.js now against the one seen at startup, so
+// it needs no version constant to keep in sync and no build step. `no-store`
+// forces the request past the browser cache; the server already sends
+// must-revalidate, so this is cheap.
+const UPDATE_CHECK_MS = 30 * 60 * 1000;
+let loadedBuildTag = null;
+let updateWatchHandle = null;
+
+async function currentBuildTag() {
+  try {
+    const r = await fetch('app.js', { method: 'HEAD', cache: 'no-store' });
+    return r.headers.get('etag') || r.headers.get('last-modified') || null;
+  } catch (e) {
+    return null; // offline, or the check is blocked — try again next time
+  }
+}
+
+async function checkForNewBuild() {
+  const tag = await currentBuildTag();
+  if (!tag) return;
+  if (loadedBuildTag == null) { loadedBuildTag = tag; return; }
+  if (tag === loadedBuildTag) return;
+  const banner = document.getElementById('updateBanner');
+  if (banner) banner.classList.remove('hidden');
+}
+
+function startUpdateWatch() {
+  const reload = document.getElementById('updateReload');
+  if (reload) reload.addEventListener('click', () => window.location.reload());
+  checkForNewBuild();
+  if (updateWatchHandle) clearInterval(updateWatchHandle);
+  updateWatchHandle = setInterval(checkForNewBuild, UPDATE_CHECK_MS);
+}
+
+async function bootstrap() {
+  // Before anything reads a control: the weights, risk settings and thresholds
+  // have to be the saved ones by the time the first analysis runs.
+  loadSettings();
+  wireSettingsPersistence();
+  await loadLearningState();
+  await loadSignalLog();
+  await loadShadowLog();
+  applyKnowledgeBaseWeights();
+  await loadPaper();
+  await loadKnowledge();
+  await loadCalendarCache();
+  loadAutonomyState();
+  loadQuota();
+  // Every store the merge touches is loaded by this point — the log it merges
+  // into, the paper account it books positions in, the learning state it
+  // updates. Replay anything the worker sent while that was still loading.
+  flushPendingIngest();
+  renderSignalLog();   // first render happened before the paper account loaded
+  startLivenessTicker();
+  startUpdateWatch();
+  startNewsWatch();
+  renderQuota();
+  renderAutonomyStats();
+  renderAnalysisQuality();
+  renderPaper();
+  renderDataInventory();
+  renderCalendar();
+  renderReasoning();
+  renderKnowledge();
+  runAudit();
+  renderAudit();
+  refreshWorkerTotals().then(renderDataInventory);
+  refreshAll();
+
+  const saved = await loadSavedKeys();
+  if (!saved) {
+    document.getElementById('autoBacktestStatus').textContent = 'Connect a data provider to enable auto-backtesting.';
+  } else {
+    document.getElementById('rememberKeysCheckbox').checked = true;
+    if (saved.provider) providerSelect.value = saved.provider;
+    if (saved.fredKey) document.getElementById('fredKeyInput').value = saved.fredKey;
+    if (saved.newsKey) document.getElementById('newsKeyInput').value = saved.newsKey;
+    if (typeof saved.autoBacktest === 'boolean') document.getElementById('autoBacktestCheckbox').checked = saved.autoBacktest;
+    if (saved.apiKey) {
+      document.getElementById('apiKeyInput').value = saved.apiKey;
+      connStatus.textContent = 'Restoring saved connection...';
+      await connectProvider(); // also re-fetches correlation/fundamentals/news with the restored keys
+    } else if (saved.fredKey || saved.newsKey) {
+      // No price provider was connected, but FRED/news keys were saved independently — restore those engines too.
+      await refreshCorrelation(activeProvider, apiKey, saved.fredKey || '');
+      await refreshFundamentals(saved.fredKey || '');
+      await refreshNewsSentiment(saved.newsKey || '');
+      refreshAll();
+      document.getElementById('autoBacktestStatus').textContent = 'Connect a data provider to enable auto-backtesting.';
+    } else {
+      document.getElementById('autoBacktestStatus').textContent = 'Connect a data provider to enable auto-backtesting.';
+    }
+  }
+
+  // The calendar gates trading, so it must be loaded before autonomy's first pass.
+  await refreshCalendar(false);
+  renderCalendar();
+  renderReasoning();
+
+  // Recover anything that resolved while the app was closed, then pick the loop back up.
+  if (autonomy.enabled) {
+    await autonomyCatchUp();
+    startAutonomy();
+  } else {
+    setAutonomyStatus('Off — check the box above to start.', 'idle', '');
+  }
+}
+bootstrap();
+ + fmt(p.requestedEntry)
+      + '</span><span><span class="mono" style="color:#5c6270;">not filled</span> '
+      + '<button class="btn" data-paper-action="close" data-paper-id="' + p.id + '" style="padding:3px 7px;font-size:10px;">Cancel</button></span></div>').join('');
+  }
+
+  const open = paper.positions.filter(p => p.status === 'open' && inEra(p));
+  if (open.length) {
+    html += '<div style="font-size:10px;color:#454a56;margin:10px 0 6px;">Open positions</div>';
+    html += open.map(p => {
+      const u = unrealisedPnl(p, price);
+      return '<div class="zone-item" style="align-items:flex-start;"><span><span class="dirtag ' + p.dir + '">' + p.dir + '</span> ' + lotLabel(p)
+        + ' · entry 
+  }
+
+  const closed = paper.positions.filter(p => p.status === 'closed' && inEra(p)).slice(0, 8);
+  if (closed.length) {
+    html += '<div style="font-size:10px;color:#454a56;margin:10px 0 6px;">Recent closed</div>';
+    html += closed.map(p =>
+      '<div class="zone-item"><span><span class="dirtag ' + p.dir + '">' + p.dir + '</span> ' + (p.outcome === 'won' ? (p.partial ? '◐' : '✓') : p.outcome === 'lost' ? '✗' : '–')
+      + ' <span style="color:#454a56;">' + lotLabel(p) + ' · exit $' + fmt(p.exitPrice) + '</span></span>'
+      + '<span class="mono ' + pnlCls(p.pnl) + '">' + money(p.pnl) + (p.rMultiple != null ? ' <span style="color:#454a56;">' + (p.rMultiple >= 0 ? '+' : '') + fmt(p.rMultiple) + 'R</span>' : '') + '</span></div>'
+    ).join('');
+  }
+
+  if (!resting.length && !open.length && !closed.length) {
+    html += '<div class="zone-empty">' + (a.archivedCount
+      ? 'Account reset — no trades in this era yet. The record above is intact.'
+      : 'No paper trades yet. Positions open automatically as the engine logs signals.') + '</div>';
+  }
+  root.innerHTML = html;
+}
+
+function renderPaperStatusNote() {
+  const note = document.getElementById('paperStatus');
+  if (!note) return;
+  if (!paper.enabled) { note.textContent = 'Off — no positions will be opened.'; return; }
+  note.textContent = paper.manual
+    ? 'On — new signals will open simulated positions. No real orders are placed.'
+    : 'On for the engine\'s own signals. Signals you generate by hand are excluded (signal panel).';
+}
+
+document.getElementById('paperEnabled').addEventListener('change', function () {
+  paper.enabled = this.checked;
+  savePaper();
+  renderPaper();
+  renderPaperStatusNote();
+  renderPaperManualHint();
+});
+
+const paperManualCb = document.getElementById('paperManual');
+if (paperManualCb) paperManualCb.addEventListener('change', function () {
+  paper.manual = this.checked;
+  // Ticking it with the account off is a request to paper-trade, so honour it
+  // rather than silently doing nothing.
+  if (paper.manual && !paper.enabled) {
+    paper.enabled = true;
+    const master = document.getElementById('paperEnabled');
+    if (master) master.checked = true;
+  }
+  savePaper();
+  renderPaper();
+  renderPaperStatusNote();
+  renderPaperManualHint();
+});
+document.getElementById('paperAdvancedToggle').addEventListener('click', () => {
+  document.getElementById('paperAdvanced').classList.toggle('hidden');
+});
+['pStartBalance', 'pRiskPct', 'pSpread', 'pSlippage', 'pMaxPos', 'pPartialPct', 'pHoldMeta', 'pPartialEnabled'].forEach(id => {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener('change', () => { paper.startingBalance = paperConfig().startingBalance; savePaper(); renderPaper(); });
+});
+document.getElementById('paperReset').addEventListener('click', async () => {
+  const price = currentMarkPrice();
+  const live = paper.positions.filter(p => p.status === 'open' || p.status === 'pending').length;
+  const keeping = paper.positions.filter(p => p.status === 'closed').length;
+  const msg = 'Reset the paper account back to $' + fmt(paperConfig().startingBalance) + '?\n\n'
+    + (live ? live + ' live position(s) will be closed at the current price first.\n' : '')
+    + keeping + ' completed trade(s) stay on record — they are what the system learns from, '
+    + 'and they keep counting towards the lifetime win rate. They just stop counting towards the balance.';
+  if (!window.confirm(msg)) return;
+  const out = resetPaperAccount(paper.positions, isFinite(price) ? price : undefined, Date.now());
+  paper.positions = out.positions;
+  paper.epoch = out.epoch;
+  await savePaper();
+  renderPaper();
+  renderDataInventory();
+});
+
+// ============================================================
+// ANALYSIS QUALITY PANEL
+// ------------------------------------------------------------
+// Renders the three self-audits. Every number here is deliberately allowed to
+// say "not enough data yet" rather than show a confident-looking figure built
+// on four trades — a reassuring number from a tiny sample is worse than no
+// number, because it gets believed.
+// ============================================================
+function fmtR(v) { return v == null ? '—' : (v >= 0 ? '+' : '') + v.toFixed(2) + 'R'; }
+function fmtPct(v) { return v == null ? '—' : (v * 100).toFixed(0) + '%'; }
+function rClass(v) { return v == null ? 'fneu' : v > 0.05 ? 'fpos' : v < -0.05 ? 'fneg' : 'fneu'; }
+
+function renderAnalysisQuality() {
+  const root = document.getElementById('qualityContent');
+  if (!root) return;
+
+  const cal = computeCalibration(signalLog);
+  const bd = computeConditionBreakdown(signalLog);
+  const audit = computeGateAudit(signalLog, shadowLog);
+
+  const rows = (list, label) => {
+    const usable = list.filter(r => r.n >= 3);
+    if (!usable.length) return '<div class="zone-empty">' + label + ': not enough resolved trades yet (need 3+ per group).</div>';
+    return usable.map(r =>
+      '<div class="zone-item"><span>' + r.key + ' <span style="color:#454a56;">(' + r.n + ')</span></span>' +
+      '<span class="mono ' + rClass(r.expectancyR) + '">' + fmtR(r.expectancyR) + ' · ' + fmtPct(r.winRate) + '</span></div>'
+    ).join('');
+  };
+
+  const o = bd.overall;
+  let html = '';
+
+  html += '<div class="data-source-note" style="margin-bottom:8px;">Expectancy is shown in R — average profit per unit risked. At a 1:4 target a 30% win rate is already profitable, so win rate alone is a poor scorecard and R is the honest one.</div>';
+
+  html += '<div class="metrics" style="margin-bottom:10px;">'
+    + '<div class="card"><div class="label">Resolved</div><div class="value mono">' + o.n + '</div></div>'
+    + '<div class="card"><div class="label">Win Rate</div><div class="value mono">' + fmtPct(o.winRate) + '</div></div>'
+    + '<div class="card"><div class="label">Expectancy</div><div class="value mono ' + rClass(o.expectancyR) + '">' + fmtR(o.expectancyR) + '</div></div>'
+    + '<div class="card"><div class="label">Total</div><div class="value mono ' + rClass(o.totalR) + '">' + fmtR(o.totalR) + '</div></div>'
+    + '</div>';
+
+  // 1. Is the confidence number worth anything?
+  html += '<div class="panel-title" style="font-size:11px;margin-top:12px;">Is the confidence score meaningful?</div>';
+  html += '<div class="event-line" style="border-left-color:#e8c37a;">' + cal.verdict + '</div>';
+  if (cal.discrimination != null) {
+    html += '<div class="zone-item"><span>High-confidence half vs low-confidence half</span><span class="mono ' + rClass(cal.discrimination) + '">'
+      + (cal.discrimination >= 0 ? '+' : '') + (cal.discrimination * 100).toFixed(0) + ' pp win rate</span></div>';
+  }
+  if (cal.buckets.length) {
+    html += '<table class="factor-table"><tr><th style="text-align:left;color:#5c6270;font-weight:500;">Confidence band</th><th style="color:#5c6270;font-weight:500;">Win rate</th><th style="color:#5c6270;font-weight:500;">Expectancy</th></tr>';
+    html += cal.buckets.map(b =>
+      '<tr><td>' + b.lo + '–' + b.hi + '% <span style="color:#454a56;">(' + b.n + ')</span></td>'
+      + '<td>' + fmtPct(b.winRate) + '</td>'
+      + '<td class="' + rClass(b.expectancyR) + '">' + fmtR(b.expectancyR) + '</td></tr>').join('');
+    html += '</table>';
+  }
+
+  // 2. Where does the edge actually live?
+  html += '<div class="panel-title" style="font-size:11px;margin-top:14px;">Where the edge actually lives</div>';
+  html += '<div style="font-size:10px;color:#454a56;margin-bottom:6px;">By session</div>' + rows(bd.bySession, 'Session');
+  html += '<div style="font-size:10px;color:#454a56;margin:8px 0 6px;">By market regime</div>' + rows(bd.byRegime, 'Regime');
+  html += '<div style="font-size:10px;color:#454a56;margin:8px 0 6px;">By grade</div>' + rows(bd.byGrade, 'Grade');
+  html += '<div style="font-size:10px;color:#454a56;margin:8px 0 6px;">By direction</div>' + rows(bd.byDirection, 'Direction');
+
+  // 3. The roads not taken.
+  html += '<div class="panel-title" style="font-size:11px;margin-top:14px;">The setups it turned down</div>';
+  html += '<div class="data-source-note" style="margin-bottom:6px;">Every setup the filter rejected is tracked and resolved against real price anyway. This is the comparison a human journal can never make, because nobody records their non-trades.</div>';
+  html += '<div class="zone-item"><span>Taken</span><span class="mono ' + rClass(audit.taken.expectancyR) + '">'
+    + fmtR(audit.taken.expectancyR) + ' <span style="color:#454a56;">(' + audit.taken.n + ')</span></span></div>';
+  html += '<div class="zone-item"><span>Declined</span><span class="mono ' + rClass(audit.declined.expectancyR) + '">'
+    + fmtR(audit.declined.expectancyR) + ' <span style="color:#454a56;">(' + audit.declined.n + ')</span></span></div>';
+  const pending = shadowLog.filter(s => s.status === 'pending' || s.status === 'open').length;
+  if (pending) html += '<div class="zone-item"><span>Declined, still running</span><span class="mono">' + pending + '</span></div>';
+  html += '<div class="event-line" style="border-left-color:#c99bff;margin-top:6px;">' + audit.verdict + '</div>';
+
+  root.innerHTML = html;
+}
+document.getElementById('resetQuality').addEventListener('click', async () => {
+  shadowLog = [];
+  await saveShadowLog();
+  renderAnalysisQuality();
+});
+
+// ============================================================
+// AUTONOMOUS MODE
+// ------------------------------------------------------------
+// The unattended operator. Once the user ticks the box, a single heartbeat
+// drives everything: fetch fresh candles, grade any signal that has since hit
+// its stop or target, re-analyse, commit a new signal if the gate clears, and
+// periodically re-backtest and retrain on the record it has built.
+//
+// Three things make this survive real-world conditions rather than only a tab
+// left open on a desk:
+//   * One 60s heartbeat with due-time checks, not a pile of setIntervals. A
+//     laptop that sleeps for six hours wakes up, sees every task is overdue,
+//     and runs them once — rather than firing a backlog of missed timers.
+//   * Losing the connection is expected, not exceptional. Offline is a quiet
+//     pause; repeated failures back off exponentially instead of hammering a
+//     rate-limited provider until the key is blocked.
+//   * Time with the tab closed is recovered, not lost. catchUp() replays the
+//     gap from real candle history on the next load, so signals that resolved
+//     while nobody was watching still become training data.
+// ============================================================
+
+const AUTONOMY_KEY = 'smc-autonomy-v1';
+const AUTONOMY_HEARTBEAT_MS = 60 * 1000;
+
+let autonomyHandle = null;
+let autonomyBusy = false;
+
+function autonomyConfig() {
+  const num = (id, fallback) => {
+    const el = document.getElementById(id);
+    const v = el ? parseFloat(el.value) : NaN;
+    return isFinite(v) ? v : fallback;
+  };
+  return Object.assign({}, AUTONOMY_DEFAULTS, {
+    minConfidence: num('aMinConf', AUTONOMY_DEFAULTS.minConfidence),
+    cooldownMinutes: num('aCooldown', AUTONOMY_DEFAULTS.cooldownMinutes),
+    maxOpenSignals: num('aMaxOpen', AUTONOMY_DEFAULTS.maxOpenSignals),
+    analysisIntervalMinutes: num('aInterval', AUTONOMY_DEFAULTS.analysisIntervalMinutes),
+    backtestIntervalHours: num('aBtHours', AUTONOMY_DEFAULTS.backtestIntervalHours),
+    minMetaScore: num('aMinMeta', AUTONOMY_DEFAULTS.minMetaScore),
+    // Kill switch. 0 in any field disables that arm rather than expiring
+    // everything instantly, which is what a 0 limit would otherwise mean.
+    maxHoursToFill: num('aKillFill', AUTONOMY_DEFAULTS.maxHoursToFill),
+    maxHoursOpen: num('aKillOpen', AUTONOMY_DEFAULTS.maxHoursOpen),
+    maxDriftRToFill: num('aKillDrift', AUTONOMY_DEFAULTS.maxDriftRToFill),
+    partialTP: partialTPConfig(),
+    newsState: currentNewsState(),
+    gradeFloor: (document.getElementById('aMinGrade') || {}).value || AUTONOMY_DEFAULTS.gradeFloor
+  });
+}
+
+function saveAutonomyState() {
+  try {
+    localStorage.setItem(AUTONOMY_KEY, JSON.stringify({
+      enabled: autonomy.enabled,
+      cycles: autonomy.cycles,
+      gateTally: autonomy.gateTally,
+      signalsTaken: autonomy.signalsTaken,
+      autoResolved: autonomy.autoResolved,
+      lastAnalysisAt: autonomy.lastAnalysisAt,
+      lastBacktestAt: autonomy.lastBacktestAt,
+      lastSignalAt: autonomy.lastSignalAt,
+      cfg: {
+        aMinConf: document.getElementById('aMinConf').value,
+        aCooldown: document.getElementById('aCooldown').value,
+        aKillFill: document.getElementById('aKillFill').value,
+        aKillOpen: document.getElementById('aKillOpen').value,
+        aKillDrift: document.getElementById('aKillDrift').value,
+        aMaxOpen: document.getElementById('aMaxOpen').value,
+        aInterval: document.getElementById('aInterval').value,
+        aBtHours: document.getElementById('aBtHours').value,
+        aMinMeta: document.getElementById('aMinMeta').value,
+        aDailyCap: document.getElementById('aDailyCap').value,
+        aMinGrade: document.getElementById('aMinGrade').value
+      }
+    }));
+  } catch (e) { /* storage unavailable — autonomy still works, it just won't remember across reloads */ }
+}
+
+function loadAutonomyState() {
+  try {
+    const raw = localStorage.getItem(AUTONOMY_KEY);
+    if (!raw) return;
+    const saved = JSON.parse(raw);
+    Object.assign(autonomy, {
+      enabled: !!saved.enabled,
+      cycles: saved.cycles || 0,
+      gateTally: saved.gateTally || {},
+      signalsTaken: saved.signalsTaken || 0,
+      autoResolved: saved.autoResolved || 0,
+      lastAnalysisAt: saved.lastAnalysisAt || null,
+      lastBacktestAt: saved.lastBacktestAt || null,
+      lastSignalAt: saved.lastSignalAt || null
+    });
+    if (saved.cfg) {
+      Object.keys(saved.cfg).forEach(id => {
+        const el = document.getElementById(id);
+        if (el && saved.cfg[id] != null) el.value = saved.cfg[id];
+      });
+    }
+    document.getElementById('autonomyEnabled').checked = autonomy.enabled;
+  } catch (e) { /* nothing saved yet */ }
+}
+
+function setAutonomyStatus(text, tone, reason) {
+  const dot = document.getElementById('autonomyDot');
+  const status = document.getElementById('autonomyStatus');
+  const reasonEl = document.getElementById('autonomyReason');
+  if (!status) return;
+  status.textContent = text;
+  const colours = { live: '#3ecf8e', warn: '#ffa726', error: '#ef4d5f', idle: '#454a56' };
+  const c = colours[tone] || colours.idle;
+  dot.style.background = c;
+  dot.style.boxShadow = tone === 'live' ? '0 0 7px ' + c : 'none';
+  status.style.color = tone === 'idle' ? '#9298a5' : c;
+  if (reason !== undefined) reasonEl.textContent = reason || '';
+}
+
+function renderAutonomyStats() {
+  const live = signalLog.filter(s => s.status === 'pending' || s.status === 'open');
+  document.getElementById('aCycles').textContent = autonomy.cycles;
+  document.getElementById('aSignals').textContent = autonomy.signalsTaken;
+  document.getElementById('aResolved').textContent = autonomy.autoResolved;
+  document.getElementById('aOpen').textContent = live.length;
+
+  const killedEl = document.getElementById('aKilled');
+  if (killedEl) killedEl.textContent = signalLog.filter(s => s.status === 'expired').length;
+
+  // How long the oldest live trade has been sitting. This is the number that
+  // was invisible before: an order resting for a day looked identical to one
+  // placed a minute ago.
+  const oldestEl = document.getElementById('aOldest');
+  if (oldestEl) {
+    const cfg = autonomyConfig();
+    // Each trade is aged against the limit that actually applies to it: a
+    // resting order against the fill limit, a filled one against the hold
+    // limit. Using the larger of the two would leave an order 2.5x past its own
+    // deadline showing no warning at all.
+    const ages = live.map(s => {
+      const filled = s.status === 'open';
+      const t = Date.parse(filled ? (s.filledAt || s.time) : s.time);
+      if (!isFinite(t)) return null;
+      const hours = (Date.now() - t) / 3600000;
+      const limit = filled ? cfg.maxHoursOpen : cfg.maxHoursToFill;
+      return { hours, ratio: limit > 0 ? hours / limit : 0 };
+    }).filter(v => v != null);
+    if (!ages.length) {
+      oldestEl.textContent = '—';
+      oldestEl.style.color = '';
+    } else {
+      const worst = ages.reduce((a, b) => b.hours > a.hours ? b : a, ages[0]);
+      const closest = ages.reduce((a, b) => b.ratio > a.ratio ? b : a, ages[0]);
+      oldestEl.textContent = worst.hours < 1 ? Math.round(worst.hours * 60) + 'm' : worst.hours.toFixed(1) + 'h';
+      // Amber as a trade approaches its own kill limit, red once past it, so
+      // one about to be culled is visible before it disappears.
+      oldestEl.style.color = closest.ratio >= 1 ? '#ef4d5f' : closest.ratio >= 0.75 ? '#ffa726' : '';
+    }
+  }
+
+  const el = document.getElementById('gateTally');
+  if (!el) return;
+  const entries = Object.keys(autonomy.gateTally || {})
+    .map(k => ({ code: k, n: autonomy.gateTally[k] }))
+    .sort((a, b) => b.n - a.n);
+  if (!entries.length) { el.innerHTML = ''; return; }
+  el.innerHTML = '<div style="font-size:10px;color:#454a56;margin:8px 0 4px;">Why cycles ended this way</div>'
+    + entries.map(e => '<div class="zone-item" style="padding:3px 0;"><span style="font-size:11px;">'
+        + (GATE_LABELS[e.code] || e.code) + '</span><span class="mono" style="font-size:11px;color:'
+        + (e.code === 'taken' ? '#3ecf8e' : '#5c6270') + ';">' + e.n + '</span></div>').join('');
+}
+
+// Grade every unresolved signal against `candles`. Used both by the heartbeat
+// (fresh candles each cycle) and by catchUp() (deep history after downtime).
+// Returns how many signals reached a win/loss verdict.
+function resolveOpenSignals(candles, cfg) {
+  if (!candles || candles.length < 2) return 0;
+  let resolved = 0, killed = 0, changed = false;
+
+  // The auditor decides which live trades are past saving, not the engine.
+  // Letting the engine judge whether its own trade has gone bad is the thing
+  // the auditor exists to avoid — and it re-derives fill state from raw candles
+  // rather than trusting the signal's own status, so a "pending" order price
+  // actually traded through is caught rather than aged as if it never filled.
+  const tradeAudit = auditOpenTrades(signalLog, candles, {
+    maxHoursToFill: cfg.maxHoursToFill,
+    maxHoursOpen: cfg.maxHoursOpen,
+    maxDriftRToFill: cfg.maxDriftRToFill
+  });
+  lastTradeAudit = tradeAudit;
+  const killedBy = new Map(tradeAudit.kills.map(k => [k.id, k]));
+
+  signalLog.forEach(sig => {
+    if (sig.status !== 'pending' && sig.status !== 'open') return;
+    // An auditor kill outranks whatever the resolver would have said, EXCEPT
+    // when price has already settled the trade: a stop or target that has
+    // genuinely been hit is a real outcome and real evidence, and discarding it
+    // to enforce a time limit would throw away the data the limit exists to
+    // protect.
+    const verdict = resolveSignal(sig, candles, cfg);
+    const kill = killedBy.get(sig.id);
+    if (kill && verdict.status !== 'won' && verdict.status !== 'lost') {
+      sig.status = 'expired';
+      sig.expiryReason = 'auditor: ' + kill.reason;
+      sig.killSwitch = kill.code;
+      sig.resolvedAt = new Date().toISOString();
+      sig.resolvedBy = 'auditor';
+      paperCloseForSignal(sig.id, 'expired');
+      killed++; changed = true;
+      return;
+    }
+    if (verdict.status === 'won' || verdict.status === 'lost') {
+      if (applySignalOutcome(sig, verdict.status === 'won', {
+        auto: true, exitPrice: verdict.exitPrice, ambiguousBar: verdict.ambiguousBar, partial: verdict.partial
+      })) { resolved++; changed = true; }
+    } else if (verdict.status === 'expired') {
+      sig.status = 'expired';
+      sig.expiryReason = verdict.reason || null;
+      sig.killSwitch = verdict.killSwitch || null;
+      sig.resolvedAt = new Date().toISOString();
+      sig.resolvedBy = 'auto';
+      paperCloseForSignal(sig.id, 'expired');
+      if (verdict.killSwitch) killed++;
+      changed = true; // expired signals never become training data — no outcome to learn from
+    } else if (verdict.status === 'open' && sig.status === 'pending') {
+      sig.status = 'open'; // limit entry got tagged; it's a live position now
+      sig.filledAt = new Date().toISOString();
+      paperFillForSignal(sig.id, sig.filledAt);
+      changed = true;
+    }
+  });
+  if (changed) { saveSignalLog(); renderSignalLog(); }
+  if (resolved) autonomy.autoResolved += resolved;
+  if (killed) autonomy.killed = (autonomy.killed || 0) + killed;
+  resolveShadowSignals(candles, cfg);
+  return resolved;
+}
+
+// Shadows get the same treatment, minus the learning updates — a setup the
+// engine declined should inform the audit, not train the weights as though it
+// had been traded.
+function resolveShadowSignals(candles, cfg) {
+  if (!candles || candles.length < 2 || !shadowLog.length) return;
+  let changed = false;
+  shadowLog.forEach(sig => {
+    if (sig.status !== 'pending' && sig.status !== 'open') return;
+    const verdict = resolveSignal(sig, candles, cfg);
+    if (verdict.status === 'won' || verdict.status === 'lost') {
+      sig.status = verdict.status;
+      sig.resolvedAt = new Date().toISOString();
+      changed = true;
+    } else if (verdict.status === 'expired') {
+      sig.status = 'expired'; sig.expiryReason = verdict.reason || null; changed = true;
+    } else if (verdict.status === 'open' && sig.status === 'pending') {
+      sig.status = 'open'; changed = true;
+    }
+  });
+  if (changed) { saveShadowLog(); renderAnalysisQuality(); }
+}
+
+// One unattended pass. Everything that can fail is inside the caller's try.
+async function autonomyCycle() {
+  const cfg = autonomyConfig();
+  const now = Date.now();
+
+  // 0. Calendar first. It gates whether a signal may be taken at all, so it has
+  // to be current BEFORE the gate reads it — refreshing at the end of the cycle
+  // meant the first pass after a reconnect ran against an empty calendar and
+  // could take a position straight into a release window.
+  await refreshCalendar(false);
+
+  // 1. Fresh candles. resyncCandles() already refreshes liveData from the provider.
+  await resyncCandles();
+
+  // 2. Grade what the market has already decided since the last pass.
+  const graded = resolveOpenSignals(liveData, cfg);
+
+  // 3. Re-analyse on the new data.
+  refreshAll();
+  autonomy.lastAnalysisAt = now;
+
+  // 4. Commit a signal only if the gate clears.
+  let reason;
+  if (lastComposite) {
+    const plan = buildTradePlan(lastComposite, getTargetRR());
+    // The auditor is advisory everywhere except here. A critical finding means
+    // the analysis contradicts itself or the data it was built on — that is not
+    // a risk preference, and no confidence score should be able to override it.
+    const audit = runAudit();
+    renderAudit();
+    let gate;
+    if (audit && audit.blocking) {
+      gate = { take: false, code: 'audit',
+        reason: 'independent audit found ' + audit.critical + ' critical issue(s): ' + audit.findings[0].title };
+    } else {
+      gate = autonomyGate(lastComposite, plan, signalLog, autonomy.lastSignalAt, cfg);
+    }
+    // Tally why each cycle ended as it did. One latest-reason line cannot show
+    // whether 13 quiet cycles mean "no setup existed" or "the filter blocked
+    // every one" — and those need opposite responses.
+    const code = gate.code || 'unknown';
+    autonomy.gateTally[code] = (autonomy.gateTally[code] || 0) + 1;
+    if (gate.take) {
+      updateSignalUI(lastComposite, plan, true, 'auto'); // logIt = true -> addSignalToLog
+      autonomy.signalsTaken++;
+      autonomy.lastSignalAt = now;
+      reason = 'Took a ' + lastComposite.direction + ' at $' + fmt(plan.entry) +
+               ' (' + lastComposite.confidence + '% confidence' + (gate.grade ? ', grade ' + gate.grade : '') + ').';
+    } else {
+      updateSignalUI(lastComposite, plan, false); // keep the panel current without logging
+      // Track what was passed on, so the filter can be audited later rather
+      // than trusted forever.
+      addShadowSignal(lastComposite, plan, gate.reason);
+      reason = 'No signal taken — ' + gate.reason + '.';
+    }
+  } else {
+    reason = 'Analysis produced no result this cycle.';
+  }
+  if (graded) reason = 'Self-graded ' + graded + ' signal' + (graded === 1 ? '' : 's') + '. ' + reason;
+  autonomy.lastReason = reason;
+
+  // 5. Periodic re-backtest / retrain on the accumulated record.
+  const btDue = !autonomy.lastBacktestAt || (now - autonomy.lastBacktestAt) >= cfg.backtestIntervalHours * 3600 * 1000;
+  if (btDue) {
+    autonomy.lastBacktestAt = now;
+    await runBacktestCycle(true);
+  }
+
+  renderAnalysisQuality();
+  renderDataInventory();
+  renderCalendar();
+  renderReasoning();
+  runAudit();
+  renderAudit();
+  autonomy.cycles++;
+  autonomy.consecutiveErrors = 0;
+  autonomy.lastError = null;
+  saveAutonomyState();
+  renderAutonomyStats();
+  if (candlesStaleForBudget) {
+    setAutonomyStatus('Running on cached candles — daily API budget spent, resumes 00:00 UTC.', 'warn',
+      'Still grading open signals and re-analysing, but on the last candles fetched rather than fresh ones. ' + reason);
+  } else {
+    setAutonomyStatus('Running autonomously — last pass ' + new Date(now).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) + '.', 'live', reason);
+  }
+}
+
+// The heartbeat: decides whether a cycle is due, and handles every reason it
+// might not be. Deliberately does no analysis itself.
+async function autonomyHeartbeat() {
+  if (!autonomy.enabled || autonomyBusy) return;
+
+  if (!navigator.onLine) {
+    setAutonomyStatus('Paused — no internet connection. Resumes automatically.', 'warn',
+      'Nothing is lost while offline; the gap gets replayed from candle history once the connection is back.');
+    return;
+  }
+  if (dataMode !== 'live') {
+    setAutonomyStatus('Waiting for a live data provider — connect an API key above.', 'warn',
+      'Autonomous mode needs real candles; it will not run on the simulated feed.');
+    return;
+  }
+  // Gold is shut from Friday ~21:00 UTC to Sunday ~22:00 UTC. Analysing a frozen
+  // feed produces confident-looking signals off Friday's last bar, and every one
+  // of them enters the learning record as a real read of a market that was not
+  // trading. Nothing to analyse, so nothing runs.
+  if (!isMarketOpen(Date.now())) {
+    const clock = marketClock(Date.now());
+    const h = clock.hoursUntilOpen;
+    setAutonomyStatus('Market closed — resumes when gold reopens in ' +
+      (h < 1 ? Math.round(h * 60) + 'm' : h.toFixed(1) + 'h') + '.', 'warn',
+      'The feed is frozen at Friday\u2019s close. Analysing it would generate signals from a market that is not trading.');
+    return;
+  }
+  if (autonomy.skipCycles > 0) {
+    autonomy.skipCycles--;
+    setAutonomyStatus('Backing off after an error — retrying in ' + (autonomy.skipCycles + 1) + ' min.', 'warn', autonomy.lastError);
+    return;
+  }
+
+  const cfg = autonomyConfig();
+  const dueAt = (autonomy.lastAnalysisAt || 0) + cfg.analysisIntervalMinutes * 60 * 1000;
+  if (Date.now() < dueAt) {
+    const mins = Math.ceil((dueAt - Date.now()) / 60000);
+    setAutonomyStatus('Running autonomously — next pass in ' + mins + ' min.', 'live', autonomy.lastReason);
+    return;
+  }
+
+  autonomyBusy = true;
+  try {
+    await autonomyCycle();
+  } catch (e) {
+    autonomy.consecutiveErrors++;
+    autonomy.lastError = (e && e.message) || String(e);
+    // Exponential backoff, capped at ~30 min. A rate-limited or expired key
+    // should not turn into a request every minute for the rest of the day.
+    autonomy.skipCycles = Math.min(Math.pow(2, autonomy.consecutiveErrors), 30);
+    setAutonomyStatus('Cycle failed (' + autonomy.consecutiveErrors + ' in a row) — backing off ' + autonomy.skipCycles + ' min.', 'error', autonomy.lastError);
+    saveAutonomyState();
+  } finally {
+    autonomyBusy = false;
+  }
+}
+
+// Replay the time the app was closed or disconnected. Pulls the deepest history
+// the provider allows and grades every still-open signal against it, so a signal
+// that hit its target overnight is training data by the time the user looks.
+async function autonomyCatchUp() {
+  if (dataMode !== 'live' || !navigator.onLine) return;
+  const stillOpen = signalLog.filter(s => s.status === 'pending' || s.status === 'open');
+  if (!stillOpen.length) return;
+  setAutonomyStatus('Catching up — replaying ' + stillOpen.length + ' unresolved signal(s) against real history…', 'warn', '');
+  try {
+    const history = await PROVIDERS[activeProvider].timeSeries(apiKey, LIVE_INTERVAL, 5000);
+    const n = resolveOpenSignals(history, autonomyConfig());
+    renderAutonomyStats();
+    saveAutonomyState();
+    setAutonomyStatus('Catch-up complete.', autonomy.enabled ? 'live' : 'idle',
+      n ? 'Graded ' + n + ' signal(s) that resolved while the app was closed.'
+        : 'No signals had resolved while the app was closed.');
+  } catch (e) {
+    // Not fatal — the regular heartbeat will keep trying against live candles.
+    setAutonomyStatus('Catch-up could not fetch history — continuing on live candles.', 'warn', (e && e.message) || String(e));
+  }
+}
+
+function startAutonomy() {
+  if (autonomyHandle) clearInterval(autonomyHandle);
+  autonomyHandle = setInterval(autonomyHeartbeat, AUTONOMY_HEARTBEAT_MS);
+  autonomy.skipCycles = 0;
+  autonomy.consecutiveErrors = 0;
+  setAutonomyStatus('Autonomous mode on — first pass starting…', 'live', '');
+  autonomy.lastAnalysisAt = null; // force an immediate first pass
+  autonomyHeartbeat();
+}
+
+function stopAutonomy() {
+  if (autonomyHandle) { clearInterval(autonomyHandle); autonomyHandle = null; }
+  setAutonomyStatus('Off — check the box above to start.', 'idle', '');
+}
+
+document.getElementById('autonomyEnabled').addEventListener('change', function () {
+  autonomy.enabled = this.checked;
+  saveAutonomyState();
+  if (autonomy.enabled) startAutonomy(); else stopAutonomy();
+});
+providerSelect.addEventListener('change', renderQuota);
+const umm = document.getElementById('useMacroModel');
+if (umm) umm.addEventListener('change', () => { renderKnowledge(); renderReasoning(); });
+
+// A posture for building up a record rather than protecting capital. The engine
+// learns from resolved trades, and at the default B floor a ranging market
+// simply never qualifies — so a cautious setup collects nothing and the
+// knowledge base never starts.
+document.getElementById('aPresetCollect').addEventListener('click', () => {
+  // D, not C: even a perfect five-timeframe alignment only scores ~49%, so a C
+  // floor (>=30%) still rejects ordinary conditions and collects almost nothing.
+  document.getElementById('aMinGrade').value = 'D';
+  document.getElementById('aMinConf').value = 15;
+  document.getElementById('aCooldown').value = 30;
+  document.getElementById('aMaxOpen').value = 5;
+  document.getElementById('aMinMeta').value = -0.5;
+  saveAutonomyState();
+  autonomy.lastAnalysisAt = null; // re-evaluate immediately under the new thresholds
+  setAutonomyStatus('Data-collection thresholds applied — re-evaluating now.', 'live', '');
+  autonomyHeartbeat();
+});
+document.getElementById('autonomyAdvancedToggle').addEventListener('click', () => {
+  document.getElementById('autonomyAdvanced').classList.toggle('hidden');
+});
+['aMinConf', 'aCooldown', 'aMaxOpen', 'aInterval', 'aBtHours', 'aMinMeta', 'aDailyCap', 'aMinGrade',
+ 'aKillFill', 'aKillOpen', 'aKillDrift'].forEach(id => {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener('change', () => { saveAutonomyState(); renderQuota(); });
+});
+
+// React to connectivity changes straight away rather than waiting out a heartbeat.
+window.addEventListener('online', () => {
+  if (!autonomy.enabled) return;
+  autonomy.skipCycles = 0;
+  autonomy.consecutiveErrors = 0;
+  setAutonomyStatus('Back online — catching up…', 'warn', '');
+  autonomyCatchUp().then(autonomyHeartbeat);
+});
+window.addEventListener('offline', () => {
+  if (autonomy.enabled) setAutonomyStatus('Paused — no internet connection. Resumes automatically.', 'warn', '');
+});
+// Coming back to a backgrounded tab is a good moment to check for missed work:
+// mobile browsers in particular throttle timers hard once a tab is hidden.
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && autonomy.enabled) autonomyHeartbeat();
+});
+
+// ============================================================
+// BOOTSTRAP
+// ------------------------------------------------------------
+// Ordering matters here, which is why it is one explicit sequence rather than
+// scattered top-level calls: persisted learning state has to be restored (and
+// its weights applied) before the first analysis, and every DOM const further
+// up this file has to exist before anything reads it.
+// ============================================================
+// ============================================================
+// SETTINGS THAT SURVIVE A RELOAD
+// ------------------------------------------------------------
+// Only the paper account's balance and the autonomy thresholds were ever
+// persisted. Everything else a person could change — risk per trade, spread,
+// slippage, max concurrent, the partial-take-profit rules, all fourteen factor
+// weights, the target R:R, every backtest parameter, the news-window settings —
+// was read straight off the DOM and lost the moment the page reloaded. Tuning
+// the system was therefore something you had to redo from memory each session,
+// and an autonomous run would quietly revert to defaults after any refresh.
+//
+// One store, one list, restored before the first analysis so the weights are in
+// force when it runs. Ids that already have an owner are deliberately absent —
+// autonomy keeps its own (AUTONOMY_KEY), the paper on/off switches live with the
+// account, and the API keys are opt-in through "remember keys" rather than
+// swept up here.
+const SETTINGS_KEY = 'smc-settings-v1';
+const SETTINGS_IDS = [
+  // paper account
+  'pStartBalance', 'pRiskPct', 'pSpread', 'pSlippage', 'pMaxPos',
+  'pSizingMode', 'pFixedLots', 'pContractSize', 'pLotStep', 'pMinLots',
+  'pPartialPct', 'pHoldMeta', 'pPartialEnabled',
+  // factor weights
+  'wWeekly', 'wDaily', 'wHtf', 'wMtf', 'wLtf', 'wOb', 'wFvg', 'wLiq',
+  'wPd', 'wPriceAction', 'wClassic', 'wCorrelation', 'wFundamental', 'wNews',
+  // signal + backtest
+  'targetRR', 'pBars', 'pCapital', 'pRisk', 'pCostPips', 'pMinConf', 'pTargetRR',
+  // news window and macro model
+  'newsBeforeMin', 'newsAfterMin', 'newsBlockEnabled', 'newsBlockMedium',
+  'newsFlattenEnabled', 'newsFlattenMin', 'newsAlertMin', 'useMacroModel',
+  'weekendFlattenEnabled', 'weekendFlattenMin'
+];
+
+function saveSettings() {
+  const out = {};
+  SETTINGS_IDS.forEach(id => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    out[id] = el.type === 'checkbox' ? !!el.checked : el.value;
+  });
+  try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(out)); }
+  catch (e) { return false; }
+  return true;
+}
+
+function loadSettings() {
+  let saved;
+  try { saved = JSON.parse(localStorage.getItem(SETTINGS_KEY) || 'null'); }
+  catch (e) { return; }
+  if (!saved || typeof saved !== 'object') return;
+  SETTINGS_IDS.forEach(id => {
+    if (!(id in saved)) return;
+    const el = document.getElementById(id);
+    if (!el) return;
+    if (el.type === 'checkbox') el.checked = !!saved[id];
+    else if (saved[id] != null) el.value = saved[id];
+  });
+  // Sliders carry a printed value beside them that does not follow a
+  // programmatic change, so a restored weight would show the old number.
+  syncSliderLabels();
+}
+
+function syncSliderLabels() {
+  weightIds.forEach(id => {
+    const el = document.getElementById(id), out = document.getElementById(id + 'V');
+    if (el && out) out.textContent = el.value;
+  });
+  const rr = document.getElementById('targetRR'), rrOut = document.getElementById('targetRRV');
+  if (rr && rrOut) rrOut.textContent = '1:' + rr.value;
+}
+
+let settingsSaveTimer = null;
+function flagSettingsSaved() {
+  const el = document.getElementById('settingsSavedNote');
+  if (!el) return;
+  el.textContent = 'Settings saved.';
+  el.style.color = '#3ecf8e';
+  clearTimeout(settingsSaveTimer);
+  settingsSaveTimer = setTimeout(() => { el.textContent = ''; }, 2500);
+}
+
+function wireSettingsPersistence() {
+  SETTINGS_IDS.forEach(id => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    const handler = () => { if (saveSettings()) flagSettingsSaved(); };
+    el.addEventListener('change', handler);
+    // Sliders and number spinners fire `input` continuously; `change` alone
+    // would miss a drag that never blurs.
+    if (el.type === 'range' || el.type === 'number') el.addEventListener('input', handler);
+  });
+}
+
+// ============================================================
+// IS THIS TAB STILL RUNNING THE CURRENT CODE?
+// ------------------------------------------------------------
+// This app is built to be left open for days doing unattended analysis, which
+// means a tab can go on running the modules it loaded at open time long after a
+// fix has shipped. That is not hypothetical: the macro engine ran on 1976-2006
+// FRED data, the fix deployed, and an open tab would have carried on producing
+// confident, wrong numbers with nothing on screen to say so.
+//
+// The check compares the ETag of app.js now against the one seen at startup, so
+// it needs no version constant to keep in sync and no build step. `no-store`
+// forces the request past the browser cache; the server already sends
+// must-revalidate, so this is cheap.
+const UPDATE_CHECK_MS = 30 * 60 * 1000;
+let loadedBuildTag = null;
+let updateWatchHandle = null;
+
+async function currentBuildTag() {
+  try {
+    const r = await fetch('app.js', { method: 'HEAD', cache: 'no-store' });
+    return r.headers.get('etag') || r.headers.get('last-modified') || null;
+  } catch (e) {
+    return null; // offline, or the check is blocked — try again next time
+  }
+}
+
+async function checkForNewBuild() {
+  const tag = await currentBuildTag();
+  if (!tag) return;
+  if (loadedBuildTag == null) { loadedBuildTag = tag; return; }
+  if (tag === loadedBuildTag) return;
+  const banner = document.getElementById('updateBanner');
+  if (banner) banner.classList.remove('hidden');
+}
+
+function startUpdateWatch() {
+  const reload = document.getElementById('updateReload');
+  if (reload) reload.addEventListener('click', () => window.location.reload());
+  checkForNewBuild();
+  if (updateWatchHandle) clearInterval(updateWatchHandle);
+  updateWatchHandle = setInterval(checkForNewBuild, UPDATE_CHECK_MS);
+}
+
+async function bootstrap() {
+  // Before anything reads a control: the weights, risk settings and thresholds
+  // have to be the saved ones by the time the first analysis runs.
+  loadSettings();
+  wireSettingsPersistence();
+  await loadLearningState();
+  await loadSignalLog();
+  await loadShadowLog();
+  applyKnowledgeBaseWeights();
+  await loadPaper();
+  await loadKnowledge();
+  await loadCalendarCache();
+  loadAutonomyState();
+  loadQuota();
+  // Every store the merge touches is loaded by this point — the log it merges
+  // into, the paper account it books positions in, the learning state it
+  // updates. Replay anything the worker sent while that was still loading.
+  flushPendingIngest();
+  renderSignalLog();   // first render happened before the paper account loaded
+  startLivenessTicker();
+  startUpdateWatch();
+  startNewsWatch();
+  renderQuota();
+  renderAutonomyStats();
+  renderAnalysisQuality();
+  renderPaper();
+  renderDataInventory();
+  renderCalendar();
+  renderReasoning();
+  renderKnowledge();
+  runAudit();
+  renderAudit();
+  refreshWorkerTotals().then(renderDataInventory);
+  refreshAll();
+
+  const saved = await loadSavedKeys();
+  if (!saved) {
+    document.getElementById('autoBacktestStatus').textContent = 'Connect a data provider to enable auto-backtesting.';
+  } else {
+    document.getElementById('rememberKeysCheckbox').checked = true;
+    if (saved.provider) providerSelect.value = saved.provider;
+    if (saved.fredKey) document.getElementById('fredKeyInput').value = saved.fredKey;
+    if (saved.newsKey) document.getElementById('newsKeyInput').value = saved.newsKey;
+    if (typeof saved.autoBacktest === 'boolean') document.getElementById('autoBacktestCheckbox').checked = saved.autoBacktest;
+    if (saved.apiKey) {
+      document.getElementById('apiKeyInput').value = saved.apiKey;
+      connStatus.textContent = 'Restoring saved connection...';
+      await connectProvider(); // also re-fetches correlation/fundamentals/news with the restored keys
+    } else if (saved.fredKey || saved.newsKey) {
+      // No price provider was connected, but FRED/news keys were saved independently — restore those engines too.
+      await refreshCorrelation(activeProvider, apiKey, saved.fredKey || '');
+      await refreshFundamentals(saved.fredKey || '');
+      await refreshNewsSentiment(saved.newsKey || '');
+      refreshAll();
+      document.getElementById('autoBacktestStatus').textContent = 'Connect a data provider to enable auto-backtesting.';
+    } else {
+      document.getElementById('autoBacktestStatus').textContent = 'Connect a data provider to enable auto-backtesting.';
+    }
+  }
+
+  // The calendar gates trading, so it must be loaded before autonomy's first pass.
+  await refreshCalendar(false);
+  renderCalendar();
+  renderReasoning();
+
+  // Recover anything that resolved while the app was closed, then pick the loop back up.
+  if (autonomy.enabled) {
+    await autonomyCatchUp();
+    startAutonomy();
+  } else {
+    setAutonomyStatus('Off — check the box above to start.', 'idle', '');
+  }
+}
+bootstrap();
+ + fmt(p.entryFill) + ' · SL 
+  }
+
+  const closed = paper.positions.filter(p => p.status === 'closed' && inEra(p)).slice(0, 8);
+  if (closed.length) {
+    html += '<div style="font-size:10px;color:#454a56;margin:10px 0 6px;">Recent closed</div>';
+    html += closed.map(p =>
+      '<div class="zone-item"><span><span class="dirtag ' + p.dir + '">' + p.dir + '</span> ' + (p.outcome === 'won' ? (p.partial ? '◐' : '✓') : p.outcome === 'lost' ? '✗' : '–')
+      + ' <span style="color:#454a56;">' + lotLabel(p) + ' · exit $' + fmt(p.exitPrice) + '</span></span>'
+      + '<span class="mono ' + pnlCls(p.pnl) + '">' + money(p.pnl) + (p.rMultiple != null ? ' <span style="color:#454a56;">' + (p.rMultiple >= 0 ? '+' : '') + fmt(p.rMultiple) + 'R</span>' : '') + '</span></div>'
+    ).join('');
+  }
+
+  if (!resting.length && !open.length && !closed.length) {
+    html += '<div class="zone-empty">' + (a.archivedCount
+      ? 'Account reset — no trades in this era yet. The record above is intact.'
+      : 'No paper trades yet. Positions open automatically as the engine logs signals.') + '</div>';
+  }
+  root.innerHTML = html;
+}
+
+function renderPaperStatusNote() {
+  const note = document.getElementById('paperStatus');
+  if (!note) return;
+  if (!paper.enabled) { note.textContent = 'Off — no positions will be opened.'; return; }
+  note.textContent = paper.manual
+    ? 'On — new signals will open simulated positions. No real orders are placed.'
+    : 'On for the engine\'s own signals. Signals you generate by hand are excluded (signal panel).';
+}
+
+document.getElementById('paperEnabled').addEventListener('change', function () {
+  paper.enabled = this.checked;
+  savePaper();
+  renderPaper();
+  renderPaperStatusNote();
+  renderPaperManualHint();
+});
+
+const paperManualCb = document.getElementById('paperManual');
+if (paperManualCb) paperManualCb.addEventListener('change', function () {
+  paper.manual = this.checked;
+  // Ticking it with the account off is a request to paper-trade, so honour it
+  // rather than silently doing nothing.
+  if (paper.manual && !paper.enabled) {
+    paper.enabled = true;
+    const master = document.getElementById('paperEnabled');
+    if (master) master.checked = true;
+  }
+  savePaper();
+  renderPaper();
+  renderPaperStatusNote();
+  renderPaperManualHint();
+});
+document.getElementById('paperAdvancedToggle').addEventListener('click', () => {
+  document.getElementById('paperAdvanced').classList.toggle('hidden');
+});
+['pStartBalance', 'pRiskPct', 'pSpread', 'pSlippage', 'pMaxPos', 'pPartialPct', 'pHoldMeta', 'pPartialEnabled'].forEach(id => {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener('change', () => { paper.startingBalance = paperConfig().startingBalance; savePaper(); renderPaper(); });
+});
+document.getElementById('paperReset').addEventListener('click', async () => {
+  const price = currentMarkPrice();
+  const live = paper.positions.filter(p => p.status === 'open' || p.status === 'pending').length;
+  const keeping = paper.positions.filter(p => p.status === 'closed').length;
+  const msg = 'Reset the paper account back to $' + fmt(paperConfig().startingBalance) + '?\n\n'
+    + (live ? live + ' live position(s) will be closed at the current price first.\n' : '')
+    + keeping + ' completed trade(s) stay on record — they are what the system learns from, '
+    + 'and they keep counting towards the lifetime win rate. They just stop counting towards the balance.';
+  if (!window.confirm(msg)) return;
+  const out = resetPaperAccount(paper.positions, isFinite(price) ? price : undefined, Date.now());
+  paper.positions = out.positions;
+  paper.epoch = out.epoch;
+  await savePaper();
+  renderPaper();
+  renderDataInventory();
+});
+
+// ============================================================
+// ANALYSIS QUALITY PANEL
+// ------------------------------------------------------------
+// Renders the three self-audits. Every number here is deliberately allowed to
+// say "not enough data yet" rather than show a confident-looking figure built
+// on four trades — a reassuring number from a tiny sample is worse than no
+// number, because it gets believed.
+// ============================================================
+function fmtR(v) { return v == null ? '—' : (v >= 0 ? '+' : '') + v.toFixed(2) + 'R'; }
+function fmtPct(v) { return v == null ? '—' : (v * 100).toFixed(0) + '%'; }
+function rClass(v) { return v == null ? 'fneu' : v > 0.05 ? 'fpos' : v < -0.05 ? 'fneg' : 'fneu'; }
+
+function renderAnalysisQuality() {
+  const root = document.getElementById('qualityContent');
+  if (!root) return;
+
+  const cal = computeCalibration(signalLog);
+  const bd = computeConditionBreakdown(signalLog);
+  const audit = computeGateAudit(signalLog, shadowLog);
+
+  const rows = (list, label) => {
+    const usable = list.filter(r => r.n >= 3);
+    if (!usable.length) return '<div class="zone-empty">' + label + ': not enough resolved trades yet (need 3+ per group).</div>';
+    return usable.map(r =>
+      '<div class="zone-item"><span>' + r.key + ' <span style="color:#454a56;">(' + r.n + ')</span></span>' +
+      '<span class="mono ' + rClass(r.expectancyR) + '">' + fmtR(r.expectancyR) + ' · ' + fmtPct(r.winRate) + '</span></div>'
+    ).join('');
+  };
+
+  const o = bd.overall;
+  let html = '';
+
+  html += '<div class="data-source-note" style="margin-bottom:8px;">Expectancy is shown in R — average profit per unit risked. At a 1:4 target a 30% win rate is already profitable, so win rate alone is a poor scorecard and R is the honest one.</div>';
+
+  html += '<div class="metrics" style="margin-bottom:10px;">'
+    + '<div class="card"><div class="label">Resolved</div><div class="value mono">' + o.n + '</div></div>'
+    + '<div class="card"><div class="label">Win Rate</div><div class="value mono">' + fmtPct(o.winRate) + '</div></div>'
+    + '<div class="card"><div class="label">Expectancy</div><div class="value mono ' + rClass(o.expectancyR) + '">' + fmtR(o.expectancyR) + '</div></div>'
+    + '<div class="card"><div class="label">Total</div><div class="value mono ' + rClass(o.totalR) + '">' + fmtR(o.totalR) + '</div></div>'
+    + '</div>';
+
+  // 1. Is the confidence number worth anything?
+  html += '<div class="panel-title" style="font-size:11px;margin-top:12px;">Is the confidence score meaningful?</div>';
+  html += '<div class="event-line" style="border-left-color:#e8c37a;">' + cal.verdict + '</div>';
+  if (cal.discrimination != null) {
+    html += '<div class="zone-item"><span>High-confidence half vs low-confidence half</span><span class="mono ' + rClass(cal.discrimination) + '">'
+      + (cal.discrimination >= 0 ? '+' : '') + (cal.discrimination * 100).toFixed(0) + ' pp win rate</span></div>';
+  }
+  if (cal.buckets.length) {
+    html += '<table class="factor-table"><tr><th style="text-align:left;color:#5c6270;font-weight:500;">Confidence band</th><th style="color:#5c6270;font-weight:500;">Win rate</th><th style="color:#5c6270;font-weight:500;">Expectancy</th></tr>';
+    html += cal.buckets.map(b =>
+      '<tr><td>' + b.lo + '–' + b.hi + '% <span style="color:#454a56;">(' + b.n + ')</span></td>'
+      + '<td>' + fmtPct(b.winRate) + '</td>'
+      + '<td class="' + rClass(b.expectancyR) + '">' + fmtR(b.expectancyR) + '</td></tr>').join('');
+    html += '</table>';
+  }
+
+  // 2. Where does the edge actually live?
+  html += '<div class="panel-title" style="font-size:11px;margin-top:14px;">Where the edge actually lives</div>';
+  html += '<div style="font-size:10px;color:#454a56;margin-bottom:6px;">By session</div>' + rows(bd.bySession, 'Session');
+  html += '<div style="font-size:10px;color:#454a56;margin:8px 0 6px;">By market regime</div>' + rows(bd.byRegime, 'Regime');
+  html += '<div style="font-size:10px;color:#454a56;margin:8px 0 6px;">By grade</div>' + rows(bd.byGrade, 'Grade');
+  html += '<div style="font-size:10px;color:#454a56;margin:8px 0 6px;">By direction</div>' + rows(bd.byDirection, 'Direction');
+
+  // 3. The roads not taken.
+  html += '<div class="panel-title" style="font-size:11px;margin-top:14px;">The setups it turned down</div>';
+  html += '<div class="data-source-note" style="margin-bottom:6px;">Every setup the filter rejected is tracked and resolved against real price anyway. This is the comparison a human journal can never make, because nobody records their non-trades.</div>';
+  html += '<div class="zone-item"><span>Taken</span><span class="mono ' + rClass(audit.taken.expectancyR) + '">'
+    + fmtR(audit.taken.expectancyR) + ' <span style="color:#454a56;">(' + audit.taken.n + ')</span></span></div>';
+  html += '<div class="zone-item"><span>Declined</span><span class="mono ' + rClass(audit.declined.expectancyR) + '">'
+    + fmtR(audit.declined.expectancyR) + ' <span style="color:#454a56;">(' + audit.declined.n + ')</span></span></div>';
+  const pending = shadowLog.filter(s => s.status === 'pending' || s.status === 'open').length;
+  if (pending) html += '<div class="zone-item"><span>Declined, still running</span><span class="mono">' + pending + '</span></div>';
+  html += '<div class="event-line" style="border-left-color:#c99bff;margin-top:6px;">' + audit.verdict + '</div>';
+
+  root.innerHTML = html;
+}
+document.getElementById('resetQuality').addEventListener('click', async () => {
+  shadowLog = [];
+  await saveShadowLog();
+  renderAnalysisQuality();
+});
+
+// ============================================================
+// AUTONOMOUS MODE
+// ------------------------------------------------------------
+// The unattended operator. Once the user ticks the box, a single heartbeat
+// drives everything: fetch fresh candles, grade any signal that has since hit
+// its stop or target, re-analyse, commit a new signal if the gate clears, and
+// periodically re-backtest and retrain on the record it has built.
+//
+// Three things make this survive real-world conditions rather than only a tab
+// left open on a desk:
+//   * One 60s heartbeat with due-time checks, not a pile of setIntervals. A
+//     laptop that sleeps for six hours wakes up, sees every task is overdue,
+//     and runs them once — rather than firing a backlog of missed timers.
+//   * Losing the connection is expected, not exceptional. Offline is a quiet
+//     pause; repeated failures back off exponentially instead of hammering a
+//     rate-limited provider until the key is blocked.
+//   * Time with the tab closed is recovered, not lost. catchUp() replays the
+//     gap from real candle history on the next load, so signals that resolved
+//     while nobody was watching still become training data.
+// ============================================================
+
+const AUTONOMY_KEY = 'smc-autonomy-v1';
+const AUTONOMY_HEARTBEAT_MS = 60 * 1000;
+
+let autonomyHandle = null;
+let autonomyBusy = false;
+
+function autonomyConfig() {
+  const num = (id, fallback) => {
+    const el = document.getElementById(id);
+    const v = el ? parseFloat(el.value) : NaN;
+    return isFinite(v) ? v : fallback;
+  };
+  return Object.assign({}, AUTONOMY_DEFAULTS, {
+    minConfidence: num('aMinConf', AUTONOMY_DEFAULTS.minConfidence),
+    cooldownMinutes: num('aCooldown', AUTONOMY_DEFAULTS.cooldownMinutes),
+    maxOpenSignals: num('aMaxOpen', AUTONOMY_DEFAULTS.maxOpenSignals),
+    analysisIntervalMinutes: num('aInterval', AUTONOMY_DEFAULTS.analysisIntervalMinutes),
+    backtestIntervalHours: num('aBtHours', AUTONOMY_DEFAULTS.backtestIntervalHours),
+    minMetaScore: num('aMinMeta', AUTONOMY_DEFAULTS.minMetaScore),
+    // Kill switch. 0 in any field disables that arm rather than expiring
+    // everything instantly, which is what a 0 limit would otherwise mean.
+    maxHoursToFill: num('aKillFill', AUTONOMY_DEFAULTS.maxHoursToFill),
+    maxHoursOpen: num('aKillOpen', AUTONOMY_DEFAULTS.maxHoursOpen),
+    maxDriftRToFill: num('aKillDrift', AUTONOMY_DEFAULTS.maxDriftRToFill),
+    partialTP: partialTPConfig(),
+    newsState: currentNewsState(),
+    gradeFloor: (document.getElementById('aMinGrade') || {}).value || AUTONOMY_DEFAULTS.gradeFloor
+  });
+}
+
+function saveAutonomyState() {
+  try {
+    localStorage.setItem(AUTONOMY_KEY, JSON.stringify({
+      enabled: autonomy.enabled,
+      cycles: autonomy.cycles,
+      gateTally: autonomy.gateTally,
+      signalsTaken: autonomy.signalsTaken,
+      autoResolved: autonomy.autoResolved,
+      lastAnalysisAt: autonomy.lastAnalysisAt,
+      lastBacktestAt: autonomy.lastBacktestAt,
+      lastSignalAt: autonomy.lastSignalAt,
+      cfg: {
+        aMinConf: document.getElementById('aMinConf').value,
+        aCooldown: document.getElementById('aCooldown').value,
+        aKillFill: document.getElementById('aKillFill').value,
+        aKillOpen: document.getElementById('aKillOpen').value,
+        aKillDrift: document.getElementById('aKillDrift').value,
+        aMaxOpen: document.getElementById('aMaxOpen').value,
+        aInterval: document.getElementById('aInterval').value,
+        aBtHours: document.getElementById('aBtHours').value,
+        aMinMeta: document.getElementById('aMinMeta').value,
+        aDailyCap: document.getElementById('aDailyCap').value,
+        aMinGrade: document.getElementById('aMinGrade').value
+      }
+    }));
+  } catch (e) { /* storage unavailable — autonomy still works, it just won't remember across reloads */ }
+}
+
+function loadAutonomyState() {
+  try {
+    const raw = localStorage.getItem(AUTONOMY_KEY);
+    if (!raw) return;
+    const saved = JSON.parse(raw);
+    Object.assign(autonomy, {
+      enabled: !!saved.enabled,
+      cycles: saved.cycles || 0,
+      gateTally: saved.gateTally || {},
+      signalsTaken: saved.signalsTaken || 0,
+      autoResolved: saved.autoResolved || 0,
+      lastAnalysisAt: saved.lastAnalysisAt || null,
+      lastBacktestAt: saved.lastBacktestAt || null,
+      lastSignalAt: saved.lastSignalAt || null
+    });
+    if (saved.cfg) {
+      Object.keys(saved.cfg).forEach(id => {
+        const el = document.getElementById(id);
+        if (el && saved.cfg[id] != null) el.value = saved.cfg[id];
+      });
+    }
+    document.getElementById('autonomyEnabled').checked = autonomy.enabled;
+  } catch (e) { /* nothing saved yet */ }
+}
+
+function setAutonomyStatus(text, tone, reason) {
+  const dot = document.getElementById('autonomyDot');
+  const status = document.getElementById('autonomyStatus');
+  const reasonEl = document.getElementById('autonomyReason');
+  if (!status) return;
+  status.textContent = text;
+  const colours = { live: '#3ecf8e', warn: '#ffa726', error: '#ef4d5f', idle: '#454a56' };
+  const c = colours[tone] || colours.idle;
+  dot.style.background = c;
+  dot.style.boxShadow = tone === 'live' ? '0 0 7px ' + c : 'none';
+  status.style.color = tone === 'idle' ? '#9298a5' : c;
+  if (reason !== undefined) reasonEl.textContent = reason || '';
+}
+
+function renderAutonomyStats() {
+  const live = signalLog.filter(s => s.status === 'pending' || s.status === 'open');
+  document.getElementById('aCycles').textContent = autonomy.cycles;
+  document.getElementById('aSignals').textContent = autonomy.signalsTaken;
+  document.getElementById('aResolved').textContent = autonomy.autoResolved;
+  document.getElementById('aOpen').textContent = live.length;
+
+  const killedEl = document.getElementById('aKilled');
+  if (killedEl) killedEl.textContent = signalLog.filter(s => s.status === 'expired').length;
+
+  // How long the oldest live trade has been sitting. This is the number that
+  // was invisible before: an order resting for a day looked identical to one
+  // placed a minute ago.
+  const oldestEl = document.getElementById('aOldest');
+  if (oldestEl) {
+    const cfg = autonomyConfig();
+    // Each trade is aged against the limit that actually applies to it: a
+    // resting order against the fill limit, a filled one against the hold
+    // limit. Using the larger of the two would leave an order 2.5x past its own
+    // deadline showing no warning at all.
+    const ages = live.map(s => {
+      const filled = s.status === 'open';
+      const t = Date.parse(filled ? (s.filledAt || s.time) : s.time);
+      if (!isFinite(t)) return null;
+      const hours = (Date.now() - t) / 3600000;
+      const limit = filled ? cfg.maxHoursOpen : cfg.maxHoursToFill;
+      return { hours, ratio: limit > 0 ? hours / limit : 0 };
+    }).filter(v => v != null);
+    if (!ages.length) {
+      oldestEl.textContent = '—';
+      oldestEl.style.color = '';
+    } else {
+      const worst = ages.reduce((a, b) => b.hours > a.hours ? b : a, ages[0]);
+      const closest = ages.reduce((a, b) => b.ratio > a.ratio ? b : a, ages[0]);
+      oldestEl.textContent = worst.hours < 1 ? Math.round(worst.hours * 60) + 'm' : worst.hours.toFixed(1) + 'h';
+      // Amber as a trade approaches its own kill limit, red once past it, so
+      // one about to be culled is visible before it disappears.
+      oldestEl.style.color = closest.ratio >= 1 ? '#ef4d5f' : closest.ratio >= 0.75 ? '#ffa726' : '';
+    }
+  }
+
+  const el = document.getElementById('gateTally');
+  if (!el) return;
+  const entries = Object.keys(autonomy.gateTally || {})
+    .map(k => ({ code: k, n: autonomy.gateTally[k] }))
+    .sort((a, b) => b.n - a.n);
+  if (!entries.length) { el.innerHTML = ''; return; }
+  el.innerHTML = '<div style="font-size:10px;color:#454a56;margin:8px 0 4px;">Why cycles ended this way</div>'
+    + entries.map(e => '<div class="zone-item" style="padding:3px 0;"><span style="font-size:11px;">'
+        + (GATE_LABELS[e.code] || e.code) + '</span><span class="mono" style="font-size:11px;color:'
+        + (e.code === 'taken' ? '#3ecf8e' : '#5c6270') + ';">' + e.n + '</span></div>').join('');
+}
+
+// Grade every unresolved signal against `candles`. Used both by the heartbeat
+// (fresh candles each cycle) and by catchUp() (deep history after downtime).
+// Returns how many signals reached a win/loss verdict.
+function resolveOpenSignals(candles, cfg) {
+  if (!candles || candles.length < 2) return 0;
+  let resolved = 0, killed = 0, changed = false;
+
+  // The auditor decides which live trades are past saving, not the engine.
+  // Letting the engine judge whether its own trade has gone bad is the thing
+  // the auditor exists to avoid — and it re-derives fill state from raw candles
+  // rather than trusting the signal's own status, so a "pending" order price
+  // actually traded through is caught rather than aged as if it never filled.
+  const tradeAudit = auditOpenTrades(signalLog, candles, {
+    maxHoursToFill: cfg.maxHoursToFill,
+    maxHoursOpen: cfg.maxHoursOpen,
+    maxDriftRToFill: cfg.maxDriftRToFill
+  });
+  lastTradeAudit = tradeAudit;
+  const killedBy = new Map(tradeAudit.kills.map(k => [k.id, k]));
+
+  signalLog.forEach(sig => {
+    if (sig.status !== 'pending' && sig.status !== 'open') return;
+    // An auditor kill outranks whatever the resolver would have said, EXCEPT
+    // when price has already settled the trade: a stop or target that has
+    // genuinely been hit is a real outcome and real evidence, and discarding it
+    // to enforce a time limit would throw away the data the limit exists to
+    // protect.
+    const verdict = resolveSignal(sig, candles, cfg);
+    const kill = killedBy.get(sig.id);
+    if (kill && verdict.status !== 'won' && verdict.status !== 'lost') {
+      sig.status = 'expired';
+      sig.expiryReason = 'auditor: ' + kill.reason;
+      sig.killSwitch = kill.code;
+      sig.resolvedAt = new Date().toISOString();
+      sig.resolvedBy = 'auditor';
+      paperCloseForSignal(sig.id, 'expired');
+      killed++; changed = true;
+      return;
+    }
+    if (verdict.status === 'won' || verdict.status === 'lost') {
+      if (applySignalOutcome(sig, verdict.status === 'won', {
+        auto: true, exitPrice: verdict.exitPrice, ambiguousBar: verdict.ambiguousBar, partial: verdict.partial
+      })) { resolved++; changed = true; }
+    } else if (verdict.status === 'expired') {
+      sig.status = 'expired';
+      sig.expiryReason = verdict.reason || null;
+      sig.killSwitch = verdict.killSwitch || null;
+      sig.resolvedAt = new Date().toISOString();
+      sig.resolvedBy = 'auto';
+      paperCloseForSignal(sig.id, 'expired');
+      if (verdict.killSwitch) killed++;
+      changed = true; // expired signals never become training data — no outcome to learn from
+    } else if (verdict.status === 'open' && sig.status === 'pending') {
+      sig.status = 'open'; // limit entry got tagged; it's a live position now
+      sig.filledAt = new Date().toISOString();
+      paperFillForSignal(sig.id, sig.filledAt);
+      changed = true;
+    }
+  });
+  if (changed) { saveSignalLog(); renderSignalLog(); }
+  if (resolved) autonomy.autoResolved += resolved;
+  if (killed) autonomy.killed = (autonomy.killed || 0) + killed;
+  resolveShadowSignals(candles, cfg);
+  return resolved;
+}
+
+// Shadows get the same treatment, minus the learning updates — a setup the
+// engine declined should inform the audit, not train the weights as though it
+// had been traded.
+function resolveShadowSignals(candles, cfg) {
+  if (!candles || candles.length < 2 || !shadowLog.length) return;
+  let changed = false;
+  shadowLog.forEach(sig => {
+    if (sig.status !== 'pending' && sig.status !== 'open') return;
+    const verdict = resolveSignal(sig, candles, cfg);
+    if (verdict.status === 'won' || verdict.status === 'lost') {
+      sig.status = verdict.status;
+      sig.resolvedAt = new Date().toISOString();
+      changed = true;
+    } else if (verdict.status === 'expired') {
+      sig.status = 'expired'; sig.expiryReason = verdict.reason || null; changed = true;
+    } else if (verdict.status === 'open' && sig.status === 'pending') {
+      sig.status = 'open'; changed = true;
+    }
+  });
+  if (changed) { saveShadowLog(); renderAnalysisQuality(); }
+}
+
+// One unattended pass. Everything that can fail is inside the caller's try.
+async function autonomyCycle() {
+  const cfg = autonomyConfig();
+  const now = Date.now();
+
+  // 0. Calendar first. It gates whether a signal may be taken at all, so it has
+  // to be current BEFORE the gate reads it — refreshing at the end of the cycle
+  // meant the first pass after a reconnect ran against an empty calendar and
+  // could take a position straight into a release window.
+  await refreshCalendar(false);
+
+  // 1. Fresh candles. resyncCandles() already refreshes liveData from the provider.
+  await resyncCandles();
+
+  // 2. Grade what the market has already decided since the last pass.
+  const graded = resolveOpenSignals(liveData, cfg);
+
+  // 3. Re-analyse on the new data.
+  refreshAll();
+  autonomy.lastAnalysisAt = now;
+
+  // 4. Commit a signal only if the gate clears.
+  let reason;
+  if (lastComposite) {
+    const plan = buildTradePlan(lastComposite, getTargetRR());
+    // The auditor is advisory everywhere except here. A critical finding means
+    // the analysis contradicts itself or the data it was built on — that is not
+    // a risk preference, and no confidence score should be able to override it.
+    const audit = runAudit();
+    renderAudit();
+    let gate;
+    if (audit && audit.blocking) {
+      gate = { take: false, code: 'audit',
+        reason: 'independent audit found ' + audit.critical + ' critical issue(s): ' + audit.findings[0].title };
+    } else {
+      gate = autonomyGate(lastComposite, plan, signalLog, autonomy.lastSignalAt, cfg);
+    }
+    // Tally why each cycle ended as it did. One latest-reason line cannot show
+    // whether 13 quiet cycles mean "no setup existed" or "the filter blocked
+    // every one" — and those need opposite responses.
+    const code = gate.code || 'unknown';
+    autonomy.gateTally[code] = (autonomy.gateTally[code] || 0) + 1;
+    if (gate.take) {
+      updateSignalUI(lastComposite, plan, true, 'auto'); // logIt = true -> addSignalToLog
+      autonomy.signalsTaken++;
+      autonomy.lastSignalAt = now;
+      reason = 'Took a ' + lastComposite.direction + ' at $' + fmt(plan.entry) +
+               ' (' + lastComposite.confidence + '% confidence' + (gate.grade ? ', grade ' + gate.grade : '') + ').';
+    } else {
+      updateSignalUI(lastComposite, plan, false); // keep the panel current without logging
+      // Track what was passed on, so the filter can be audited later rather
+      // than trusted forever.
+      addShadowSignal(lastComposite, plan, gate.reason);
+      reason = 'No signal taken — ' + gate.reason + '.';
+    }
+  } else {
+    reason = 'Analysis produced no result this cycle.';
+  }
+  if (graded) reason = 'Self-graded ' + graded + ' signal' + (graded === 1 ? '' : 's') + '. ' + reason;
+  autonomy.lastReason = reason;
+
+  // 5. Periodic re-backtest / retrain on the accumulated record.
+  const btDue = !autonomy.lastBacktestAt || (now - autonomy.lastBacktestAt) >= cfg.backtestIntervalHours * 3600 * 1000;
+  if (btDue) {
+    autonomy.lastBacktestAt = now;
+    await runBacktestCycle(true);
+  }
+
+  renderAnalysisQuality();
+  renderDataInventory();
+  renderCalendar();
+  renderReasoning();
+  runAudit();
+  renderAudit();
+  autonomy.cycles++;
+  autonomy.consecutiveErrors = 0;
+  autonomy.lastError = null;
+  saveAutonomyState();
+  renderAutonomyStats();
+  if (candlesStaleForBudget) {
+    setAutonomyStatus('Running on cached candles — daily API budget spent, resumes 00:00 UTC.', 'warn',
+      'Still grading open signals and re-analysing, but on the last candles fetched rather than fresh ones. ' + reason);
+  } else {
+    setAutonomyStatus('Running autonomously — last pass ' + new Date(now).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) + '.', 'live', reason);
+  }
+}
+
+// The heartbeat: decides whether a cycle is due, and handles every reason it
+// might not be. Deliberately does no analysis itself.
+async function autonomyHeartbeat() {
+  if (!autonomy.enabled || autonomyBusy) return;
+
+  if (!navigator.onLine) {
+    setAutonomyStatus('Paused — no internet connection. Resumes automatically.', 'warn',
+      'Nothing is lost while offline; the gap gets replayed from candle history once the connection is back.');
+    return;
+  }
+  if (dataMode !== 'live') {
+    setAutonomyStatus('Waiting for a live data provider — connect an API key above.', 'warn',
+      'Autonomous mode needs real candles; it will not run on the simulated feed.');
+    return;
+  }
+  // Gold is shut from Friday ~21:00 UTC to Sunday ~22:00 UTC. Analysing a frozen
+  // feed produces confident-looking signals off Friday's last bar, and every one
+  // of them enters the learning record as a real read of a market that was not
+  // trading. Nothing to analyse, so nothing runs.
+  if (!isMarketOpen(Date.now())) {
+    const clock = marketClock(Date.now());
+    const h = clock.hoursUntilOpen;
+    setAutonomyStatus('Market closed — resumes when gold reopens in ' +
+      (h < 1 ? Math.round(h * 60) + 'm' : h.toFixed(1) + 'h') + '.', 'warn',
+      'The feed is frozen at Friday\u2019s close. Analysing it would generate signals from a market that is not trading.');
+    return;
+  }
+  if (autonomy.skipCycles > 0) {
+    autonomy.skipCycles--;
+    setAutonomyStatus('Backing off after an error — retrying in ' + (autonomy.skipCycles + 1) + ' min.', 'warn', autonomy.lastError);
+    return;
+  }
+
+  const cfg = autonomyConfig();
+  const dueAt = (autonomy.lastAnalysisAt || 0) + cfg.analysisIntervalMinutes * 60 * 1000;
+  if (Date.now() < dueAt) {
+    const mins = Math.ceil((dueAt - Date.now()) / 60000);
+    setAutonomyStatus('Running autonomously — next pass in ' + mins + ' min.', 'live', autonomy.lastReason);
+    return;
+  }
+
+  autonomyBusy = true;
+  try {
+    await autonomyCycle();
+  } catch (e) {
+    autonomy.consecutiveErrors++;
+    autonomy.lastError = (e && e.message) || String(e);
+    // Exponential backoff, capped at ~30 min. A rate-limited or expired key
+    // should not turn into a request every minute for the rest of the day.
+    autonomy.skipCycles = Math.min(Math.pow(2, autonomy.consecutiveErrors), 30);
+    setAutonomyStatus('Cycle failed (' + autonomy.consecutiveErrors + ' in a row) — backing off ' + autonomy.skipCycles + ' min.', 'error', autonomy.lastError);
+    saveAutonomyState();
+  } finally {
+    autonomyBusy = false;
+  }
+}
+
+// Replay the time the app was closed or disconnected. Pulls the deepest history
+// the provider allows and grades every still-open signal against it, so a signal
+// that hit its target overnight is training data by the time the user looks.
+async function autonomyCatchUp() {
+  if (dataMode !== 'live' || !navigator.onLine) return;
+  const stillOpen = signalLog.filter(s => s.status === 'pending' || s.status === 'open');
+  if (!stillOpen.length) return;
+  setAutonomyStatus('Catching up — replaying ' + stillOpen.length + ' unresolved signal(s) against real history…', 'warn', '');
+  try {
+    const history = await PROVIDERS[activeProvider].timeSeries(apiKey, LIVE_INTERVAL, 5000);
+    const n = resolveOpenSignals(history, autonomyConfig());
+    renderAutonomyStats();
+    saveAutonomyState();
+    setAutonomyStatus('Catch-up complete.', autonomy.enabled ? 'live' : 'idle',
+      n ? 'Graded ' + n + ' signal(s) that resolved while the app was closed.'
+        : 'No signals had resolved while the app was closed.');
+  } catch (e) {
+    // Not fatal — the regular heartbeat will keep trying against live candles.
+    setAutonomyStatus('Catch-up could not fetch history — continuing on live candles.', 'warn', (e && e.message) || String(e));
+  }
+}
+
+function startAutonomy() {
+  if (autonomyHandle) clearInterval(autonomyHandle);
+  autonomyHandle = setInterval(autonomyHeartbeat, AUTONOMY_HEARTBEAT_MS);
+  autonomy.skipCycles = 0;
+  autonomy.consecutiveErrors = 0;
+  setAutonomyStatus('Autonomous mode on — first pass starting…', 'live', '');
+  autonomy.lastAnalysisAt = null; // force an immediate first pass
+  autonomyHeartbeat();
+}
+
+function stopAutonomy() {
+  if (autonomyHandle) { clearInterval(autonomyHandle); autonomyHandle = null; }
+  setAutonomyStatus('Off — check the box above to start.', 'idle', '');
+}
+
+document.getElementById('autonomyEnabled').addEventListener('change', function () {
+  autonomy.enabled = this.checked;
+  saveAutonomyState();
+  if (autonomy.enabled) startAutonomy(); else stopAutonomy();
+});
+providerSelect.addEventListener('change', renderQuota);
+const umm = document.getElementById('useMacroModel');
+if (umm) umm.addEventListener('change', () => { renderKnowledge(); renderReasoning(); });
+
+// A posture for building up a record rather than protecting capital. The engine
+// learns from resolved trades, and at the default B floor a ranging market
+// simply never qualifies — so a cautious setup collects nothing and the
+// knowledge base never starts.
+document.getElementById('aPresetCollect').addEventListener('click', () => {
+  // D, not C: even a perfect five-timeframe alignment only scores ~49%, so a C
+  // floor (>=30%) still rejects ordinary conditions and collects almost nothing.
+  document.getElementById('aMinGrade').value = 'D';
+  document.getElementById('aMinConf').value = 15;
+  document.getElementById('aCooldown').value = 30;
+  document.getElementById('aMaxOpen').value = 5;
+  document.getElementById('aMinMeta').value = -0.5;
+  saveAutonomyState();
+  autonomy.lastAnalysisAt = null; // re-evaluate immediately under the new thresholds
+  setAutonomyStatus('Data-collection thresholds applied — re-evaluating now.', 'live', '');
+  autonomyHeartbeat();
+});
+document.getElementById('autonomyAdvancedToggle').addEventListener('click', () => {
+  document.getElementById('autonomyAdvanced').classList.toggle('hidden');
+});
+['aMinConf', 'aCooldown', 'aMaxOpen', 'aInterval', 'aBtHours', 'aMinMeta', 'aDailyCap', 'aMinGrade',
+ 'aKillFill', 'aKillOpen', 'aKillDrift'].forEach(id => {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener('change', () => { saveAutonomyState(); renderQuota(); });
+});
+
+// React to connectivity changes straight away rather than waiting out a heartbeat.
+window.addEventListener('online', () => {
+  if (!autonomy.enabled) return;
+  autonomy.skipCycles = 0;
+  autonomy.consecutiveErrors = 0;
+  setAutonomyStatus('Back online — catching up…', 'warn', '');
+  autonomyCatchUp().then(autonomyHeartbeat);
+});
+window.addEventListener('offline', () => {
+  if (autonomy.enabled) setAutonomyStatus('Paused — no internet connection. Resumes automatically.', 'warn', '');
+});
+// Coming back to a backgrounded tab is a good moment to check for missed work:
+// mobile browsers in particular throttle timers hard once a tab is hidden.
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && autonomy.enabled) autonomyHeartbeat();
+});
+
+// ============================================================
+// BOOTSTRAP
+// ------------------------------------------------------------
+// Ordering matters here, which is why it is one explicit sequence rather than
+// scattered top-level calls: persisted learning state has to be restored (and
+// its weights applied) before the first analysis, and every DOM const further
+// up this file has to exist before anything reads it.
+// ============================================================
+// ============================================================
+// SETTINGS THAT SURVIVE A RELOAD
+// ------------------------------------------------------------
+// Only the paper account's balance and the autonomy thresholds were ever
+// persisted. Everything else a person could change — risk per trade, spread,
+// slippage, max concurrent, the partial-take-profit rules, all fourteen factor
+// weights, the target R:R, every backtest parameter, the news-window settings —
+// was read straight off the DOM and lost the moment the page reloaded. Tuning
+// the system was therefore something you had to redo from memory each session,
+// and an autonomous run would quietly revert to defaults after any refresh.
+//
+// One store, one list, restored before the first analysis so the weights are in
+// force when it runs. Ids that already have an owner are deliberately absent —
+// autonomy keeps its own (AUTONOMY_KEY), the paper on/off switches live with the
+// account, and the API keys are opt-in through "remember keys" rather than
+// swept up here.
+const SETTINGS_KEY = 'smc-settings-v1';
+const SETTINGS_IDS = [
+  // paper account
+  'pStartBalance', 'pRiskPct', 'pSpread', 'pSlippage', 'pMaxPos',
+  'pSizingMode', 'pFixedLots', 'pContractSize', 'pLotStep', 'pMinLots',
+  'pPartialPct', 'pHoldMeta', 'pPartialEnabled',
+  // factor weights
+  'wWeekly', 'wDaily', 'wHtf', 'wMtf', 'wLtf', 'wOb', 'wFvg', 'wLiq',
+  'wPd', 'wPriceAction', 'wClassic', 'wCorrelation', 'wFundamental', 'wNews',
+  // signal + backtest
+  'targetRR', 'pBars', 'pCapital', 'pRisk', 'pCostPips', 'pMinConf', 'pTargetRR',
+  // news window and macro model
+  'newsBeforeMin', 'newsAfterMin', 'newsBlockEnabled', 'newsBlockMedium',
+  'newsFlattenEnabled', 'newsFlattenMin', 'newsAlertMin', 'useMacroModel',
+  'weekendFlattenEnabled', 'weekendFlattenMin'
+];
+
+function saveSettings() {
+  const out = {};
+  SETTINGS_IDS.forEach(id => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    out[id] = el.type === 'checkbox' ? !!el.checked : el.value;
+  });
+  try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(out)); }
+  catch (e) { return false; }
+  return true;
+}
+
+function loadSettings() {
+  let saved;
+  try { saved = JSON.parse(localStorage.getItem(SETTINGS_KEY) || 'null'); }
+  catch (e) { return; }
+  if (!saved || typeof saved !== 'object') return;
+  SETTINGS_IDS.forEach(id => {
+    if (!(id in saved)) return;
+    const el = document.getElementById(id);
+    if (!el) return;
+    if (el.type === 'checkbox') el.checked = !!saved[id];
+    else if (saved[id] != null) el.value = saved[id];
+  });
+  // Sliders carry a printed value beside them that does not follow a
+  // programmatic change, so a restored weight would show the old number.
+  syncSliderLabels();
+}
+
+function syncSliderLabels() {
+  weightIds.forEach(id => {
+    const el = document.getElementById(id), out = document.getElementById(id + 'V');
+    if (el && out) out.textContent = el.value;
+  });
+  const rr = document.getElementById('targetRR'), rrOut = document.getElementById('targetRRV');
+  if (rr && rrOut) rrOut.textContent = '1:' + rr.value;
+}
+
+let settingsSaveTimer = null;
+function flagSettingsSaved() {
+  const el = document.getElementById('settingsSavedNote');
+  if (!el) return;
+  el.textContent = 'Settings saved.';
+  el.style.color = '#3ecf8e';
+  clearTimeout(settingsSaveTimer);
+  settingsSaveTimer = setTimeout(() => { el.textContent = ''; }, 2500);
+}
+
+function wireSettingsPersistence() {
+  SETTINGS_IDS.forEach(id => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    const handler = () => { if (saveSettings()) flagSettingsSaved(); };
+    el.addEventListener('change', handler);
+    // Sliders and number spinners fire `input` continuously; `change` alone
+    // would miss a drag that never blurs.
+    if (el.type === 'range' || el.type === 'number') el.addEventListener('input', handler);
+  });
+}
+
+// ============================================================
+// IS THIS TAB STILL RUNNING THE CURRENT CODE?
+// ------------------------------------------------------------
+// This app is built to be left open for days doing unattended analysis, which
+// means a tab can go on running the modules it loaded at open time long after a
+// fix has shipped. That is not hypothetical: the macro engine ran on 1976-2006
+// FRED data, the fix deployed, and an open tab would have carried on producing
+// confident, wrong numbers with nothing on screen to say so.
+//
+// The check compares the ETag of app.js now against the one seen at startup, so
+// it needs no version constant to keep in sync and no build step. `no-store`
+// forces the request past the browser cache; the server already sends
+// must-revalidate, so this is cheap.
+const UPDATE_CHECK_MS = 30 * 60 * 1000;
+let loadedBuildTag = null;
+let updateWatchHandle = null;
+
+async function currentBuildTag() {
+  try {
+    const r = await fetch('app.js', { method: 'HEAD', cache: 'no-store' });
+    return r.headers.get('etag') || r.headers.get('last-modified') || null;
+  } catch (e) {
+    return null; // offline, or the check is blocked — try again next time
+  }
+}
+
+async function checkForNewBuild() {
+  const tag = await currentBuildTag();
+  if (!tag) return;
+  if (loadedBuildTag == null) { loadedBuildTag = tag; return; }
+  if (tag === loadedBuildTag) return;
+  const banner = document.getElementById('updateBanner');
+  if (banner) banner.classList.remove('hidden');
+}
+
+function startUpdateWatch() {
+  const reload = document.getElementById('updateReload');
+  if (reload) reload.addEventListener('click', () => window.location.reload());
+  checkForNewBuild();
+  if (updateWatchHandle) clearInterval(updateWatchHandle);
+  updateWatchHandle = setInterval(checkForNewBuild, UPDATE_CHECK_MS);
+}
+
+async function bootstrap() {
+  // Before anything reads a control: the weights, risk settings and thresholds
+  // have to be the saved ones by the time the first analysis runs.
+  loadSettings();
+  wireSettingsPersistence();
+  await loadLearningState();
+  await loadSignalLog();
+  await loadShadowLog();
+  applyKnowledgeBaseWeights();
+  await loadPaper();
+  await loadKnowledge();
+  await loadCalendarCache();
+  loadAutonomyState();
+  loadQuota();
+  // Every store the merge touches is loaded by this point — the log it merges
+  // into, the paper account it books positions in, the learning state it
+  // updates. Replay anything the worker sent while that was still loading.
+  flushPendingIngest();
+  renderSignalLog();   // first render happened before the paper account loaded
+  startLivenessTicker();
+  startUpdateWatch();
+  startNewsWatch();
+  renderQuota();
+  renderAutonomyStats();
+  renderAnalysisQuality();
+  renderPaper();
+  renderDataInventory();
+  renderCalendar();
+  renderReasoning();
+  renderKnowledge();
+  runAudit();
+  renderAudit();
+  refreshWorkerTotals().then(renderDataInventory);
+  refreshAll();
+
+  const saved = await loadSavedKeys();
+  if (!saved) {
+    document.getElementById('autoBacktestStatus').textContent = 'Connect a data provider to enable auto-backtesting.';
+  } else {
+    document.getElementById('rememberKeysCheckbox').checked = true;
+    if (saved.provider) providerSelect.value = saved.provider;
+    if (saved.fredKey) document.getElementById('fredKeyInput').value = saved.fredKey;
+    if (saved.newsKey) document.getElementById('newsKeyInput').value = saved.newsKey;
+    if (typeof saved.autoBacktest === 'boolean') document.getElementById('autoBacktestCheckbox').checked = saved.autoBacktest;
+    if (saved.apiKey) {
+      document.getElementById('apiKeyInput').value = saved.apiKey;
+      connStatus.textContent = 'Restoring saved connection...';
+      await connectProvider(); // also re-fetches correlation/fundamentals/news with the restored keys
+    } else if (saved.fredKey || saved.newsKey) {
+      // No price provider was connected, but FRED/news keys were saved independently — restore those engines too.
+      await refreshCorrelation(activeProvider, apiKey, saved.fredKey || '');
+      await refreshFundamentals(saved.fredKey || '');
+      await refreshNewsSentiment(saved.newsKey || '');
+      refreshAll();
+      document.getElementById('autoBacktestStatus').textContent = 'Connect a data provider to enable auto-backtesting.';
+    } else {
+      document.getElementById('autoBacktestStatus').textContent = 'Connect a data provider to enable auto-backtesting.';
+    }
+  }
+
+  // The calendar gates trading, so it must be loaded before autonomy's first pass.
+  await refreshCalendar(false);
+  renderCalendar();
+  renderReasoning();
+
+  // Recover anything that resolved while the app was closed, then pick the loop back up.
+  if (autonomy.enabled) {
+    await autonomyCatchUp();
+    startAutonomy();
+  } else {
+    setAutonomyStatus('Off — check the box above to start.', 'idle', '');
+  }
+}
+bootstrap();
+ + fmt(p.sl) + ' · TP 
+  }
+
+  const closed = paper.positions.filter(p => p.status === 'closed' && inEra(p)).slice(0, 8);
+  if (closed.length) {
+    html += '<div style="font-size:10px;color:#454a56;margin:10px 0 6px;">Recent closed</div>';
+    html += closed.map(p =>
+      '<div class="zone-item"><span><span class="dirtag ' + p.dir + '">' + p.dir + '</span> ' + (p.outcome === 'won' ? (p.partial ? '◐' : '✓') : p.outcome === 'lost' ? '✗' : '–')
+      + ' <span style="color:#454a56;">' + lotLabel(p) + ' · exit $' + fmt(p.exitPrice) + '</span></span>'
+      + '<span class="mono ' + pnlCls(p.pnl) + '">' + money(p.pnl) + (p.rMultiple != null ? ' <span style="color:#454a56;">' + (p.rMultiple >= 0 ? '+' : '') + fmt(p.rMultiple) + 'R</span>' : '') + '</span></div>'
+    ).join('');
+  }
+
+  if (!resting.length && !open.length && !closed.length) {
+    html += '<div class="zone-empty">' + (a.archivedCount
+      ? 'Account reset — no trades in this era yet. The record above is intact.'
+      : 'No paper trades yet. Positions open automatically as the engine logs signals.') + '</div>';
+  }
+  root.innerHTML = html;
+}
+
+function renderPaperStatusNote() {
+  const note = document.getElementById('paperStatus');
+  if (!note) return;
+  if (!paper.enabled) { note.textContent = 'Off — no positions will be opened.'; return; }
+  note.textContent = paper.manual
+    ? 'On — new signals will open simulated positions. No real orders are placed.'
+    : 'On for the engine\'s own signals. Signals you generate by hand are excluded (signal panel).';
+}
+
+document.getElementById('paperEnabled').addEventListener('change', function () {
+  paper.enabled = this.checked;
+  savePaper();
+  renderPaper();
+  renderPaperStatusNote();
+  renderPaperManualHint();
+});
+
+const paperManualCb = document.getElementById('paperManual');
+if (paperManualCb) paperManualCb.addEventListener('change', function () {
+  paper.manual = this.checked;
+  // Ticking it with the account off is a request to paper-trade, so honour it
+  // rather than silently doing nothing.
+  if (paper.manual && !paper.enabled) {
+    paper.enabled = true;
+    const master = document.getElementById('paperEnabled');
+    if (master) master.checked = true;
+  }
+  savePaper();
+  renderPaper();
+  renderPaperStatusNote();
+  renderPaperManualHint();
+});
+document.getElementById('paperAdvancedToggle').addEventListener('click', () => {
+  document.getElementById('paperAdvanced').classList.toggle('hidden');
+});
+['pStartBalance', 'pRiskPct', 'pSpread', 'pSlippage', 'pMaxPos', 'pPartialPct', 'pHoldMeta', 'pPartialEnabled'].forEach(id => {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener('change', () => { paper.startingBalance = paperConfig().startingBalance; savePaper(); renderPaper(); });
+});
+document.getElementById('paperReset').addEventListener('click', async () => {
+  const price = currentMarkPrice();
+  const live = paper.positions.filter(p => p.status === 'open' || p.status === 'pending').length;
+  const keeping = paper.positions.filter(p => p.status === 'closed').length;
+  const msg = 'Reset the paper account back to $' + fmt(paperConfig().startingBalance) + '?\n\n'
+    + (live ? live + ' live position(s) will be closed at the current price first.\n' : '')
+    + keeping + ' completed trade(s) stay on record — they are what the system learns from, '
+    + 'and they keep counting towards the lifetime win rate. They just stop counting towards the balance.';
+  if (!window.confirm(msg)) return;
+  const out = resetPaperAccount(paper.positions, isFinite(price) ? price : undefined, Date.now());
+  paper.positions = out.positions;
+  paper.epoch = out.epoch;
+  await savePaper();
+  renderPaper();
+  renderDataInventory();
+});
+
+// ============================================================
+// ANALYSIS QUALITY PANEL
+// ------------------------------------------------------------
+// Renders the three self-audits. Every number here is deliberately allowed to
+// say "not enough data yet" rather than show a confident-looking figure built
+// on four trades — a reassuring number from a tiny sample is worse than no
+// number, because it gets believed.
+// ============================================================
+function fmtR(v) { return v == null ? '—' : (v >= 0 ? '+' : '') + v.toFixed(2) + 'R'; }
+function fmtPct(v) { return v == null ? '—' : (v * 100).toFixed(0) + '%'; }
+function rClass(v) { return v == null ? 'fneu' : v > 0.05 ? 'fpos' : v < -0.05 ? 'fneg' : 'fneu'; }
+
+function renderAnalysisQuality() {
+  const root = document.getElementById('qualityContent');
+  if (!root) return;
+
+  const cal = computeCalibration(signalLog);
+  const bd = computeConditionBreakdown(signalLog);
+  const audit = computeGateAudit(signalLog, shadowLog);
+
+  const rows = (list, label) => {
+    const usable = list.filter(r => r.n >= 3);
+    if (!usable.length) return '<div class="zone-empty">' + label + ': not enough resolved trades yet (need 3+ per group).</div>';
+    return usable.map(r =>
+      '<div class="zone-item"><span>' + r.key + ' <span style="color:#454a56;">(' + r.n + ')</span></span>' +
+      '<span class="mono ' + rClass(r.expectancyR) + '">' + fmtR(r.expectancyR) + ' · ' + fmtPct(r.winRate) + '</span></div>'
+    ).join('');
+  };
+
+  const o = bd.overall;
+  let html = '';
+
+  html += '<div class="data-source-note" style="margin-bottom:8px;">Expectancy is shown in R — average profit per unit risked. At a 1:4 target a 30% win rate is already profitable, so win rate alone is a poor scorecard and R is the honest one.</div>';
+
+  html += '<div class="metrics" style="margin-bottom:10px;">'
+    + '<div class="card"><div class="label">Resolved</div><div class="value mono">' + o.n + '</div></div>'
+    + '<div class="card"><div class="label">Win Rate</div><div class="value mono">' + fmtPct(o.winRate) + '</div></div>'
+    + '<div class="card"><div class="label">Expectancy</div><div class="value mono ' + rClass(o.expectancyR) + '">' + fmtR(o.expectancyR) + '</div></div>'
+    + '<div class="card"><div class="label">Total</div><div class="value mono ' + rClass(o.totalR) + '">' + fmtR(o.totalR) + '</div></div>'
+    + '</div>';
+
+  // 1. Is the confidence number worth anything?
+  html += '<div class="panel-title" style="font-size:11px;margin-top:12px;">Is the confidence score meaningful?</div>';
+  html += '<div class="event-line" style="border-left-color:#e8c37a;">' + cal.verdict + '</div>';
+  if (cal.discrimination != null) {
+    html += '<div class="zone-item"><span>High-confidence half vs low-confidence half</span><span class="mono ' + rClass(cal.discrimination) + '">'
+      + (cal.discrimination >= 0 ? '+' : '') + (cal.discrimination * 100).toFixed(0) + ' pp win rate</span></div>';
+  }
+  if (cal.buckets.length) {
+    html += '<table class="factor-table"><tr><th style="text-align:left;color:#5c6270;font-weight:500;">Confidence band</th><th style="color:#5c6270;font-weight:500;">Win rate</th><th style="color:#5c6270;font-weight:500;">Expectancy</th></tr>';
+    html += cal.buckets.map(b =>
+      '<tr><td>' + b.lo + '–' + b.hi + '% <span style="color:#454a56;">(' + b.n + ')</span></td>'
+      + '<td>' + fmtPct(b.winRate) + '</td>'
+      + '<td class="' + rClass(b.expectancyR) + '">' + fmtR(b.expectancyR) + '</td></tr>').join('');
+    html += '</table>';
+  }
+
+  // 2. Where does the edge actually live?
+  html += '<div class="panel-title" style="font-size:11px;margin-top:14px;">Where the edge actually lives</div>';
+  html += '<div style="font-size:10px;color:#454a56;margin-bottom:6px;">By session</div>' + rows(bd.bySession, 'Session');
+  html += '<div style="font-size:10px;color:#454a56;margin:8px 0 6px;">By market regime</div>' + rows(bd.byRegime, 'Regime');
+  html += '<div style="font-size:10px;color:#454a56;margin:8px 0 6px;">By grade</div>' + rows(bd.byGrade, 'Grade');
+  html += '<div style="font-size:10px;color:#454a56;margin:8px 0 6px;">By direction</div>' + rows(bd.byDirection, 'Direction');
+
+  // 3. The roads not taken.
+  html += '<div class="panel-title" style="font-size:11px;margin-top:14px;">The setups it turned down</div>';
+  html += '<div class="data-source-note" style="margin-bottom:6px;">Every setup the filter rejected is tracked and resolved against real price anyway. This is the comparison a human journal can never make, because nobody records their non-trades.</div>';
+  html += '<div class="zone-item"><span>Taken</span><span class="mono ' + rClass(audit.taken.expectancyR) + '">'
+    + fmtR(audit.taken.expectancyR) + ' <span style="color:#454a56;">(' + audit.taken.n + ')</span></span></div>';
+  html += '<div class="zone-item"><span>Declined</span><span class="mono ' + rClass(audit.declined.expectancyR) + '">'
+    + fmtR(audit.declined.expectancyR) + ' <span style="color:#454a56;">(' + audit.declined.n + ')</span></span></div>';
+  const pending = shadowLog.filter(s => s.status === 'pending' || s.status === 'open').length;
+  if (pending) html += '<div class="zone-item"><span>Declined, still running</span><span class="mono">' + pending + '</span></div>';
+  html += '<div class="event-line" style="border-left-color:#c99bff;margin-top:6px;">' + audit.verdict + '</div>';
+
+  root.innerHTML = html;
+}
+document.getElementById('resetQuality').addEventListener('click', async () => {
+  shadowLog = [];
+  await saveShadowLog();
+  renderAnalysisQuality();
+});
+
+// ============================================================
+// AUTONOMOUS MODE
+// ------------------------------------------------------------
+// The unattended operator. Once the user ticks the box, a single heartbeat
+// drives everything: fetch fresh candles, grade any signal that has since hit
+// its stop or target, re-analyse, commit a new signal if the gate clears, and
+// periodically re-backtest and retrain on the record it has built.
+//
+// Three things make this survive real-world conditions rather than only a tab
+// left open on a desk:
+//   * One 60s heartbeat with due-time checks, not a pile of setIntervals. A
+//     laptop that sleeps for six hours wakes up, sees every task is overdue,
+//     and runs them once — rather than firing a backlog of missed timers.
+//   * Losing the connection is expected, not exceptional. Offline is a quiet
+//     pause; repeated failures back off exponentially instead of hammering a
+//     rate-limited provider until the key is blocked.
+//   * Time with the tab closed is recovered, not lost. catchUp() replays the
+//     gap from real candle history on the next load, so signals that resolved
+//     while nobody was watching still become training data.
+// ============================================================
+
+const AUTONOMY_KEY = 'smc-autonomy-v1';
+const AUTONOMY_HEARTBEAT_MS = 60 * 1000;
+
+let autonomyHandle = null;
+let autonomyBusy = false;
+
+function autonomyConfig() {
+  const num = (id, fallback) => {
+    const el = document.getElementById(id);
+    const v = el ? parseFloat(el.value) : NaN;
+    return isFinite(v) ? v : fallback;
+  };
+  return Object.assign({}, AUTONOMY_DEFAULTS, {
+    minConfidence: num('aMinConf', AUTONOMY_DEFAULTS.minConfidence),
+    cooldownMinutes: num('aCooldown', AUTONOMY_DEFAULTS.cooldownMinutes),
+    maxOpenSignals: num('aMaxOpen', AUTONOMY_DEFAULTS.maxOpenSignals),
+    analysisIntervalMinutes: num('aInterval', AUTONOMY_DEFAULTS.analysisIntervalMinutes),
+    backtestIntervalHours: num('aBtHours', AUTONOMY_DEFAULTS.backtestIntervalHours),
+    minMetaScore: num('aMinMeta', AUTONOMY_DEFAULTS.minMetaScore),
+    // Kill switch. 0 in any field disables that arm rather than expiring
+    // everything instantly, which is what a 0 limit would otherwise mean.
+    maxHoursToFill: num('aKillFill', AUTONOMY_DEFAULTS.maxHoursToFill),
+    maxHoursOpen: num('aKillOpen', AUTONOMY_DEFAULTS.maxHoursOpen),
+    maxDriftRToFill: num('aKillDrift', AUTONOMY_DEFAULTS.maxDriftRToFill),
+    partialTP: partialTPConfig(),
+    newsState: currentNewsState(),
+    gradeFloor: (document.getElementById('aMinGrade') || {}).value || AUTONOMY_DEFAULTS.gradeFloor
+  });
+}
+
+function saveAutonomyState() {
+  try {
+    localStorage.setItem(AUTONOMY_KEY, JSON.stringify({
+      enabled: autonomy.enabled,
+      cycles: autonomy.cycles,
+      gateTally: autonomy.gateTally,
+      signalsTaken: autonomy.signalsTaken,
+      autoResolved: autonomy.autoResolved,
+      lastAnalysisAt: autonomy.lastAnalysisAt,
+      lastBacktestAt: autonomy.lastBacktestAt,
+      lastSignalAt: autonomy.lastSignalAt,
+      cfg: {
+        aMinConf: document.getElementById('aMinConf').value,
+        aCooldown: document.getElementById('aCooldown').value,
+        aKillFill: document.getElementById('aKillFill').value,
+        aKillOpen: document.getElementById('aKillOpen').value,
+        aKillDrift: document.getElementById('aKillDrift').value,
+        aMaxOpen: document.getElementById('aMaxOpen').value,
+        aInterval: document.getElementById('aInterval').value,
+        aBtHours: document.getElementById('aBtHours').value,
+        aMinMeta: document.getElementById('aMinMeta').value,
+        aDailyCap: document.getElementById('aDailyCap').value,
+        aMinGrade: document.getElementById('aMinGrade').value
+      }
+    }));
+  } catch (e) { /* storage unavailable — autonomy still works, it just won't remember across reloads */ }
+}
+
+function loadAutonomyState() {
+  try {
+    const raw = localStorage.getItem(AUTONOMY_KEY);
+    if (!raw) return;
+    const saved = JSON.parse(raw);
+    Object.assign(autonomy, {
+      enabled: !!saved.enabled,
+      cycles: saved.cycles || 0,
+      gateTally: saved.gateTally || {},
+      signalsTaken: saved.signalsTaken || 0,
+      autoResolved: saved.autoResolved || 0,
+      lastAnalysisAt: saved.lastAnalysisAt || null,
+      lastBacktestAt: saved.lastBacktestAt || null,
+      lastSignalAt: saved.lastSignalAt || null
+    });
+    if (saved.cfg) {
+      Object.keys(saved.cfg).forEach(id => {
+        const el = document.getElementById(id);
+        if (el && saved.cfg[id] != null) el.value = saved.cfg[id];
+      });
+    }
+    document.getElementById('autonomyEnabled').checked = autonomy.enabled;
+  } catch (e) { /* nothing saved yet */ }
+}
+
+function setAutonomyStatus(text, tone, reason) {
+  const dot = document.getElementById('autonomyDot');
+  const status = document.getElementById('autonomyStatus');
+  const reasonEl = document.getElementById('autonomyReason');
+  if (!status) return;
+  status.textContent = text;
+  const colours = { live: '#3ecf8e', warn: '#ffa726', error: '#ef4d5f', idle: '#454a56' };
+  const c = colours[tone] || colours.idle;
+  dot.style.background = c;
+  dot.style.boxShadow = tone === 'live' ? '0 0 7px ' + c : 'none';
+  status.style.color = tone === 'idle' ? '#9298a5' : c;
+  if (reason !== undefined) reasonEl.textContent = reason || '';
+}
+
+function renderAutonomyStats() {
+  const live = signalLog.filter(s => s.status === 'pending' || s.status === 'open');
+  document.getElementById('aCycles').textContent = autonomy.cycles;
+  document.getElementById('aSignals').textContent = autonomy.signalsTaken;
+  document.getElementById('aResolved').textContent = autonomy.autoResolved;
+  document.getElementById('aOpen').textContent = live.length;
+
+  const killedEl = document.getElementById('aKilled');
+  if (killedEl) killedEl.textContent = signalLog.filter(s => s.status === 'expired').length;
+
+  // How long the oldest live trade has been sitting. This is the number that
+  // was invisible before: an order resting for a day looked identical to one
+  // placed a minute ago.
+  const oldestEl = document.getElementById('aOldest');
+  if (oldestEl) {
+    const cfg = autonomyConfig();
+    // Each trade is aged against the limit that actually applies to it: a
+    // resting order against the fill limit, a filled one against the hold
+    // limit. Using the larger of the two would leave an order 2.5x past its own
+    // deadline showing no warning at all.
+    const ages = live.map(s => {
+      const filled = s.status === 'open';
+      const t = Date.parse(filled ? (s.filledAt || s.time) : s.time);
+      if (!isFinite(t)) return null;
+      const hours = (Date.now() - t) / 3600000;
+      const limit = filled ? cfg.maxHoursOpen : cfg.maxHoursToFill;
+      return { hours, ratio: limit > 0 ? hours / limit : 0 };
+    }).filter(v => v != null);
+    if (!ages.length) {
+      oldestEl.textContent = '—';
+      oldestEl.style.color = '';
+    } else {
+      const worst = ages.reduce((a, b) => b.hours > a.hours ? b : a, ages[0]);
+      const closest = ages.reduce((a, b) => b.ratio > a.ratio ? b : a, ages[0]);
+      oldestEl.textContent = worst.hours < 1 ? Math.round(worst.hours * 60) + 'm' : worst.hours.toFixed(1) + 'h';
+      // Amber as a trade approaches its own kill limit, red once past it, so
+      // one about to be culled is visible before it disappears.
+      oldestEl.style.color = closest.ratio >= 1 ? '#ef4d5f' : closest.ratio >= 0.75 ? '#ffa726' : '';
+    }
+  }
+
+  const el = document.getElementById('gateTally');
+  if (!el) return;
+  const entries = Object.keys(autonomy.gateTally || {})
+    .map(k => ({ code: k, n: autonomy.gateTally[k] }))
+    .sort((a, b) => b.n - a.n);
+  if (!entries.length) { el.innerHTML = ''; return; }
+  el.innerHTML = '<div style="font-size:10px;color:#454a56;margin:8px 0 4px;">Why cycles ended this way</div>'
+    + entries.map(e => '<div class="zone-item" style="padding:3px 0;"><span style="font-size:11px;">'
+        + (GATE_LABELS[e.code] || e.code) + '</span><span class="mono" style="font-size:11px;color:'
+        + (e.code === 'taken' ? '#3ecf8e' : '#5c6270') + ';">' + e.n + '</span></div>').join('');
+}
+
+// Grade every unresolved signal against `candles`. Used both by the heartbeat
+// (fresh candles each cycle) and by catchUp() (deep history after downtime).
+// Returns how many signals reached a win/loss verdict.
+function resolveOpenSignals(candles, cfg) {
+  if (!candles || candles.length < 2) return 0;
+  let resolved = 0, killed = 0, changed = false;
+
+  // The auditor decides which live trades are past saving, not the engine.
+  // Letting the engine judge whether its own trade has gone bad is the thing
+  // the auditor exists to avoid — and it re-derives fill state from raw candles
+  // rather than trusting the signal's own status, so a "pending" order price
+  // actually traded through is caught rather than aged as if it never filled.
+  const tradeAudit = auditOpenTrades(signalLog, candles, {
+    maxHoursToFill: cfg.maxHoursToFill,
+    maxHoursOpen: cfg.maxHoursOpen,
+    maxDriftRToFill: cfg.maxDriftRToFill
+  });
+  lastTradeAudit = tradeAudit;
+  const killedBy = new Map(tradeAudit.kills.map(k => [k.id, k]));
+
+  signalLog.forEach(sig => {
+    if (sig.status !== 'pending' && sig.status !== 'open') return;
+    // An auditor kill outranks whatever the resolver would have said, EXCEPT
+    // when price has already settled the trade: a stop or target that has
+    // genuinely been hit is a real outcome and real evidence, and discarding it
+    // to enforce a time limit would throw away the data the limit exists to
+    // protect.
+    const verdict = resolveSignal(sig, candles, cfg);
+    const kill = killedBy.get(sig.id);
+    if (kill && verdict.status !== 'won' && verdict.status !== 'lost') {
+      sig.status = 'expired';
+      sig.expiryReason = 'auditor: ' + kill.reason;
+      sig.killSwitch = kill.code;
+      sig.resolvedAt = new Date().toISOString();
+      sig.resolvedBy = 'auditor';
+      paperCloseForSignal(sig.id, 'expired');
+      killed++; changed = true;
+      return;
+    }
+    if (verdict.status === 'won' || verdict.status === 'lost') {
+      if (applySignalOutcome(sig, verdict.status === 'won', {
+        auto: true, exitPrice: verdict.exitPrice, ambiguousBar: verdict.ambiguousBar, partial: verdict.partial
+      })) { resolved++; changed = true; }
+    } else if (verdict.status === 'expired') {
+      sig.status = 'expired';
+      sig.expiryReason = verdict.reason || null;
+      sig.killSwitch = verdict.killSwitch || null;
+      sig.resolvedAt = new Date().toISOString();
+      sig.resolvedBy = 'auto';
+      paperCloseForSignal(sig.id, 'expired');
+      if (verdict.killSwitch) killed++;
+      changed = true; // expired signals never become training data — no outcome to learn from
+    } else if (verdict.status === 'open' && sig.status === 'pending') {
+      sig.status = 'open'; // limit entry got tagged; it's a live position now
+      sig.filledAt = new Date().toISOString();
+      paperFillForSignal(sig.id, sig.filledAt);
+      changed = true;
+    }
+  });
+  if (changed) { saveSignalLog(); renderSignalLog(); }
+  if (resolved) autonomy.autoResolved += resolved;
+  if (killed) autonomy.killed = (autonomy.killed || 0) + killed;
+  resolveShadowSignals(candles, cfg);
+  return resolved;
+}
+
+// Shadows get the same treatment, minus the learning updates — a setup the
+// engine declined should inform the audit, not train the weights as though it
+// had been traded.
+function resolveShadowSignals(candles, cfg) {
+  if (!candles || candles.length < 2 || !shadowLog.length) return;
+  let changed = false;
+  shadowLog.forEach(sig => {
+    if (sig.status !== 'pending' && sig.status !== 'open') return;
+    const verdict = resolveSignal(sig, candles, cfg);
+    if (verdict.status === 'won' || verdict.status === 'lost') {
+      sig.status = verdict.status;
+      sig.resolvedAt = new Date().toISOString();
+      changed = true;
+    } else if (verdict.status === 'expired') {
+      sig.status = 'expired'; sig.expiryReason = verdict.reason || null; changed = true;
+    } else if (verdict.status === 'open' && sig.status === 'pending') {
+      sig.status = 'open'; changed = true;
+    }
+  });
+  if (changed) { saveShadowLog(); renderAnalysisQuality(); }
+}
+
+// One unattended pass. Everything that can fail is inside the caller's try.
+async function autonomyCycle() {
+  const cfg = autonomyConfig();
+  const now = Date.now();
+
+  // 0. Calendar first. It gates whether a signal may be taken at all, so it has
+  // to be current BEFORE the gate reads it — refreshing at the end of the cycle
+  // meant the first pass after a reconnect ran against an empty calendar and
+  // could take a position straight into a release window.
+  await refreshCalendar(false);
+
+  // 1. Fresh candles. resyncCandles() already refreshes liveData from the provider.
+  await resyncCandles();
+
+  // 2. Grade what the market has already decided since the last pass.
+  const graded = resolveOpenSignals(liveData, cfg);
+
+  // 3. Re-analyse on the new data.
+  refreshAll();
+  autonomy.lastAnalysisAt = now;
+
+  // 4. Commit a signal only if the gate clears.
+  let reason;
+  if (lastComposite) {
+    const plan = buildTradePlan(lastComposite, getTargetRR());
+    // The auditor is advisory everywhere except here. A critical finding means
+    // the analysis contradicts itself or the data it was built on — that is not
+    // a risk preference, and no confidence score should be able to override it.
+    const audit = runAudit();
+    renderAudit();
+    let gate;
+    if (audit && audit.blocking) {
+      gate = { take: false, code: 'audit',
+        reason: 'independent audit found ' + audit.critical + ' critical issue(s): ' + audit.findings[0].title };
+    } else {
+      gate = autonomyGate(lastComposite, plan, signalLog, autonomy.lastSignalAt, cfg);
+    }
+    // Tally why each cycle ended as it did. One latest-reason line cannot show
+    // whether 13 quiet cycles mean "no setup existed" or "the filter blocked
+    // every one" — and those need opposite responses.
+    const code = gate.code || 'unknown';
+    autonomy.gateTally[code] = (autonomy.gateTally[code] || 0) + 1;
+    if (gate.take) {
+      updateSignalUI(lastComposite, plan, true, 'auto'); // logIt = true -> addSignalToLog
+      autonomy.signalsTaken++;
+      autonomy.lastSignalAt = now;
+      reason = 'Took a ' + lastComposite.direction + ' at $' + fmt(plan.entry) +
+               ' (' + lastComposite.confidence + '% confidence' + (gate.grade ? ', grade ' + gate.grade : '') + ').';
+    } else {
+      updateSignalUI(lastComposite, plan, false); // keep the panel current without logging
+      // Track what was passed on, so the filter can be audited later rather
+      // than trusted forever.
+      addShadowSignal(lastComposite, plan, gate.reason);
+      reason = 'No signal taken — ' + gate.reason + '.';
+    }
+  } else {
+    reason = 'Analysis produced no result this cycle.';
+  }
+  if (graded) reason = 'Self-graded ' + graded + ' signal' + (graded === 1 ? '' : 's') + '. ' + reason;
+  autonomy.lastReason = reason;
+
+  // 5. Periodic re-backtest / retrain on the accumulated record.
+  const btDue = !autonomy.lastBacktestAt || (now - autonomy.lastBacktestAt) >= cfg.backtestIntervalHours * 3600 * 1000;
+  if (btDue) {
+    autonomy.lastBacktestAt = now;
+    await runBacktestCycle(true);
+  }
+
+  renderAnalysisQuality();
+  renderDataInventory();
+  renderCalendar();
+  renderReasoning();
+  runAudit();
+  renderAudit();
+  autonomy.cycles++;
+  autonomy.consecutiveErrors = 0;
+  autonomy.lastError = null;
+  saveAutonomyState();
+  renderAutonomyStats();
+  if (candlesStaleForBudget) {
+    setAutonomyStatus('Running on cached candles — daily API budget spent, resumes 00:00 UTC.', 'warn',
+      'Still grading open signals and re-analysing, but on the last candles fetched rather than fresh ones. ' + reason);
+  } else {
+    setAutonomyStatus('Running autonomously — last pass ' + new Date(now).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) + '.', 'live', reason);
+  }
+}
+
+// The heartbeat: decides whether a cycle is due, and handles every reason it
+// might not be. Deliberately does no analysis itself.
+async function autonomyHeartbeat() {
+  if (!autonomy.enabled || autonomyBusy) return;
+
+  if (!navigator.onLine) {
+    setAutonomyStatus('Paused — no internet connection. Resumes automatically.', 'warn',
+      'Nothing is lost while offline; the gap gets replayed from candle history once the connection is back.');
+    return;
+  }
+  if (dataMode !== 'live') {
+    setAutonomyStatus('Waiting for a live data provider — connect an API key above.', 'warn',
+      'Autonomous mode needs real candles; it will not run on the simulated feed.');
+    return;
+  }
+  // Gold is shut from Friday ~21:00 UTC to Sunday ~22:00 UTC. Analysing a frozen
+  // feed produces confident-looking signals off Friday's last bar, and every one
+  // of them enters the learning record as a real read of a market that was not
+  // trading. Nothing to analyse, so nothing runs.
+  if (!isMarketOpen(Date.now())) {
+    const clock = marketClock(Date.now());
+    const h = clock.hoursUntilOpen;
+    setAutonomyStatus('Market closed — resumes when gold reopens in ' +
+      (h < 1 ? Math.round(h * 60) + 'm' : h.toFixed(1) + 'h') + '.', 'warn',
+      'The feed is frozen at Friday\u2019s close. Analysing it would generate signals from a market that is not trading.');
+    return;
+  }
+  if (autonomy.skipCycles > 0) {
+    autonomy.skipCycles--;
+    setAutonomyStatus('Backing off after an error — retrying in ' + (autonomy.skipCycles + 1) + ' min.', 'warn', autonomy.lastError);
+    return;
+  }
+
+  const cfg = autonomyConfig();
+  const dueAt = (autonomy.lastAnalysisAt || 0) + cfg.analysisIntervalMinutes * 60 * 1000;
+  if (Date.now() < dueAt) {
+    const mins = Math.ceil((dueAt - Date.now()) / 60000);
+    setAutonomyStatus('Running autonomously — next pass in ' + mins + ' min.', 'live', autonomy.lastReason);
+    return;
+  }
+
+  autonomyBusy = true;
+  try {
+    await autonomyCycle();
+  } catch (e) {
+    autonomy.consecutiveErrors++;
+    autonomy.lastError = (e && e.message) || String(e);
+    // Exponential backoff, capped at ~30 min. A rate-limited or expired key
+    // should not turn into a request every minute for the rest of the day.
+    autonomy.skipCycles = Math.min(Math.pow(2, autonomy.consecutiveErrors), 30);
+    setAutonomyStatus('Cycle failed (' + autonomy.consecutiveErrors + ' in a row) — backing off ' + autonomy.skipCycles + ' min.', 'error', autonomy.lastError);
+    saveAutonomyState();
+  } finally {
+    autonomyBusy = false;
+  }
+}
+
+// Replay the time the app was closed or disconnected. Pulls the deepest history
+// the provider allows and grades every still-open signal against it, so a signal
+// that hit its target overnight is training data by the time the user looks.
+async function autonomyCatchUp() {
+  if (dataMode !== 'live' || !navigator.onLine) return;
+  const stillOpen = signalLog.filter(s => s.status === 'pending' || s.status === 'open');
+  if (!stillOpen.length) return;
+  setAutonomyStatus('Catching up — replaying ' + stillOpen.length + ' unresolved signal(s) against real history…', 'warn', '');
+  try {
+    const history = await PROVIDERS[activeProvider].timeSeries(apiKey, LIVE_INTERVAL, 5000);
+    const n = resolveOpenSignals(history, autonomyConfig());
+    renderAutonomyStats();
+    saveAutonomyState();
+    setAutonomyStatus('Catch-up complete.', autonomy.enabled ? 'live' : 'idle',
+      n ? 'Graded ' + n + ' signal(s) that resolved while the app was closed.'
+        : 'No signals had resolved while the app was closed.');
+  } catch (e) {
+    // Not fatal — the regular heartbeat will keep trying against live candles.
+    setAutonomyStatus('Catch-up could not fetch history — continuing on live candles.', 'warn', (e && e.message) || String(e));
+  }
+}
+
+function startAutonomy() {
+  if (autonomyHandle) clearInterval(autonomyHandle);
+  autonomyHandle = setInterval(autonomyHeartbeat, AUTONOMY_HEARTBEAT_MS);
+  autonomy.skipCycles = 0;
+  autonomy.consecutiveErrors = 0;
+  setAutonomyStatus('Autonomous mode on — first pass starting…', 'live', '');
+  autonomy.lastAnalysisAt = null; // force an immediate first pass
+  autonomyHeartbeat();
+}
+
+function stopAutonomy() {
+  if (autonomyHandle) { clearInterval(autonomyHandle); autonomyHandle = null; }
+  setAutonomyStatus('Off — check the box above to start.', 'idle', '');
+}
+
+document.getElementById('autonomyEnabled').addEventListener('change', function () {
+  autonomy.enabled = this.checked;
+  saveAutonomyState();
+  if (autonomy.enabled) startAutonomy(); else stopAutonomy();
+});
+providerSelect.addEventListener('change', renderQuota);
+const umm = document.getElementById('useMacroModel');
+if (umm) umm.addEventListener('change', () => { renderKnowledge(); renderReasoning(); });
+
+// A posture for building up a record rather than protecting capital. The engine
+// learns from resolved trades, and at the default B floor a ranging market
+// simply never qualifies — so a cautious setup collects nothing and the
+// knowledge base never starts.
+document.getElementById('aPresetCollect').addEventListener('click', () => {
+  // D, not C: even a perfect five-timeframe alignment only scores ~49%, so a C
+  // floor (>=30%) still rejects ordinary conditions and collects almost nothing.
+  document.getElementById('aMinGrade').value = 'D';
+  document.getElementById('aMinConf').value = 15;
+  document.getElementById('aCooldown').value = 30;
+  document.getElementById('aMaxOpen').value = 5;
+  document.getElementById('aMinMeta').value = -0.5;
+  saveAutonomyState();
+  autonomy.lastAnalysisAt = null; // re-evaluate immediately under the new thresholds
+  setAutonomyStatus('Data-collection thresholds applied — re-evaluating now.', 'live', '');
+  autonomyHeartbeat();
+});
+document.getElementById('autonomyAdvancedToggle').addEventListener('click', () => {
+  document.getElementById('autonomyAdvanced').classList.toggle('hidden');
+});
+['aMinConf', 'aCooldown', 'aMaxOpen', 'aInterval', 'aBtHours', 'aMinMeta', 'aDailyCap', 'aMinGrade',
+ 'aKillFill', 'aKillOpen', 'aKillDrift'].forEach(id => {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener('change', () => { saveAutonomyState(); renderQuota(); });
+});
+
+// React to connectivity changes straight away rather than waiting out a heartbeat.
+window.addEventListener('online', () => {
+  if (!autonomy.enabled) return;
+  autonomy.skipCycles = 0;
+  autonomy.consecutiveErrors = 0;
+  setAutonomyStatus('Back online — catching up…', 'warn', '');
+  autonomyCatchUp().then(autonomyHeartbeat);
+});
+window.addEventListener('offline', () => {
+  if (autonomy.enabled) setAutonomyStatus('Paused — no internet connection. Resumes automatically.', 'warn', '');
+});
+// Coming back to a backgrounded tab is a good moment to check for missed work:
+// mobile browsers in particular throttle timers hard once a tab is hidden.
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && autonomy.enabled) autonomyHeartbeat();
+});
+
+// ============================================================
+// BOOTSTRAP
+// ------------------------------------------------------------
+// Ordering matters here, which is why it is one explicit sequence rather than
+// scattered top-level calls: persisted learning state has to be restored (and
+// its weights applied) before the first analysis, and every DOM const further
+// up this file has to exist before anything reads it.
+// ============================================================
+// ============================================================
+// SETTINGS THAT SURVIVE A RELOAD
+// ------------------------------------------------------------
+// Only the paper account's balance and the autonomy thresholds were ever
+// persisted. Everything else a person could change — risk per trade, spread,
+// slippage, max concurrent, the partial-take-profit rules, all fourteen factor
+// weights, the target R:R, every backtest parameter, the news-window settings —
+// was read straight off the DOM and lost the moment the page reloaded. Tuning
+// the system was therefore something you had to redo from memory each session,
+// and an autonomous run would quietly revert to defaults after any refresh.
+//
+// One store, one list, restored before the first analysis so the weights are in
+// force when it runs. Ids that already have an owner are deliberately absent —
+// autonomy keeps its own (AUTONOMY_KEY), the paper on/off switches live with the
+// account, and the API keys are opt-in through "remember keys" rather than
+// swept up here.
+const SETTINGS_KEY = 'smc-settings-v1';
+const SETTINGS_IDS = [
+  // paper account
+  'pStartBalance', 'pRiskPct', 'pSpread', 'pSlippage', 'pMaxPos',
+  'pSizingMode', 'pFixedLots', 'pContractSize', 'pLotStep', 'pMinLots',
+  'pPartialPct', 'pHoldMeta', 'pPartialEnabled',
+  // factor weights
+  'wWeekly', 'wDaily', 'wHtf', 'wMtf', 'wLtf', 'wOb', 'wFvg', 'wLiq',
+  'wPd', 'wPriceAction', 'wClassic', 'wCorrelation', 'wFundamental', 'wNews',
+  // signal + backtest
+  'targetRR', 'pBars', 'pCapital', 'pRisk', 'pCostPips', 'pMinConf', 'pTargetRR',
+  // news window and macro model
+  'newsBeforeMin', 'newsAfterMin', 'newsBlockEnabled', 'newsBlockMedium',
+  'newsFlattenEnabled', 'newsFlattenMin', 'newsAlertMin', 'useMacroModel',
+  'weekendFlattenEnabled', 'weekendFlattenMin'
+];
+
+function saveSettings() {
+  const out = {};
+  SETTINGS_IDS.forEach(id => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    out[id] = el.type === 'checkbox' ? !!el.checked : el.value;
+  });
+  try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(out)); }
+  catch (e) { return false; }
+  return true;
+}
+
+function loadSettings() {
+  let saved;
+  try { saved = JSON.parse(localStorage.getItem(SETTINGS_KEY) || 'null'); }
+  catch (e) { return; }
+  if (!saved || typeof saved !== 'object') return;
+  SETTINGS_IDS.forEach(id => {
+    if (!(id in saved)) return;
+    const el = document.getElementById(id);
+    if (!el) return;
+    if (el.type === 'checkbox') el.checked = !!saved[id];
+    else if (saved[id] != null) el.value = saved[id];
+  });
+  // Sliders carry a printed value beside them that does not follow a
+  // programmatic change, so a restored weight would show the old number.
+  syncSliderLabels();
+}
+
+function syncSliderLabels() {
+  weightIds.forEach(id => {
+    const el = document.getElementById(id), out = document.getElementById(id + 'V');
+    if (el && out) out.textContent = el.value;
+  });
+  const rr = document.getElementById('targetRR'), rrOut = document.getElementById('targetRRV');
+  if (rr && rrOut) rrOut.textContent = '1:' + rr.value;
+}
+
+let settingsSaveTimer = null;
+function flagSettingsSaved() {
+  const el = document.getElementById('settingsSavedNote');
+  if (!el) return;
+  el.textContent = 'Settings saved.';
+  el.style.color = '#3ecf8e';
+  clearTimeout(settingsSaveTimer);
+  settingsSaveTimer = setTimeout(() => { el.textContent = ''; }, 2500);
+}
+
+function wireSettingsPersistence() {
+  SETTINGS_IDS.forEach(id => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    const handler = () => { if (saveSettings()) flagSettingsSaved(); };
+    el.addEventListener('change', handler);
+    // Sliders and number spinners fire `input` continuously; `change` alone
+    // would miss a drag that never blurs.
+    if (el.type === 'range' || el.type === 'number') el.addEventListener('input', handler);
+  });
+}
+
+// ============================================================
+// IS THIS TAB STILL RUNNING THE CURRENT CODE?
+// ------------------------------------------------------------
+// This app is built to be left open for days doing unattended analysis, which
+// means a tab can go on running the modules it loaded at open time long after a
+// fix has shipped. That is not hypothetical: the macro engine ran on 1976-2006
+// FRED data, the fix deployed, and an open tab would have carried on producing
+// confident, wrong numbers with nothing on screen to say so.
+//
+// The check compares the ETag of app.js now against the one seen at startup, so
+// it needs no version constant to keep in sync and no build step. `no-store`
+// forces the request past the browser cache; the server already sends
+// must-revalidate, so this is cheap.
+const UPDATE_CHECK_MS = 30 * 60 * 1000;
+let loadedBuildTag = null;
+let updateWatchHandle = null;
+
+async function currentBuildTag() {
+  try {
+    const r = await fetch('app.js', { method: 'HEAD', cache: 'no-store' });
+    return r.headers.get('etag') || r.headers.get('last-modified') || null;
+  } catch (e) {
+    return null; // offline, or the check is blocked — try again next time
+  }
+}
+
+async function checkForNewBuild() {
+  const tag = await currentBuildTag();
+  if (!tag) return;
+  if (loadedBuildTag == null) { loadedBuildTag = tag; return; }
+  if (tag === loadedBuildTag) return;
+  const banner = document.getElementById('updateBanner');
+  if (banner) banner.classList.remove('hidden');
+}
+
+function startUpdateWatch() {
+  const reload = document.getElementById('updateReload');
+  if (reload) reload.addEventListener('click', () => window.location.reload());
+  checkForNewBuild();
+  if (updateWatchHandle) clearInterval(updateWatchHandle);
+  updateWatchHandle = setInterval(checkForNewBuild, UPDATE_CHECK_MS);
+}
+
+async function bootstrap() {
+  // Before anything reads a control: the weights, risk settings and thresholds
+  // have to be the saved ones by the time the first analysis runs.
+  loadSettings();
+  wireSettingsPersistence();
+  await loadLearningState();
+  await loadSignalLog();
+  await loadShadowLog();
+  applyKnowledgeBaseWeights();
+  await loadPaper();
+  await loadKnowledge();
+  await loadCalendarCache();
+  loadAutonomyState();
+  loadQuota();
+  // Every store the merge touches is loaded by this point — the log it merges
+  // into, the paper account it books positions in, the learning state it
+  // updates. Replay anything the worker sent while that was still loading.
+  flushPendingIngest();
+  renderSignalLog();   // first render happened before the paper account loaded
+  startLivenessTicker();
+  startUpdateWatch();
+  startNewsWatch();
+  renderQuota();
+  renderAutonomyStats();
+  renderAnalysisQuality();
+  renderPaper();
+  renderDataInventory();
+  renderCalendar();
+  renderReasoning();
+  renderKnowledge();
+  runAudit();
+  renderAudit();
+  refreshWorkerTotals().then(renderDataInventory);
+  refreshAll();
+
+  const saved = await loadSavedKeys();
+  if (!saved) {
+    document.getElementById('autoBacktestStatus').textContent = 'Connect a data provider to enable auto-backtesting.';
+  } else {
+    document.getElementById('rememberKeysCheckbox').checked = true;
+    if (saved.provider) providerSelect.value = saved.provider;
+    if (saved.fredKey) document.getElementById('fredKeyInput').value = saved.fredKey;
+    if (saved.newsKey) document.getElementById('newsKeyInput').value = saved.newsKey;
+    if (typeof saved.autoBacktest === 'boolean') document.getElementById('autoBacktestCheckbox').checked = saved.autoBacktest;
+    if (saved.apiKey) {
+      document.getElementById('apiKeyInput').value = saved.apiKey;
+      connStatus.textContent = 'Restoring saved connection...';
+      await connectProvider(); // also re-fetches correlation/fundamentals/news with the restored keys
+    } else if (saved.fredKey || saved.newsKey) {
+      // No price provider was connected, but FRED/news keys were saved independently — restore those engines too.
+      await refreshCorrelation(activeProvider, apiKey, saved.fredKey || '');
+      await refreshFundamentals(saved.fredKey || '');
+      await refreshNewsSentiment(saved.newsKey || '');
+      refreshAll();
+      document.getElementById('autoBacktestStatus').textContent = 'Connect a data provider to enable auto-backtesting.';
+    } else {
+      document.getElementById('autoBacktestStatus').textContent = 'Connect a data provider to enable auto-backtesting.';
+    }
+  }
+
+  // The calendar gates trading, so it must be loaded before autonomy's first pass.
+  await refreshCalendar(false);
+  renderCalendar();
+  renderReasoning();
+
+  // Recover anything that resolved while the app was closed, then pick the loop back up.
+  if (autonomy.enabled) {
+    await autonomyCatchUp();
+    startAutonomy();
+  } else {
+    setAutonomyStatus('Off — check the box above to start.', 'idle', '');
+  }
+}
+bootstrap();
+ + fmt(p.tp)
+        + '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:5px;">'
+        + '<button class="btn" data-paper-action="edit-sl" data-paper-id="' + p.id + '" style="padding:3px 7px;font-size:10px;">Edit SL</button>'
+        + '<button class="btn" data-paper-action="close" data-paper-id="' + p.id + '" style="padding:3px 7px;font-size:10px;border-color:#ef4d5f;color:#ef4d5f;">Close at market</button>'
+        + '</div></span><span class="mono ' + pnlCls(u) + '">' + money(u) + '</span></div>';
+    }).join('');
+  }
+
+  const closed = paper.positions.filter(p => p.status === 'closed' && inEra(p)).slice(0, 8);
+  if (closed.length) {
+    html += '<div style="font-size:10px;color:#454a56;margin:10px 0 6px;">Recent closed</div>';
+    html += closed.map(p =>
+      '<div class="zone-item"><span><span class="dirtag ' + p.dir + '">' + p.dir + '</span> ' + (p.outcome === 'won' ? (p.partial ? '◐' : '✓') : p.outcome === 'lost' ? '✗' : '–')
+      + ' <span style="color:#454a56;">' + lotLabel(p) + ' · exit $' + fmt(p.exitPrice) + '</span></span>'
+      + '<span class="mono ' + pnlCls(p.pnl) + '">' + money(p.pnl) + (p.rMultiple != null ? ' <span style="color:#454a56;">' + (p.rMultiple >= 0 ? '+' : '') + fmt(p.rMultiple) + 'R</span>' : '') + '</span></div>'
+    ).join('');
+  }
+
+  if (!resting.length && !open.length && !closed.length) {
+    html += '<div class="zone-empty">' + (a.archivedCount
+      ? 'Account reset — no trades in this era yet. The record above is intact.'
+      : 'No paper trades yet. Positions open automatically as the engine logs signals.') + '</div>';
+  }
+  root.innerHTML = html;
+}
+
+function renderPaperStatusNote() {
+  const note = document.getElementById('paperStatus');
+  if (!note) return;
+  if (!paper.enabled) { note.textContent = 'Off — no positions will be opened.'; return; }
+  note.textContent = paper.manual
+    ? 'On — new signals will open simulated positions. No real orders are placed.'
+    : 'On for the engine\'s own signals. Signals you generate by hand are excluded (signal panel).';
+}
+
+document.getElementById('paperEnabled').addEventListener('change', function () {
+  paper.enabled = this.checked;
+  savePaper();
+  renderPaper();
+  renderPaperStatusNote();
+  renderPaperManualHint();
+});
+
+const paperManualCb = document.getElementById('paperManual');
+if (paperManualCb) paperManualCb.addEventListener('change', function () {
+  paper.manual = this.checked;
+  // Ticking it with the account off is a request to paper-trade, so honour it
+  // rather than silently doing nothing.
+  if (paper.manual && !paper.enabled) {
+    paper.enabled = true;
+    const master = document.getElementById('paperEnabled');
+    if (master) master.checked = true;
+  }
+  savePaper();
+  renderPaper();
+  renderPaperStatusNote();
+  renderPaperManualHint();
+});
+document.getElementById('paperAdvancedToggle').addEventListener('click', () => {
+  document.getElementById('paperAdvanced').classList.toggle('hidden');
+});
+['pStartBalance', 'pRiskPct', 'pSpread', 'pSlippage', 'pMaxPos', 'pPartialPct', 'pHoldMeta', 'pPartialEnabled'].forEach(id => {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener('change', () => { paper.startingBalance = paperConfig().startingBalance; savePaper(); renderPaper(); });
+});
+document.getElementById('paperReset').addEventListener('click', async () => {
+  const price = currentMarkPrice();
+  const live = paper.positions.filter(p => p.status === 'open' || p.status === 'pending').length;
+  const keeping = paper.positions.filter(p => p.status === 'closed').length;
+  const msg = 'Reset the paper account back to $' + fmt(paperConfig().startingBalance) + '?\n\n'
+    + (live ? live + ' live position(s) will be closed at the current price first.\n' : '')
+    + keeping + ' completed trade(s) stay on record — they are what the system learns from, '
+    + 'and they keep counting towards the lifetime win rate. They just stop counting towards the balance.';
+  if (!window.confirm(msg)) return;
+  const out = resetPaperAccount(paper.positions, isFinite(price) ? price : undefined, Date.now());
+  paper.positions = out.positions;
+  paper.epoch = out.epoch;
+  await savePaper();
+  renderPaper();
+  renderDataInventory();
+});
+
+// ============================================================
+// ANALYSIS QUALITY PANEL
+// ------------------------------------------------------------
+// Renders the three self-audits. Every number here is deliberately allowed to
+// say "not enough data yet" rather than show a confident-looking figure built
+// on four trades — a reassuring number from a tiny sample is worse than no
+// number, because it gets believed.
+// ============================================================
+function fmtR(v) { return v == null ? '—' : (v >= 0 ? '+' : '') + v.toFixed(2) + 'R'; }
+function fmtPct(v) { return v == null ? '—' : (v * 100).toFixed(0) + '%'; }
+function rClass(v) { return v == null ? 'fneu' : v > 0.05 ? 'fpos' : v < -0.05 ? 'fneg' : 'fneu'; }
+
+function renderAnalysisQuality() {
+  const root = document.getElementById('qualityContent');
+  if (!root) return;
+
+  const cal = computeCalibration(signalLog);
+  const bd = computeConditionBreakdown(signalLog);
+  const audit = computeGateAudit(signalLog, shadowLog);
+
+  const rows = (list, label) => {
+    const usable = list.filter(r => r.n >= 3);
+    if (!usable.length) return '<div class="zone-empty">' + label + ': not enough resolved trades yet (need 3+ per group).</div>';
+    return usable.map(r =>
+      '<div class="zone-item"><span>' + r.key + ' <span style="color:#454a56;">(' + r.n + ')</span></span>' +
+      '<span class="mono ' + rClass(r.expectancyR) + '">' + fmtR(r.expectancyR) + ' · ' + fmtPct(r.winRate) + '</span></div>'
+    ).join('');
+  };
+
+  const o = bd.overall;
+  let html = '';
+
+  html += '<div class="data-source-note" style="margin-bottom:8px;">Expectancy is shown in R — average profit per unit risked. At a 1:4 target a 30% win rate is already profitable, so win rate alone is a poor scorecard and R is the honest one.</div>';
+
+  html += '<div class="metrics" style="margin-bottom:10px;">'
+    + '<div class="card"><div class="label">Resolved</div><div class="value mono">' + o.n + '</div></div>'
+    + '<div class="card"><div class="label">Win Rate</div><div class="value mono">' + fmtPct(o.winRate) + '</div></div>'
+    + '<div class="card"><div class="label">Expectancy</div><div class="value mono ' + rClass(o.expectancyR) + '">' + fmtR(o.expectancyR) + '</div></div>'
+    + '<div class="card"><div class="label">Total</div><div class="value mono ' + rClass(o.totalR) + '">' + fmtR(o.totalR) + '</div></div>'
+    + '</div>';
+
+  // 1. Is the confidence number worth anything?
+  html += '<div class="panel-title" style="font-size:11px;margin-top:12px;">Is the confidence score meaningful?</div>';
+  html += '<div class="event-line" style="border-left-color:#e8c37a;">' + cal.verdict + '</div>';
+  if (cal.discrimination != null) {
+    html += '<div class="zone-item"><span>High-confidence half vs low-confidence half</span><span class="mono ' + rClass(cal.discrimination) + '">'
+      + (cal.discrimination >= 0 ? '+' : '') + (cal.discrimination * 100).toFixed(0) + ' pp win rate</span></div>';
+  }
+  if (cal.buckets.length) {
+    html += '<table class="factor-table"><tr><th style="text-align:left;color:#5c6270;font-weight:500;">Confidence band</th><th style="color:#5c6270;font-weight:500;">Win rate</th><th style="color:#5c6270;font-weight:500;">Expectancy</th></tr>';
+    html += cal.buckets.map(b =>
+      '<tr><td>' + b.lo + '–' + b.hi + '% <span style="color:#454a56;">(' + b.n + ')</span></td>'
+      + '<td>' + fmtPct(b.winRate) + '</td>'
+      + '<td class="' + rClass(b.expectancyR) + '">' + fmtR(b.expectancyR) + '</td></tr>').join('');
+    html += '</table>';
+  }
+
+  // 2. Where does the edge actually live?
+  html += '<div class="panel-title" style="font-size:11px;margin-top:14px;">Where the edge actually lives</div>';
+  html += '<div style="font-size:10px;color:#454a56;margin-bottom:6px;">By session</div>' + rows(bd.bySession, 'Session');
+  html += '<div style="font-size:10px;color:#454a56;margin:8px 0 6px;">By market regime</div>' + rows(bd.byRegime, 'Regime');
+  html += '<div style="font-size:10px;color:#454a56;margin:8px 0 6px;">By grade</div>' + rows(bd.byGrade, 'Grade');
+  html += '<div style="font-size:10px;color:#454a56;margin:8px 0 6px;">By direction</div>' + rows(bd.byDirection, 'Direction');
+
+  // 3. The roads not taken.
+  html += '<div class="panel-title" style="font-size:11px;margin-top:14px;">The setups it turned down</div>';
+  html += '<div class="data-source-note" style="margin-bottom:6px;">Every setup the filter rejected is tracked and resolved against real price anyway. This is the comparison a human journal can never make, because nobody records their non-trades.</div>';
+  html += '<div class="zone-item"><span>Taken</span><span class="mono ' + rClass(audit.taken.expectancyR) + '">'
+    + fmtR(audit.taken.expectancyR) + ' <span style="color:#454a56;">(' + audit.taken.n + ')</span></span></div>';
+  html += '<div class="zone-item"><span>Declined</span><span class="mono ' + rClass(audit.declined.expectancyR) + '">'
+    + fmtR(audit.declined.expectancyR) + ' <span style="color:#454a56;">(' + audit.declined.n + ')</span></span></div>';
+  const pending = shadowLog.filter(s => s.status === 'pending' || s.status === 'open').length;
+  if (pending) html += '<div class="zone-item"><span>Declined, still running</span><span class="mono">' + pending + '</span></div>';
+  html += '<div class="event-line" style="border-left-color:#c99bff;margin-top:6px;">' + audit.verdict + '</div>';
+
+  root.innerHTML = html;
+}
+document.getElementById('resetQuality').addEventListener('click', async () => {
+  shadowLog = [];
+  await saveShadowLog();
+  renderAnalysisQuality();
+});
+
+// ============================================================
+// AUTONOMOUS MODE
+// ------------------------------------------------------------
+// The unattended operator. Once the user ticks the box, a single heartbeat
+// drives everything: fetch fresh candles, grade any signal that has since hit
+// its stop or target, re-analyse, commit a new signal if the gate clears, and
+// periodically re-backtest and retrain on the record it has built.
+//
+// Three things make this survive real-world conditions rather than only a tab
+// left open on a desk:
+//   * One 60s heartbeat with due-time checks, not a pile of setIntervals. A
+//     laptop that sleeps for six hours wakes up, sees every task is overdue,
+//     and runs them once — rather than firing a backlog of missed timers.
+//   * Losing the connection is expected, not exceptional. Offline is a quiet
+//     pause; repeated failures back off exponentially instead of hammering a
+//     rate-limited provider until the key is blocked.
+//   * Time with the tab closed is recovered, not lost. catchUp() replays the
+//     gap from real candle history on the next load, so signals that resolved
+//     while nobody was watching still become training data.
+// ============================================================
+
+const AUTONOMY_KEY = 'smc-autonomy-v1';
+const AUTONOMY_HEARTBEAT_MS = 60 * 1000;
+
+let autonomyHandle = null;
+let autonomyBusy = false;
+
+function autonomyConfig() {
+  const num = (id, fallback) => {
+    const el = document.getElementById(id);
+    const v = el ? parseFloat(el.value) : NaN;
+    return isFinite(v) ? v : fallback;
+  };
+  return Object.assign({}, AUTONOMY_DEFAULTS, {
+    minConfidence: num('aMinConf', AUTONOMY_DEFAULTS.minConfidence),
+    cooldownMinutes: num('aCooldown', AUTONOMY_DEFAULTS.cooldownMinutes),
+    maxOpenSignals: num('aMaxOpen', AUTONOMY_DEFAULTS.maxOpenSignals),
+    analysisIntervalMinutes: num('aInterval', AUTONOMY_DEFAULTS.analysisIntervalMinutes),
+    backtestIntervalHours: num('aBtHours', AUTONOMY_DEFAULTS.backtestIntervalHours),
+    minMetaScore: num('aMinMeta', AUTONOMY_DEFAULTS.minMetaScore),
+    // Kill switch. 0 in any field disables that arm rather than expiring
+    // everything instantly, which is what a 0 limit would otherwise mean.
+    maxHoursToFill: num('aKillFill', AUTONOMY_DEFAULTS.maxHoursToFill),
+    maxHoursOpen: num('aKillOpen', AUTONOMY_DEFAULTS.maxHoursOpen),
+    maxDriftRToFill: num('aKillDrift', AUTONOMY_DEFAULTS.maxDriftRToFill),
+    partialTP: partialTPConfig(),
+    newsState: currentNewsState(),
+    gradeFloor: (document.getElementById('aMinGrade') || {}).value || AUTONOMY_DEFAULTS.gradeFloor
+  });
+}
+
+function saveAutonomyState() {
+  try {
+    localStorage.setItem(AUTONOMY_KEY, JSON.stringify({
+      enabled: autonomy.enabled,
+      cycles: autonomy.cycles,
+      gateTally: autonomy.gateTally,
+      signalsTaken: autonomy.signalsTaken,
+      autoResolved: autonomy.autoResolved,
+      lastAnalysisAt: autonomy.lastAnalysisAt,
+      lastBacktestAt: autonomy.lastBacktestAt,
+      lastSignalAt: autonomy.lastSignalAt,
+      cfg: {
+        aMinConf: document.getElementById('aMinConf').value,
+        aCooldown: document.getElementById('aCooldown').value,
+        aKillFill: document.getElementById('aKillFill').value,
+        aKillOpen: document.getElementById('aKillOpen').value,
+        aKillDrift: document.getElementById('aKillDrift').value,
+        aMaxOpen: document.getElementById('aMaxOpen').value,
+        aInterval: document.getElementById('aInterval').value,
+        aBtHours: document.getElementById('aBtHours').value,
+        aMinMeta: document.getElementById('aMinMeta').value,
+        aDailyCap: document.getElementById('aDailyCap').value,
+        aMinGrade: document.getElementById('aMinGrade').value
+      }
+    }));
+  } catch (e) { /* storage unavailable — autonomy still works, it just won't remember across reloads */ }
+}
+
+function loadAutonomyState() {
+  try {
+    const raw = localStorage.getItem(AUTONOMY_KEY);
+    if (!raw) return;
+    const saved = JSON.parse(raw);
+    Object.assign(autonomy, {
+      enabled: !!saved.enabled,
+      cycles: saved.cycles || 0,
+      gateTally: saved.gateTally || {},
+      signalsTaken: saved.signalsTaken || 0,
+      autoResolved: saved.autoResolved || 0,
+      lastAnalysisAt: saved.lastAnalysisAt || null,
+      lastBacktestAt: saved.lastBacktestAt || null,
+      lastSignalAt: saved.lastSignalAt || null
+    });
+    if (saved.cfg) {
+      Object.keys(saved.cfg).forEach(id => {
+        const el = document.getElementById(id);
+        if (el && saved.cfg[id] != null) el.value = saved.cfg[id];
+      });
+    }
+    document.getElementById('autonomyEnabled').checked = autonomy.enabled;
+  } catch (e) { /* nothing saved yet */ }
+}
+
+function setAutonomyStatus(text, tone, reason) {
+  const dot = document.getElementById('autonomyDot');
+  const status = document.getElementById('autonomyStatus');
+  const reasonEl = document.getElementById('autonomyReason');
+  if (!status) return;
+  status.textContent = text;
+  const colours = { live: '#3ecf8e', warn: '#ffa726', error: '#ef4d5f', idle: '#454a56' };
+  const c = colours[tone] || colours.idle;
+  dot.style.background = c;
+  dot.style.boxShadow = tone === 'live' ? '0 0 7px ' + c : 'none';
+  status.style.color = tone === 'idle' ? '#9298a5' : c;
+  if (reason !== undefined) reasonEl.textContent = reason || '';
+}
+
+function renderAutonomyStats() {
+  const live = signalLog.filter(s => s.status === 'pending' || s.status === 'open');
+  document.getElementById('aCycles').textContent = autonomy.cycles;
+  document.getElementById('aSignals').textContent = autonomy.signalsTaken;
+  document.getElementById('aResolved').textContent = autonomy.autoResolved;
+  document.getElementById('aOpen').textContent = live.length;
+
+  const killedEl = document.getElementById('aKilled');
+  if (killedEl) killedEl.textContent = signalLog.filter(s => s.status === 'expired').length;
+
+  // How long the oldest live trade has been sitting. This is the number that
+  // was invisible before: an order resting for a day looked identical to one
+  // placed a minute ago.
+  const oldestEl = document.getElementById('aOldest');
+  if (oldestEl) {
+    const cfg = autonomyConfig();
+    // Each trade is aged against the limit that actually applies to it: a
+    // resting order against the fill limit, a filled one against the hold
+    // limit. Using the larger of the two would leave an order 2.5x past its own
+    // deadline showing no warning at all.
+    const ages = live.map(s => {
+      const filled = s.status === 'open';
+      const t = Date.parse(filled ? (s.filledAt || s.time) : s.time);
+      if (!isFinite(t)) return null;
+      const hours = (Date.now() - t) / 3600000;
+      const limit = filled ? cfg.maxHoursOpen : cfg.maxHoursToFill;
+      return { hours, ratio: limit > 0 ? hours / limit : 0 };
+    }).filter(v => v != null);
+    if (!ages.length) {
+      oldestEl.textContent = '—';
+      oldestEl.style.color = '';
+    } else {
+      const worst = ages.reduce((a, b) => b.hours > a.hours ? b : a, ages[0]);
+      const closest = ages.reduce((a, b) => b.ratio > a.ratio ? b : a, ages[0]);
+      oldestEl.textContent = worst.hours < 1 ? Math.round(worst.hours * 60) + 'm' : worst.hours.toFixed(1) + 'h';
+      // Amber as a trade approaches its own kill limit, red once past it, so
+      // one about to be culled is visible before it disappears.
+      oldestEl.style.color = closest.ratio >= 1 ? '#ef4d5f' : closest.ratio >= 0.75 ? '#ffa726' : '';
+    }
+  }
+
+  const el = document.getElementById('gateTally');
+  if (!el) return;
+  const entries = Object.keys(autonomy.gateTally || {})
+    .map(k => ({ code: k, n: autonomy.gateTally[k] }))
+    .sort((a, b) => b.n - a.n);
+  if (!entries.length) { el.innerHTML = ''; return; }
+  el.innerHTML = '<div style="font-size:10px;color:#454a56;margin:8px 0 4px;">Why cycles ended this way</div>'
+    + entries.map(e => '<div class="zone-item" style="padding:3px 0;"><span style="font-size:11px;">'
+        + (GATE_LABELS[e.code] || e.code) + '</span><span class="mono" style="font-size:11px;color:'
+        + (e.code === 'taken' ? '#3ecf8e' : '#5c6270') + ';">' + e.n + '</span></div>').join('');
+}
+
+// Grade every unresolved signal against `candles`. Used both by the heartbeat
+// (fresh candles each cycle) and by catchUp() (deep history after downtime).
+// Returns how many signals reached a win/loss verdict.
+function resolveOpenSignals(candles, cfg) {
+  if (!candles || candles.length < 2) return 0;
+  let resolved = 0, killed = 0, changed = false;
+
+  // The auditor decides which live trades are past saving, not the engine.
+  // Letting the engine judge whether its own trade has gone bad is the thing
+  // the auditor exists to avoid — and it re-derives fill state from raw candles
+  // rather than trusting the signal's own status, so a "pending" order price
+  // actually traded through is caught rather than aged as if it never filled.
+  const tradeAudit = auditOpenTrades(signalLog, candles, {
+    maxHoursToFill: cfg.maxHoursToFill,
+    maxHoursOpen: cfg.maxHoursOpen,
+    maxDriftRToFill: cfg.maxDriftRToFill
+  });
+  lastTradeAudit = tradeAudit;
+  const killedBy = new Map(tradeAudit.kills.map(k => [k.id, k]));
+
+  signalLog.forEach(sig => {
+    if (sig.status !== 'pending' && sig.status !== 'open') return;
+    // An auditor kill outranks whatever the resolver would have said, EXCEPT
+    // when price has already settled the trade: a stop or target that has
+    // genuinely been hit is a real outcome and real evidence, and discarding it
+    // to enforce a time limit would throw away the data the limit exists to
+    // protect.
+    const verdict = resolveSignal(sig, candles, cfg);
+    const kill = killedBy.get(sig.id);
+    if (kill && verdict.status !== 'won' && verdict.status !== 'lost') {
+      sig.status = 'expired';
+      sig.expiryReason = 'auditor: ' + kill.reason;
+      sig.killSwitch = kill.code;
+      sig.resolvedAt = new Date().toISOString();
+      sig.resolvedBy = 'auditor';
+      paperCloseForSignal(sig.id, 'expired');
+      killed++; changed = true;
+      return;
+    }
+    if (verdict.status === 'won' || verdict.status === 'lost') {
+      if (applySignalOutcome(sig, verdict.status === 'won', {
+        auto: true, exitPrice: verdict.exitPrice, ambiguousBar: verdict.ambiguousBar, partial: verdict.partial
+      })) { resolved++; changed = true; }
+    } else if (verdict.status === 'expired') {
+      sig.status = 'expired';
+      sig.expiryReason = verdict.reason || null;
+      sig.killSwitch = verdict.killSwitch || null;
+      sig.resolvedAt = new Date().toISOString();
+      sig.resolvedBy = 'auto';
+      paperCloseForSignal(sig.id, 'expired');
+      if (verdict.killSwitch) killed++;
+      changed = true; // expired signals never become training data — no outcome to learn from
+    } else if (verdict.status === 'open' && sig.status === 'pending') {
+      sig.status = 'open'; // limit entry got tagged; it's a live position now
+      sig.filledAt = new Date().toISOString();
+      paperFillForSignal(sig.id, sig.filledAt);
+      changed = true;
+    }
+  });
+  if (changed) { saveSignalLog(); renderSignalLog(); }
+  if (resolved) autonomy.autoResolved += resolved;
+  if (killed) autonomy.killed = (autonomy.killed || 0) + killed;
+  resolveShadowSignals(candles, cfg);
+  return resolved;
+}
+
+// Shadows get the same treatment, minus the learning updates — a setup the
+// engine declined should inform the audit, not train the weights as though it
+// had been traded.
+function resolveShadowSignals(candles, cfg) {
+  if (!candles || candles.length < 2 || !shadowLog.length) return;
+  let changed = false;
+  shadowLog.forEach(sig => {
+    if (sig.status !== 'pending' && sig.status !== 'open') return;
+    const verdict = resolveSignal(sig, candles, cfg);
+    if (verdict.status === 'won' || verdict.status === 'lost') {
+      sig.status = verdict.status;
+      sig.resolvedAt = new Date().toISOString();
+      changed = true;
+    } else if (verdict.status === 'expired') {
+      sig.status = 'expired'; sig.expiryReason = verdict.reason || null; changed = true;
+    } else if (verdict.status === 'open' && sig.status === 'pending') {
+      sig.status = 'open'; changed = true;
+    }
+  });
+  if (changed) { saveShadowLog(); renderAnalysisQuality(); }
+}
+
+// One unattended pass. Everything that can fail is inside the caller's try.
+async function autonomyCycle() {
+  const cfg = autonomyConfig();
+  const now = Date.now();
+
+  // 0. Calendar first. It gates whether a signal may be taken at all, so it has
+  // to be current BEFORE the gate reads it — refreshing at the end of the cycle
+  // meant the first pass after a reconnect ran against an empty calendar and
+  // could take a position straight into a release window.
+  await refreshCalendar(false);
+
+  // 1. Fresh candles. resyncCandles() already refreshes liveData from the provider.
+  await resyncCandles();
+
+  // 2. Grade what the market has already decided since the last pass.
+  const graded = resolveOpenSignals(liveData, cfg);
+
+  // 3. Re-analyse on the new data.
+  refreshAll();
+  autonomy.lastAnalysisAt = now;
+
+  // 4. Commit a signal only if the gate clears.
+  let reason;
+  if (lastComposite) {
+    const plan = buildTradePlan(lastComposite, getTargetRR());
+    // The auditor is advisory everywhere except here. A critical finding means
+    // the analysis contradicts itself or the data it was built on — that is not
+    // a risk preference, and no confidence score should be able to override it.
+    const audit = runAudit();
+    renderAudit();
+    let gate;
+    if (audit && audit.blocking) {
+      gate = { take: false, code: 'audit',
+        reason: 'independent audit found ' + audit.critical + ' critical issue(s): ' + audit.findings[0].title };
+    } else {
+      gate = autonomyGate(lastComposite, plan, signalLog, autonomy.lastSignalAt, cfg);
+    }
+    // Tally why each cycle ended as it did. One latest-reason line cannot show
+    // whether 13 quiet cycles mean "no setup existed" or "the filter blocked
+    // every one" — and those need opposite responses.
+    const code = gate.code || 'unknown';
+    autonomy.gateTally[code] = (autonomy.gateTally[code] || 0) + 1;
+    if (gate.take) {
+      updateSignalUI(lastComposite, plan, true, 'auto'); // logIt = true -> addSignalToLog
+      autonomy.signalsTaken++;
+      autonomy.lastSignalAt = now;
+      reason = 'Took a ' + lastComposite.direction + ' at $' + fmt(plan.entry) +
+               ' (' + lastComposite.confidence + '% confidence' + (gate.grade ? ', grade ' + gate.grade : '') + ').';
+    } else {
+      updateSignalUI(lastComposite, plan, false); // keep the panel current without logging
+      // Track what was passed on, so the filter can be audited later rather
+      // than trusted forever.
+      addShadowSignal(lastComposite, plan, gate.reason);
+      reason = 'No signal taken — ' + gate.reason + '.';
+    }
+  } else {
+    reason = 'Analysis produced no result this cycle.';
+  }
+  if (graded) reason = 'Self-graded ' + graded + ' signal' + (graded === 1 ? '' : 's') + '. ' + reason;
+  autonomy.lastReason = reason;
+
+  // 5. Periodic re-backtest / retrain on the accumulated record.
+  const btDue = !autonomy.lastBacktestAt || (now - autonomy.lastBacktestAt) >= cfg.backtestIntervalHours * 3600 * 1000;
+  if (btDue) {
+    autonomy.lastBacktestAt = now;
+    await runBacktestCycle(true);
+  }
+
+  renderAnalysisQuality();
+  renderDataInventory();
+  renderCalendar();
+  renderReasoning();
+  runAudit();
+  renderAudit();
+  autonomy.cycles++;
+  autonomy.consecutiveErrors = 0;
+  autonomy.lastError = null;
+  saveAutonomyState();
+  renderAutonomyStats();
+  if (candlesStaleForBudget) {
+    setAutonomyStatus('Running on cached candles — daily API budget spent, resumes 00:00 UTC.', 'warn',
+      'Still grading open signals and re-analysing, but on the last candles fetched rather than fresh ones. ' + reason);
+  } else {
+    setAutonomyStatus('Running autonomously — last pass ' + new Date(now).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) + '.', 'live', reason);
+  }
+}
+
+// The heartbeat: decides whether a cycle is due, and handles every reason it
+// might not be. Deliberately does no analysis itself.
+async function autonomyHeartbeat() {
+  if (!autonomy.enabled || autonomyBusy) return;
+
+  if (!navigator.onLine) {
+    setAutonomyStatus('Paused — no internet connection. Resumes automatically.', 'warn',
+      'Nothing is lost while offline; the gap gets replayed from candle history once the connection is back.');
+    return;
+  }
+  if (dataMode !== 'live') {
+    setAutonomyStatus('Waiting for a live data provider — connect an API key above.', 'warn',
+      'Autonomous mode needs real candles; it will not run on the simulated feed.');
+    return;
+  }
+  // Gold is shut from Friday ~21:00 UTC to Sunday ~22:00 UTC. Analysing a frozen
+  // feed produces confident-looking signals off Friday's last bar, and every one
+  // of them enters the learning record as a real read of a market that was not
+  // trading. Nothing to analyse, so nothing runs.
+  if (!isMarketOpen(Date.now())) {
+    const clock = marketClock(Date.now());
+    const h = clock.hoursUntilOpen;
+    setAutonomyStatus('Market closed — resumes when gold reopens in ' +
+      (h < 1 ? Math.round(h * 60) + 'm' : h.toFixed(1) + 'h') + '.', 'warn',
+      'The feed is frozen at Friday\u2019s close. Analysing it would generate signals from a market that is not trading.');
+    return;
+  }
+  if (autonomy.skipCycles > 0) {
+    autonomy.skipCycles--;
+    setAutonomyStatus('Backing off after an error — retrying in ' + (autonomy.skipCycles + 1) + ' min.', 'warn', autonomy.lastError);
+    return;
+  }
+
+  const cfg = autonomyConfig();
+  const dueAt = (autonomy.lastAnalysisAt || 0) + cfg.analysisIntervalMinutes * 60 * 1000;
+  if (Date.now() < dueAt) {
+    const mins = Math.ceil((dueAt - Date.now()) / 60000);
+    setAutonomyStatus('Running autonomously — next pass in ' + mins + ' min.', 'live', autonomy.lastReason);
+    return;
+  }
+
+  autonomyBusy = true;
+  try {
+    await autonomyCycle();
+  } catch (e) {
+    autonomy.consecutiveErrors++;
+    autonomy.lastError = (e && e.message) || String(e);
+    // Exponential backoff, capped at ~30 min. A rate-limited or expired key
+    // should not turn into a request every minute for the rest of the day.
+    autonomy.skipCycles = Math.min(Math.pow(2, autonomy.consecutiveErrors), 30);
+    setAutonomyStatus('Cycle failed (' + autonomy.consecutiveErrors + ' in a row) — backing off ' + autonomy.skipCycles + ' min.', 'error', autonomy.lastError);
+    saveAutonomyState();
+  } finally {
+    autonomyBusy = false;
+  }
+}
+
+// Replay the time the app was closed or disconnected. Pulls the deepest history
+// the provider allows and grades every still-open signal against it, so a signal
+// that hit its target overnight is training data by the time the user looks.
+async function autonomyCatchUp() {
+  if (dataMode !== 'live' || !navigator.onLine) return;
+  const stillOpen = signalLog.filter(s => s.status === 'pending' || s.status === 'open');
+  if (!stillOpen.length) return;
+  setAutonomyStatus('Catching up — replaying ' + stillOpen.length + ' unresolved signal(s) against real history…', 'warn', '');
+  try {
+    const history = await PROVIDERS[activeProvider].timeSeries(apiKey, LIVE_INTERVAL, 5000);
+    const n = resolveOpenSignals(history, autonomyConfig());
+    renderAutonomyStats();
+    saveAutonomyState();
+    setAutonomyStatus('Catch-up complete.', autonomy.enabled ? 'live' : 'idle',
+      n ? 'Graded ' + n + ' signal(s) that resolved while the app was closed.'
+        : 'No signals had resolved while the app was closed.');
+  } catch (e) {
+    // Not fatal — the regular heartbeat will keep trying against live candles.
+    setAutonomyStatus('Catch-up could not fetch history — continuing on live candles.', 'warn', (e && e.message) || String(e));
+  }
+}
+
+function startAutonomy() {
+  if (autonomyHandle) clearInterval(autonomyHandle);
+  autonomyHandle = setInterval(autonomyHeartbeat, AUTONOMY_HEARTBEAT_MS);
+  autonomy.skipCycles = 0;
+  autonomy.consecutiveErrors = 0;
+  setAutonomyStatus('Autonomous mode on — first pass starting…', 'live', '');
+  autonomy.lastAnalysisAt = null; // force an immediate first pass
+  autonomyHeartbeat();
+}
+
+function stopAutonomy() {
+  if (autonomyHandle) { clearInterval(autonomyHandle); autonomyHandle = null; }
+  setAutonomyStatus('Off — check the box above to start.', 'idle', '');
+}
+
+document.getElementById('autonomyEnabled').addEventListener('change', function () {
+  autonomy.enabled = this.checked;
+  saveAutonomyState();
+  if (autonomy.enabled) startAutonomy(); else stopAutonomy();
+});
+providerSelect.addEventListener('change', renderQuota);
+const umm = document.getElementById('useMacroModel');
+if (umm) umm.addEventListener('change', () => { renderKnowledge(); renderReasoning(); });
+
+// A posture for building up a record rather than protecting capital. The engine
+// learns from resolved trades, and at the default B floor a ranging market
+// simply never qualifies — so a cautious setup collects nothing and the
+// knowledge base never starts.
+document.getElementById('aPresetCollect').addEventListener('click', () => {
+  // D, not C: even a perfect five-timeframe alignment only scores ~49%, so a C
+  // floor (>=30%) still rejects ordinary conditions and collects almost nothing.
+  document.getElementById('aMinGrade').value = 'D';
+  document.getElementById('aMinConf').value = 15;
+  document.getElementById('aCooldown').value = 30;
+  document.getElementById('aMaxOpen').value = 5;
+  document.getElementById('aMinMeta').value = -0.5;
+  saveAutonomyState();
+  autonomy.lastAnalysisAt = null; // re-evaluate immediately under the new thresholds
+  setAutonomyStatus('Data-collection thresholds applied — re-evaluating now.', 'live', '');
+  autonomyHeartbeat();
+});
+document.getElementById('autonomyAdvancedToggle').addEventListener('click', () => {
+  document.getElementById('autonomyAdvanced').classList.toggle('hidden');
+});
+['aMinConf', 'aCooldown', 'aMaxOpen', 'aInterval', 'aBtHours', 'aMinMeta', 'aDailyCap', 'aMinGrade',
+ 'aKillFill', 'aKillOpen', 'aKillDrift'].forEach(id => {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener('change', () => { saveAutonomyState(); renderQuota(); });
+});
+
+// React to connectivity changes straight away rather than waiting out a heartbeat.
+window.addEventListener('online', () => {
+  if (!autonomy.enabled) return;
+  autonomy.skipCycles = 0;
+  autonomy.consecutiveErrors = 0;
+  setAutonomyStatus('Back online — catching up…', 'warn', '');
+  autonomyCatchUp().then(autonomyHeartbeat);
+});
+window.addEventListener('offline', () => {
+  if (autonomy.enabled) setAutonomyStatus('Paused — no internet connection. Resumes automatically.', 'warn', '');
+});
+// Coming back to a backgrounded tab is a good moment to check for missed work:
+// mobile browsers in particular throttle timers hard once a tab is hidden.
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && autonomy.enabled) autonomyHeartbeat();
+});
+
+// ============================================================
+// BOOTSTRAP
+// ------------------------------------------------------------
+// Ordering matters here, which is why it is one explicit sequence rather than
+// scattered top-level calls: persisted learning state has to be restored (and
+// its weights applied) before the first analysis, and every DOM const further
+// up this file has to exist before anything reads it.
+// ============================================================
+// ============================================================
+// SETTINGS THAT SURVIVE A RELOAD
+// ------------------------------------------------------------
+// Only the paper account's balance and the autonomy thresholds were ever
+// persisted. Everything else a person could change — risk per trade, spread,
+// slippage, max concurrent, the partial-take-profit rules, all fourteen factor
+// weights, the target R:R, every backtest parameter, the news-window settings —
+// was read straight off the DOM and lost the moment the page reloaded. Tuning
+// the system was therefore something you had to redo from memory each session,
+// and an autonomous run would quietly revert to defaults after any refresh.
+//
+// One store, one list, restored before the first analysis so the weights are in
+// force when it runs. Ids that already have an owner are deliberately absent —
+// autonomy keeps its own (AUTONOMY_KEY), the paper on/off switches live with the
+// account, and the API keys are opt-in through "remember keys" rather than
+// swept up here.
+const SETTINGS_KEY = 'smc-settings-v1';
+const SETTINGS_IDS = [
+  // paper account
+  'pStartBalance', 'pRiskPct', 'pSpread', 'pSlippage', 'pMaxPos',
+  'pSizingMode', 'pFixedLots', 'pContractSize', 'pLotStep', 'pMinLots',
+  'pPartialPct', 'pHoldMeta', 'pPartialEnabled',
+  // factor weights
+  'wWeekly', 'wDaily', 'wHtf', 'wMtf', 'wLtf', 'wOb', 'wFvg', 'wLiq',
+  'wPd', 'wPriceAction', 'wClassic', 'wCorrelation', 'wFundamental', 'wNews',
+  // signal + backtest
+  'targetRR', 'pBars', 'pCapital', 'pRisk', 'pCostPips', 'pMinConf', 'pTargetRR',
+  // news window and macro model
+  'newsBeforeMin', 'newsAfterMin', 'newsBlockEnabled', 'newsBlockMedium',
+  'newsFlattenEnabled', 'newsFlattenMin', 'newsAlertMin', 'useMacroModel',
+  'weekendFlattenEnabled', 'weekendFlattenMin'
+];
+
+function saveSettings() {
+  const out = {};
+  SETTINGS_IDS.forEach(id => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    out[id] = el.type === 'checkbox' ? !!el.checked : el.value;
+  });
+  try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(out)); }
+  catch (e) { return false; }
+  return true;
+}
+
+function loadSettings() {
+  let saved;
+  try { saved = JSON.parse(localStorage.getItem(SETTINGS_KEY) || 'null'); }
+  catch (e) { return; }
+  if (!saved || typeof saved !== 'object') return;
+  SETTINGS_IDS.forEach(id => {
+    if (!(id in saved)) return;
+    const el = document.getElementById(id);
+    if (!el) return;
+    if (el.type === 'checkbox') el.checked = !!saved[id];
+    else if (saved[id] != null) el.value = saved[id];
+  });
+  // Sliders carry a printed value beside them that does not follow a
+  // programmatic change, so a restored weight would show the old number.
+  syncSliderLabels();
+}
+
+function syncSliderLabels() {
+  weightIds.forEach(id => {
+    const el = document.getElementById(id), out = document.getElementById(id + 'V');
+    if (el && out) out.textContent = el.value;
+  });
+  const rr = document.getElementById('targetRR'), rrOut = document.getElementById('targetRRV');
+  if (rr && rrOut) rrOut.textContent = '1:' + rr.value;
+}
+
+let settingsSaveTimer = null;
+function flagSettingsSaved() {
+  const el = document.getElementById('settingsSavedNote');
+  if (!el) return;
+  el.textContent = 'Settings saved.';
+  el.style.color = '#3ecf8e';
+  clearTimeout(settingsSaveTimer);
+  settingsSaveTimer = setTimeout(() => { el.textContent = ''; }, 2500);
+}
+
+function wireSettingsPersistence() {
+  SETTINGS_IDS.forEach(id => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    const handler = () => { if (saveSettings()) flagSettingsSaved(); };
+    el.addEventListener('change', handler);
+    // Sliders and number spinners fire `input` continuously; `change` alone
+    // would miss a drag that never blurs.
+    if (el.type === 'range' || el.type === 'number') el.addEventListener('input', handler);
+  });
+}
+
+// ============================================================
+// IS THIS TAB STILL RUNNING THE CURRENT CODE?
+// ------------------------------------------------------------
+// This app is built to be left open for days doing unattended analysis, which
+// means a tab can go on running the modules it loaded at open time long after a
+// fix has shipped. That is not hypothetical: the macro engine ran on 1976-2006
+// FRED data, the fix deployed, and an open tab would have carried on producing
+// confident, wrong numbers with nothing on screen to say so.
+//
+// The check compares the ETag of app.js now against the one seen at startup, so
+// it needs no version constant to keep in sync and no build step. `no-store`
+// forces the request past the browser cache; the server already sends
+// must-revalidate, so this is cheap.
+const UPDATE_CHECK_MS = 30 * 60 * 1000;
+let loadedBuildTag = null;
+let updateWatchHandle = null;
+
+async function currentBuildTag() {
+  try {
+    const r = await fetch('app.js', { method: 'HEAD', cache: 'no-store' });
+    return r.headers.get('etag') || r.headers.get('last-modified') || null;
+  } catch (e) {
+    return null; // offline, or the check is blocked — try again next time
+  }
+}
+
+async function checkForNewBuild() {
+  const tag = await currentBuildTag();
+  if (!tag) return;
+  if (loadedBuildTag == null) { loadedBuildTag = tag; return; }
+  if (tag === loadedBuildTag) return;
+  const banner = document.getElementById('updateBanner');
+  if (banner) banner.classList.remove('hidden');
+}
+
+function startUpdateWatch() {
+  const reload = document.getElementById('updateReload');
+  if (reload) reload.addEventListener('click', () => window.location.reload());
+  checkForNewBuild();
+  if (updateWatchHandle) clearInterval(updateWatchHandle);
+  updateWatchHandle = setInterval(checkForNewBuild, UPDATE_CHECK_MS);
+}
+
+async function bootstrap() {
+  // Before anything reads a control: the weights, risk settings and thresholds
+  // have to be the saved ones by the time the first analysis runs.
+  loadSettings();
+  wireSettingsPersistence();
+  await loadLearningState();
+  await loadSignalLog();
+  await loadShadowLog();
+  applyKnowledgeBaseWeights();
+  await loadPaper();
+  await loadKnowledge();
+  await loadCalendarCache();
+  loadAutonomyState();
+  loadQuota();
+  // Every store the merge touches is loaded by this point — the log it merges
+  // into, the paper account it books positions in, the learning state it
+  // updates. Replay anything the worker sent while that was still loading.
+  flushPendingIngest();
+  renderSignalLog();   // first render happened before the paper account loaded
+  startLivenessTicker();
+  startUpdateWatch();
+  startNewsWatch();
+  renderQuota();
+  renderAutonomyStats();
+  renderAnalysisQuality();
+  renderPaper();
+  renderDataInventory();
+  renderCalendar();
+  renderReasoning();
+  renderKnowledge();
+  runAudit();
+  renderAudit();
+  refreshWorkerTotals().then(renderDataInventory);
+  refreshAll();
+
+  const saved = await loadSavedKeys();
+  if (!saved) {
+    document.getElementById('autoBacktestStatus').textContent = 'Connect a data provider to enable auto-backtesting.';
+  } else {
+    document.getElementById('rememberKeysCheckbox').checked = true;
+    if (saved.provider) providerSelect.value = saved.provider;
+    if (saved.fredKey) document.getElementById('fredKeyInput').value = saved.fredKey;
+    if (saved.newsKey) document.getElementById('newsKeyInput').value = saved.newsKey;
+    if (typeof saved.autoBacktest === 'boolean') document.getElementById('autoBacktestCheckbox').checked = saved.autoBacktest;
+    if (saved.apiKey) {
+      document.getElementById('apiKeyInput').value = saved.apiKey;
+      connStatus.textContent = 'Restoring saved connection...';
+      await connectProvider(); // also re-fetches correlation/fundamentals/news with the restored keys
+    } else if (saved.fredKey || saved.newsKey) {
+      // No price provider was connected, but FRED/news keys were saved independently — restore those engines too.
+      await refreshCorrelation(activeProvider, apiKey, saved.fredKey || '');
+      await refreshFundamentals(saved.fredKey || '');
+      await refreshNewsSentiment(saved.newsKey || '');
+      refreshAll();
+      document.getElementById('autoBacktestStatus').textContent = 'Connect a data provider to enable auto-backtesting.';
+    } else {
+      document.getElementById('autoBacktestStatus').textContent = 'Connect a data provider to enable auto-backtesting.';
+    }
+  }
+
+  // The calendar gates trading, so it must be loaded before autonomy's first pass.
+  await refreshCalendar(false);
+  renderCalendar();
+  renderReasoning();
+
+  // Recover anything that resolved while the app was closed, then pick the loop back up.
+  if (autonomy.enabled) {
+    await autonomyCatchUp();
+    startAutonomy();
+  } else {
+    setAutonomyStatus('Off — check the box above to start.', 'idle', '');
+  }
+}
+bootstrap();
+ + fmt(position.sl) + '):', String(position.sl));
+    if (raw == null) return;
+    const next = Number(raw);
+    if (!Number.isFinite(next) || next <= 0) { window.alert('Enter a valid positive price.'); return; }
+    if (position.status !== 'open') { window.alert('Cancel the resting order and create a new setup to change its stop.'); return; }
+    const validSide = position.dir === 'BUY'
+      ? next < position.entryFill && next < price
+      : next > position.entryFill && next > price;
+    if (!validSide) { window.alert('The stop must remain beyond both entry and current market price on the loss side.'); return; }
+    position.sl = next;
+    position.riskAmount = Math.abs(position.entryFill - next) * position.units;
+    const sig = signalLog.find(x => x.id === position.signalId);
+    if (sig && (sig.status === 'pending' || sig.status === 'open')) {
+      sig.sl = next;
+      sig.rr = Math.abs(sig.tp - sig.entry) / Math.max(Math.abs(sig.entry - next), 1e-9);
+      saveSignalLog();
+    }
+  } else if (button.dataset.paperAction === 'close') {
+    if (!window.confirm(position.status === 'pending' ? 'Cancel this unfilled paper order?' : 'Close this paper trade at the current market price?')) return;
+    const sig = signalLog.find(x => x.id === position.signalId);
+    if (sig && (sig.status === 'pending' || sig.status === 'open')) {
+      sig.status = 'expired';
+      sig.expiryReason = position.status === 'pending' ? 'manually cancelled' : 'manually closed by user';
+      sig.resolvedAt = new Date().toISOString();
+      sig.resolvedBy = 'manual';
+      if (position.status === 'open' && Number.isFinite(price)) sig.exitPrice = price;
+      saveSignalLog();
+    }
+    const idx = paper.positions.findIndex(p => p.id === position.id);
+    paper.positions[idx] = closePaperPosition(position, 'expired', price, paperConfig(), price);
+  }
+  await savePaper();
+  renderPaper();
+  renderSignalLog();
+  renderAnalysisQuality();
+  renderDataInventory();
+});
+
+function renderPaperStatusNote() {
+  const note = document.getElementById('paperStatus');
+  if (!note) return;
+  if (!paper.enabled) { note.textContent = 'Off — no positions will be opened.'; return; }
+  note.textContent = paper.manual
+    ? 'On — new signals will open simulated positions. No real orders are placed.'
+    : 'On for the engine\'s own signals. Signals you generate by hand are excluded (signal panel).';
+}
+
+document.getElementById('paperEnabled').addEventListener('change', function () {
+  paper.enabled = this.checked;
+  savePaper();
+  renderPaper();
+  renderPaperStatusNote();
+  renderPaperManualHint();
+});
+
+const paperManualCb = document.getElementById('paperManual');
+if (paperManualCb) paperManualCb.addEventListener('change', function () {
+  paper.manual = this.checked;
+  // Ticking it with the account off is a request to paper-trade, so honour it
+  // rather than silently doing nothing.
+  if (paper.manual && !paper.enabled) {
+    paper.enabled = true;
+    const master = document.getElementById('paperEnabled');
+    if (master) master.checked = true;
+  }
+  savePaper();
+  renderPaper();
+  renderPaperStatusNote();
+  renderPaperManualHint();
+});
+document.getElementById('paperAdvancedToggle').addEventListener('click', () => {
+  document.getElementById('paperAdvanced').classList.toggle('hidden');
+});
+['pStartBalance', 'pRiskPct', 'pSpread', 'pSlippage', 'pMaxPos', 'pPartialPct', 'pHoldMeta', 'pPartialEnabled'].forEach(id => {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener('change', () => { paper.startingBalance = paperConfig().startingBalance; savePaper(); renderPaper(); });
+});
+document.getElementById('paperReset').addEventListener('click', async () => {
+  const price = currentMarkPrice();
+  const live = paper.positions.filter(p => p.status === 'open' || p.status === 'pending').length;
+  const keeping = paper.positions.filter(p => p.status === 'closed').length;
+  const msg = 'Reset the paper account back to $' + fmt(paperConfig().startingBalance) + '?\n\n'
+    + (live ? live + ' live position(s) will be closed at the current price first.\n' : '')
+    + keeping + ' completed trade(s) stay on record — they are what the system learns from, '
+    + 'and they keep counting towards the lifetime win rate. They just stop counting towards the balance.';
+  if (!window.confirm(msg)) return;
+  const out = resetPaperAccount(paper.positions, isFinite(price) ? price : undefined, Date.now());
+  paper.positions = out.positions;
+  paper.epoch = out.epoch;
+  await savePaper();
+  renderPaper();
+  renderDataInventory();
+});
+
+// ============================================================
+// ANALYSIS QUALITY PANEL
+// ------------------------------------------------------------
+// Renders the three self-audits. Every number here is deliberately allowed to
+// say "not enough data yet" rather than show a confident-looking figure built
+// on four trades — a reassuring number from a tiny sample is worse than no
+// number, because it gets believed.
+// ============================================================
+function fmtR(v) { return v == null ? '—' : (v >= 0 ? '+' : '') + v.toFixed(2) + 'R'; }
+function fmtPct(v) { return v == null ? '—' : (v * 100).toFixed(0) + '%'; }
+function rClass(v) { return v == null ? 'fneu' : v > 0.05 ? 'fpos' : v < -0.05 ? 'fneg' : 'fneu'; }
+
+function renderAnalysisQuality() {
+  const root = document.getElementById('qualityContent');
+  if (!root) return;
+
+  const cal = computeCalibration(signalLog);
+  const bd = computeConditionBreakdown(signalLog);
+  const audit = computeGateAudit(signalLog, shadowLog);
+
+  const rows = (list, label) => {
+    const usable = list.filter(r => r.n >= 3);
+    if (!usable.length) return '<div class="zone-empty">' + label + ': not enough resolved trades yet (need 3+ per group).</div>';
+    return usable.map(r =>
+      '<div class="zone-item"><span>' + r.key + ' <span style="color:#454a56;">(' + r.n + ')</span></span>' +
+      '<span class="mono ' + rClass(r.expectancyR) + '">' + fmtR(r.expectancyR) + ' · ' + fmtPct(r.winRate) + '</span></div>'
+    ).join('');
+  };
+
+  const o = bd.overall;
+  let html = '';
+
+  html += '<div class="data-source-note" style="margin-bottom:8px;">Expectancy is shown in R — average profit per unit risked. At a 1:4 target a 30% win rate is already profitable, so win rate alone is a poor scorecard and R is the honest one.</div>';
+
+  html += '<div class="metrics" style="margin-bottom:10px;">'
+    + '<div class="card"><div class="label">Resolved</div><div class="value mono">' + o.n + '</div></div>'
+    + '<div class="card"><div class="label">Win Rate</div><div class="value mono">' + fmtPct(o.winRate) + '</div></div>'
+    + '<div class="card"><div class="label">Expectancy</div><div class="value mono ' + rClass(o.expectancyR) + '">' + fmtR(o.expectancyR) + '</div></div>'
+    + '<div class="card"><div class="label">Total</div><div class="value mono ' + rClass(o.totalR) + '">' + fmtR(o.totalR) + '</div></div>'
+    + '</div>';
+
+  // 1. Is the confidence number worth anything?
+  html += '<div class="panel-title" style="font-size:11px;margin-top:12px;">Is the confidence score meaningful?</div>';
+  html += '<div class="event-line" style="border-left-color:#e8c37a;">' + cal.verdict + '</div>';
+  if (cal.discrimination != null) {
+    html += '<div class="zone-item"><span>High-confidence half vs low-confidence half</span><span class="mono ' + rClass(cal.discrimination) + '">'
+      + (cal.discrimination >= 0 ? '+' : '') + (cal.discrimination * 100).toFixed(0) + ' pp win rate</span></div>';
+  }
+  if (cal.buckets.length) {
+    html += '<table class="factor-table"><tr><th style="text-align:left;color:#5c6270;font-weight:500;">Confidence band</th><th style="color:#5c6270;font-weight:500;">Win rate</th><th style="color:#5c6270;font-weight:500;">Expectancy</th></tr>';
+    html += cal.buckets.map(b =>
+      '<tr><td>' + b.lo + '–' + b.hi + '% <span style="color:#454a56;">(' + b.n + ')</span></td>'
+      + '<td>' + fmtPct(b.winRate) + '</td>'
+      + '<td class="' + rClass(b.expectancyR) + '">' + fmtR(b.expectancyR) + '</td></tr>').join('');
+    html += '</table>';
+  }
+
+  // 2. Where does the edge actually live?
+  html += '<div class="panel-title" style="font-size:11px;margin-top:14px;">Where the edge actually lives</div>';
+  html += '<div style="font-size:10px;color:#454a56;margin-bottom:6px;">By session</div>' + rows(bd.bySession, 'Session');
+  html += '<div style="font-size:10px;color:#454a56;margin:8px 0 6px;">By market regime</div>' + rows(bd.byRegime, 'Regime');
+  html += '<div style="font-size:10px;color:#454a56;margin:8px 0 6px;">By grade</div>' + rows(bd.byGrade, 'Grade');
+  html += '<div style="font-size:10px;color:#454a56;margin:8px 0 6px;">By direction</div>' + rows(bd.byDirection, 'Direction');
+
+  // 3. The roads not taken.
+  html += '<div class="panel-title" style="font-size:11px;margin-top:14px;">The setups it turned down</div>';
+  html += '<div class="data-source-note" style="margin-bottom:6px;">Every setup the filter rejected is tracked and resolved against real price anyway. This is the comparison a human journal can never make, because nobody records their non-trades.</div>';
+  html += '<div class="zone-item"><span>Taken</span><span class="mono ' + rClass(audit.taken.expectancyR) + '">'
+    + fmtR(audit.taken.expectancyR) + ' <span style="color:#454a56;">(' + audit.taken.n + ')</span></span></div>';
+  html += '<div class="zone-item"><span>Declined</span><span class="mono ' + rClass(audit.declined.expectancyR) + '">'
+    + fmtR(audit.declined.expectancyR) + ' <span style="color:#454a56;">(' + audit.declined.n + ')</span></span></div>';
+  const pending = shadowLog.filter(s => s.status === 'pending' || s.status === 'open').length;
+  if (pending) html += '<div class="zone-item"><span>Declined, still running</span><span class="mono">' + pending + '</span></div>';
+  html += '<div class="event-line" style="border-left-color:#c99bff;margin-top:6px;">' + audit.verdict + '</div>';
+
+  root.innerHTML = html;
+}
+document.getElementById('resetQuality').addEventListener('click', async () => {
+  shadowLog = [];
+  await saveShadowLog();
+  renderAnalysisQuality();
+});
+
+// ============================================================
+// AUTONOMOUS MODE
+// ------------------------------------------------------------
+// The unattended operator. Once the user ticks the box, a single heartbeat
+// drives everything: fetch fresh candles, grade any signal that has since hit
+// its stop or target, re-analyse, commit a new signal if the gate clears, and
+// periodically re-backtest and retrain on the record it has built.
+//
+// Three things make this survive real-world conditions rather than only a tab
+// left open on a desk:
+//   * One 60s heartbeat with due-time checks, not a pile of setIntervals. A
+//     laptop that sleeps for six hours wakes up, sees every task is overdue,
+//     and runs them once — rather than firing a backlog of missed timers.
+//   * Losing the connection is expected, not exceptional. Offline is a quiet
+//     pause; repeated failures back off exponentially instead of hammering a
+//     rate-limited provider until the key is blocked.
+//   * Time with the tab closed is recovered, not lost. catchUp() replays the
+//     gap from real candle history on the next load, so signals that resolved
+//     while nobody was watching still become training data.
+// ============================================================
+
+const AUTONOMY_KEY = 'smc-autonomy-v1';
+const AUTONOMY_HEARTBEAT_MS = 60 * 1000;
+
+let autonomyHandle = null;
+let autonomyBusy = false;
+
+function autonomyConfig() {
+  const num = (id, fallback) => {
+    const el = document.getElementById(id);
+    const v = el ? parseFloat(el.value) : NaN;
+    return isFinite(v) ? v : fallback;
+  };
+  return Object.assign({}, AUTONOMY_DEFAULTS, {
+    minConfidence: num('aMinConf', AUTONOMY_DEFAULTS.minConfidence),
+    cooldownMinutes: num('aCooldown', AUTONOMY_DEFAULTS.cooldownMinutes),
+    maxOpenSignals: num('aMaxOpen', AUTONOMY_DEFAULTS.maxOpenSignals),
+    analysisIntervalMinutes: num('aInterval', AUTONOMY_DEFAULTS.analysisIntervalMinutes),
+    backtestIntervalHours: num('aBtHours', AUTONOMY_DEFAULTS.backtestIntervalHours),
+    minMetaScore: num('aMinMeta', AUTONOMY_DEFAULTS.minMetaScore),
+    // Kill switch. 0 in any field disables that arm rather than expiring
+    // everything instantly, which is what a 0 limit would otherwise mean.
+    maxHoursToFill: num('aKillFill', AUTONOMY_DEFAULTS.maxHoursToFill),
+    maxHoursOpen: num('aKillOpen', AUTONOMY_DEFAULTS.maxHoursOpen),
+    maxDriftRToFill: num('aKillDrift', AUTONOMY_DEFAULTS.maxDriftRToFill),
+    partialTP: partialTPConfig(),
+    newsState: currentNewsState(),
+    gradeFloor: (document.getElementById('aMinGrade') || {}).value || AUTONOMY_DEFAULTS.gradeFloor
+  });
+}
+
+function saveAutonomyState() {
+  try {
+    localStorage.setItem(AUTONOMY_KEY, JSON.stringify({
+      enabled: autonomy.enabled,
+      cycles: autonomy.cycles,
+      gateTally: autonomy.gateTally,
+      signalsTaken: autonomy.signalsTaken,
+      autoResolved: autonomy.autoResolved,
+      lastAnalysisAt: autonomy.lastAnalysisAt,
+      lastBacktestAt: autonomy.lastBacktestAt,
+      lastSignalAt: autonomy.lastSignalAt,
+      cfg: {
+        aMinConf: document.getElementById('aMinConf').value,
+        aCooldown: document.getElementById('aCooldown').value,
+        aKillFill: document.getElementById('aKillFill').value,
+        aKillOpen: document.getElementById('aKillOpen').value,
+        aKillDrift: document.getElementById('aKillDrift').value,
+        aMaxOpen: document.getElementById('aMaxOpen').value,
+        aInterval: document.getElementById('aInterval').value,
+        aBtHours: document.getElementById('aBtHours').value,
+        aMinMeta: document.getElementById('aMinMeta').value,
+        aDailyCap: document.getElementById('aDailyCap').value,
+        aMinGrade: document.getElementById('aMinGrade').value
+      }
+    }));
+  } catch (e) { /* storage unavailable — autonomy still works, it just won't remember across reloads */ }
+}
+
+function loadAutonomyState() {
+  try {
+    const raw = localStorage.getItem(AUTONOMY_KEY);
+    if (!raw) return;
+    const saved = JSON.parse(raw);
+    Object.assign(autonomy, {
+      enabled: !!saved.enabled,
+      cycles: saved.cycles || 0,
+      gateTally: saved.gateTally || {},
+      signalsTaken: saved.signalsTaken || 0,
+      autoResolved: saved.autoResolved || 0,
+      lastAnalysisAt: saved.lastAnalysisAt || null,
+      lastBacktestAt: saved.lastBacktestAt || null,
+      lastSignalAt: saved.lastSignalAt || null
+    });
+    if (saved.cfg) {
+      Object.keys(saved.cfg).forEach(id => {
+        const el = document.getElementById(id);
+        if (el && saved.cfg[id] != null) el.value = saved.cfg[id];
+      });
+    }
+    document.getElementById('autonomyEnabled').checked = autonomy.enabled;
+  } catch (e) { /* nothing saved yet */ }
+}
+
+function setAutonomyStatus(text, tone, reason) {
+  const dot = document.getElementById('autonomyDot');
+  const status = document.getElementById('autonomyStatus');
+  const reasonEl = document.getElementById('autonomyReason');
+  if (!status) return;
+  status.textContent = text;
+  const colours = { live: '#3ecf8e', warn: '#ffa726', error: '#ef4d5f', idle: '#454a56' };
+  const c = colours[tone] || colours.idle;
+  dot.style.background = c;
+  dot.style.boxShadow = tone === 'live' ? '0 0 7px ' + c : 'none';
+  status.style.color = tone === 'idle' ? '#9298a5' : c;
+  if (reason !== undefined) reasonEl.textContent = reason || '';
+}
+
+function renderAutonomyStats() {
+  const live = signalLog.filter(s => s.status === 'pending' || s.status === 'open');
+  document.getElementById('aCycles').textContent = autonomy.cycles;
+  document.getElementById('aSignals').textContent = autonomy.signalsTaken;
+  document.getElementById('aResolved').textContent = autonomy.autoResolved;
+  document.getElementById('aOpen').textContent = live.length;
+
+  const killedEl = document.getElementById('aKilled');
+  if (killedEl) killedEl.textContent = signalLog.filter(s => s.status === 'expired').length;
+
+  // How long the oldest live trade has been sitting. This is the number that
+  // was invisible before: an order resting for a day looked identical to one
+  // placed a minute ago.
+  const oldestEl = document.getElementById('aOldest');
+  if (oldestEl) {
+    const cfg = autonomyConfig();
+    // Each trade is aged against the limit that actually applies to it: a
+    // resting order against the fill limit, a filled one against the hold
+    // limit. Using the larger of the two would leave an order 2.5x past its own
+    // deadline showing no warning at all.
+    const ages = live.map(s => {
+      const filled = s.status === 'open';
+      const t = Date.parse(filled ? (s.filledAt || s.time) : s.time);
+      if (!isFinite(t)) return null;
+      const hours = (Date.now() - t) / 3600000;
+      const limit = filled ? cfg.maxHoursOpen : cfg.maxHoursToFill;
+      return { hours, ratio: limit > 0 ? hours / limit : 0 };
+    }).filter(v => v != null);
+    if (!ages.length) {
+      oldestEl.textContent = '—';
+      oldestEl.style.color = '';
+    } else {
+      const worst = ages.reduce((a, b) => b.hours > a.hours ? b : a, ages[0]);
+      const closest = ages.reduce((a, b) => b.ratio > a.ratio ? b : a, ages[0]);
+      oldestEl.textContent = worst.hours < 1 ? Math.round(worst.hours * 60) + 'm' : worst.hours.toFixed(1) + 'h';
+      // Amber as a trade approaches its own kill limit, red once past it, so
+      // one about to be culled is visible before it disappears.
+      oldestEl.style.color = closest.ratio >= 1 ? '#ef4d5f' : closest.ratio >= 0.75 ? '#ffa726' : '';
+    }
+  }
+
+  const el = document.getElementById('gateTally');
+  if (!el) return;
+  const entries = Object.keys(autonomy.gateTally || {})
+    .map(k => ({ code: k, n: autonomy.gateTally[k] }))
+    .sort((a, b) => b.n - a.n);
+  if (!entries.length) { el.innerHTML = ''; return; }
+  el.innerHTML = '<div style="font-size:10px;color:#454a56;margin:8px 0 4px;">Why cycles ended this way</div>'
+    + entries.map(e => '<div class="zone-item" style="padding:3px 0;"><span style="font-size:11px;">'
+        + (GATE_LABELS[e.code] || e.code) + '</span><span class="mono" style="font-size:11px;color:'
+        + (e.code === 'taken' ? '#3ecf8e' : '#5c6270') + ';">' + e.n + '</span></div>').join('');
+}
+
+// Grade every unresolved signal against `candles`. Used both by the heartbeat
+// (fresh candles each cycle) and by catchUp() (deep history after downtime).
+// Returns how many signals reached a win/loss verdict.
+function resolveOpenSignals(candles, cfg) {
+  if (!candles || candles.length < 2) return 0;
+  let resolved = 0, killed = 0, changed = false;
+
+  // The auditor decides which live trades are past saving, not the engine.
+  // Letting the engine judge whether its own trade has gone bad is the thing
+  // the auditor exists to avoid — and it re-derives fill state from raw candles
+  // rather than trusting the signal's own status, so a "pending" order price
+  // actually traded through is caught rather than aged as if it never filled.
+  const tradeAudit = auditOpenTrades(signalLog, candles, {
+    maxHoursToFill: cfg.maxHoursToFill,
+    maxHoursOpen: cfg.maxHoursOpen,
+    maxDriftRToFill: cfg.maxDriftRToFill
+  });
+  lastTradeAudit = tradeAudit;
+  const killedBy = new Map(tradeAudit.kills.map(k => [k.id, k]));
+
+  signalLog.forEach(sig => {
+    if (sig.status !== 'pending' && sig.status !== 'open') return;
+    // An auditor kill outranks whatever the resolver would have said, EXCEPT
+    // when price has already settled the trade: a stop or target that has
+    // genuinely been hit is a real outcome and real evidence, and discarding it
+    // to enforce a time limit would throw away the data the limit exists to
+    // protect.
+    const verdict = resolveSignal(sig, candles, cfg);
+    const kill = killedBy.get(sig.id);
+    if (kill && verdict.status !== 'won' && verdict.status !== 'lost') {
+      sig.status = 'expired';
+      sig.expiryReason = 'auditor: ' + kill.reason;
+      sig.killSwitch = kill.code;
+      sig.resolvedAt = new Date().toISOString();
+      sig.resolvedBy = 'auditor';
+      paperCloseForSignal(sig.id, 'expired');
+      killed++; changed = true;
+      return;
+    }
+    if (verdict.status === 'won' || verdict.status === 'lost') {
+      if (applySignalOutcome(sig, verdict.status === 'won', {
+        auto: true, exitPrice: verdict.exitPrice, ambiguousBar: verdict.ambiguousBar, partial: verdict.partial
+      })) { resolved++; changed = true; }
+    } else if (verdict.status === 'expired') {
+      sig.status = 'expired';
+      sig.expiryReason = verdict.reason || null;
+      sig.killSwitch = verdict.killSwitch || null;
+      sig.resolvedAt = new Date().toISOString();
+      sig.resolvedBy = 'auto';
+      paperCloseForSignal(sig.id, 'expired');
+      if (verdict.killSwitch) killed++;
+      changed = true; // expired signals never become training data — no outcome to learn from
+    } else if (verdict.status === 'open' && sig.status === 'pending') {
+      sig.status = 'open'; // limit entry got tagged; it's a live position now
+      sig.filledAt = new Date().toISOString();
+      paperFillForSignal(sig.id, sig.filledAt);
+      changed = true;
+    }
+  });
+  if (changed) { saveSignalLog(); renderSignalLog(); }
+  if (resolved) autonomy.autoResolved += resolved;
+  if (killed) autonomy.killed = (autonomy.killed || 0) + killed;
+  resolveShadowSignals(candles, cfg);
+  return resolved;
+}
+
+// Shadows get the same treatment, minus the learning updates — a setup the
+// engine declined should inform the audit, not train the weights as though it
+// had been traded.
+function resolveShadowSignals(candles, cfg) {
+  if (!candles || candles.length < 2 || !shadowLog.length) return;
+  let changed = false;
+  shadowLog.forEach(sig => {
+    if (sig.status !== 'pending' && sig.status !== 'open') return;
+    const verdict = resolveSignal(sig, candles, cfg);
+    if (verdict.status === 'won' || verdict.status === 'lost') {
+      sig.status = verdict.status;
+      sig.resolvedAt = new Date().toISOString();
+      changed = true;
+    } else if (verdict.status === 'expired') {
+      sig.status = 'expired'; sig.expiryReason = verdict.reason || null; changed = true;
+    } else if (verdict.status === 'open' && sig.status === 'pending') {
+      sig.status = 'open'; changed = true;
+    }
+  });
+  if (changed) { saveShadowLog(); renderAnalysisQuality(); }
+}
+
+// One unattended pass. Everything that can fail is inside the caller's try.
+async function autonomyCycle() {
+  const cfg = autonomyConfig();
+  const now = Date.now();
+
+  // 0. Calendar first. It gates whether a signal may be taken at all, so it has
+  // to be current BEFORE the gate reads it — refreshing at the end of the cycle
+  // meant the first pass after a reconnect ran against an empty calendar and
+  // could take a position straight into a release window.
+  await refreshCalendar(false);
+
+  // 1. Fresh candles. resyncCandles() already refreshes liveData from the provider.
+  await resyncCandles();
+
+  // 2. Grade what the market has already decided since the last pass.
+  const graded = resolveOpenSignals(liveData, cfg);
+
+  // 3. Re-analyse on the new data.
+  refreshAll();
+  autonomy.lastAnalysisAt = now;
+
+  // 4. Commit a signal only if the gate clears.
+  let reason;
+  if (lastComposite) {
+    const plan = buildTradePlan(lastComposite, getTargetRR());
+    // The auditor is advisory everywhere except here. A critical finding means
+    // the analysis contradicts itself or the data it was built on — that is not
+    // a risk preference, and no confidence score should be able to override it.
+    const audit = runAudit();
+    renderAudit();
+    let gate;
+    if (audit && audit.blocking) {
+      gate = { take: false, code: 'audit',
+        reason: 'independent audit found ' + audit.critical + ' critical issue(s): ' + audit.findings[0].title };
+    } else {
+      gate = autonomyGate(lastComposite, plan, signalLog, autonomy.lastSignalAt, cfg);
+    }
+    // Tally why each cycle ended as it did. One latest-reason line cannot show
+    // whether 13 quiet cycles mean "no setup existed" or "the filter blocked
+    // every one" — and those need opposite responses.
+    const code = gate.code || 'unknown';
+    autonomy.gateTally[code] = (autonomy.gateTally[code] || 0) + 1;
+    if (gate.take) {
+      updateSignalUI(lastComposite, plan, true, 'auto'); // logIt = true -> addSignalToLog
+      autonomy.signalsTaken++;
+      autonomy.lastSignalAt = now;
+      reason = 'Took a ' + lastComposite.direction + ' at $' + fmt(plan.entry) +
+               ' (' + lastComposite.confidence + '% confidence' + (gate.grade ? ', grade ' + gate.grade : '') + ').';
+    } else {
+      updateSignalUI(lastComposite, plan, false); // keep the panel current without logging
+      // Track what was passed on, so the filter can be audited later rather
+      // than trusted forever.
+      addShadowSignal(lastComposite, plan, gate.reason);
+      reason = 'No signal taken — ' + gate.reason + '.';
+    }
+  } else {
+    reason = 'Analysis produced no result this cycle.';
+  }
+  if (graded) reason = 'Self-graded ' + graded + ' signal' + (graded === 1 ? '' : 's') + '. ' + reason;
+  autonomy.lastReason = reason;
+
+  // 5. Periodic re-backtest / retrain on the accumulated record.
+  const btDue = !autonomy.lastBacktestAt || (now - autonomy.lastBacktestAt) >= cfg.backtestIntervalHours * 3600 * 1000;
+  if (btDue) {
+    autonomy.lastBacktestAt = now;
+    await runBacktestCycle(true);
+  }
+
+  renderAnalysisQuality();
+  renderDataInventory();
+  renderCalendar();
+  renderReasoning();
+  runAudit();
+  renderAudit();
+  autonomy.cycles++;
+  autonomy.consecutiveErrors = 0;
+  autonomy.lastError = null;
+  saveAutonomyState();
+  renderAutonomyStats();
+  if (candlesStaleForBudget) {
+    setAutonomyStatus('Running on cached candles — daily API budget spent, resumes 00:00 UTC.', 'warn',
+      'Still grading open signals and re-analysing, but on the last candles fetched rather than fresh ones. ' + reason);
+  } else {
+    setAutonomyStatus('Running autonomously — last pass ' + new Date(now).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) + '.', 'live', reason);
+  }
+}
+
+// The heartbeat: decides whether a cycle is due, and handles every reason it
+// might not be. Deliberately does no analysis itself.
+async function autonomyHeartbeat() {
+  if (!autonomy.enabled || autonomyBusy) return;
+
+  if (!navigator.onLine) {
+    setAutonomyStatus('Paused — no internet connection. Resumes automatically.', 'warn',
+      'Nothing is lost while offline; the gap gets replayed from candle history once the connection is back.');
+    return;
+  }
+  if (dataMode !== 'live') {
+    setAutonomyStatus('Waiting for a live data provider — connect an API key above.', 'warn',
+      'Autonomous mode needs real candles; it will not run on the simulated feed.');
+    return;
+  }
+  // Gold is shut from Friday ~21:00 UTC to Sunday ~22:00 UTC. Analysing a frozen
+  // feed produces confident-looking signals off Friday's last bar, and every one
+  // of them enters the learning record as a real read of a market that was not
+  // trading. Nothing to analyse, so nothing runs.
+  if (!isMarketOpen(Date.now())) {
+    const clock = marketClock(Date.now());
+    const h = clock.hoursUntilOpen;
+    setAutonomyStatus('Market closed — resumes when gold reopens in ' +
+      (h < 1 ? Math.round(h * 60) + 'm' : h.toFixed(1) + 'h') + '.', 'warn',
+      'The feed is frozen at Friday\u2019s close. Analysing it would generate signals from a market that is not trading.');
+    return;
+  }
+  if (autonomy.skipCycles > 0) {
+    autonomy.skipCycles--;
+    setAutonomyStatus('Backing off after an error — retrying in ' + (autonomy.skipCycles + 1) + ' min.', 'warn', autonomy.lastError);
+    return;
+  }
+
+  const cfg = autonomyConfig();
+  const dueAt = (autonomy.lastAnalysisAt || 0) + cfg.analysisIntervalMinutes * 60 * 1000;
+  if (Date.now() < dueAt) {
+    const mins = Math.ceil((dueAt - Date.now()) / 60000);
+    setAutonomyStatus('Running autonomously — next pass in ' + mins + ' min.', 'live', autonomy.lastReason);
+    return;
+  }
+
+  autonomyBusy = true;
+  try {
+    await autonomyCycle();
+  } catch (e) {
+    autonomy.consecutiveErrors++;
+    autonomy.lastError = (e && e.message) || String(e);
+    // Exponential backoff, capped at ~30 min. A rate-limited or expired key
+    // should not turn into a request every minute for the rest of the day.
+    autonomy.skipCycles = Math.min(Math.pow(2, autonomy.consecutiveErrors), 30);
+    setAutonomyStatus('Cycle failed (' + autonomy.consecutiveErrors + ' in a row) — backing off ' + autonomy.skipCycles + ' min.', 'error', autonomy.lastError);
+    saveAutonomyState();
+  } finally {
+    autonomyBusy = false;
+  }
+}
+
+// Replay the time the app was closed or disconnected. Pulls the deepest history
+// the provider allows and grades every still-open signal against it, so a signal
+// that hit its target overnight is training data by the time the user looks.
+async function autonomyCatchUp() {
+  if (dataMode !== 'live' || !navigator.onLine) return;
+  const stillOpen = signalLog.filter(s => s.status === 'pending' || s.status === 'open');
+  if (!stillOpen.length) return;
+  setAutonomyStatus('Catching up — replaying ' + stillOpen.length + ' unresolved signal(s) against real history…', 'warn', '');
+  try {
+    const history = await PROVIDERS[activeProvider].timeSeries(apiKey, LIVE_INTERVAL, 5000);
+    const n = resolveOpenSignals(history, autonomyConfig());
+    renderAutonomyStats();
+    saveAutonomyState();
+    setAutonomyStatus('Catch-up complete.', autonomy.enabled ? 'live' : 'idle',
+      n ? 'Graded ' + n + ' signal(s) that resolved while the app was closed.'
+        : 'No signals had resolved while the app was closed.');
+  } catch (e) {
+    // Not fatal — the regular heartbeat will keep trying against live candles.
+    setAutonomyStatus('Catch-up could not fetch history — continuing on live candles.', 'warn', (e && e.message) || String(e));
+  }
+}
+
+function startAutonomy() {
+  if (autonomyHandle) clearInterval(autonomyHandle);
+  autonomyHandle = setInterval(autonomyHeartbeat, AUTONOMY_HEARTBEAT_MS);
+  autonomy.skipCycles = 0;
+  autonomy.consecutiveErrors = 0;
+  setAutonomyStatus('Autonomous mode on — first pass starting…', 'live', '');
+  autonomy.lastAnalysisAt = null; // force an immediate first pass
+  autonomyHeartbeat();
+}
+
+function stopAutonomy() {
+  if (autonomyHandle) { clearInterval(autonomyHandle); autonomyHandle = null; }
+  setAutonomyStatus('Off — check the box above to start.', 'idle', '');
+}
+
+document.getElementById('autonomyEnabled').addEventListener('change', function () {
+  autonomy.enabled = this.checked;
+  saveAutonomyState();
+  if (autonomy.enabled) startAutonomy(); else stopAutonomy();
+});
+providerSelect.addEventListener('change', renderQuota);
+const umm = document.getElementById('useMacroModel');
+if (umm) umm.addEventListener('change', () => { renderKnowledge(); renderReasoning(); });
+
+// A posture for building up a record rather than protecting capital. The engine
+// learns from resolved trades, and at the default B floor a ranging market
+// simply never qualifies — so a cautious setup collects nothing and the
+// knowledge base never starts.
+document.getElementById('aPresetCollect').addEventListener('click', () => {
+  // D, not C: even a perfect five-timeframe alignment only scores ~49%, so a C
+  // floor (>=30%) still rejects ordinary conditions and collects almost nothing.
+  document.getElementById('aMinGrade').value = 'D';
+  document.getElementById('aMinConf').value = 15;
+  document.getElementById('aCooldown').value = 30;
+  document.getElementById('aMaxOpen').value = 5;
+  document.getElementById('aMinMeta').value = -0.5;
+  saveAutonomyState();
+  autonomy.lastAnalysisAt = null; // re-evaluate immediately under the new thresholds
+  setAutonomyStatus('Data-collection thresholds applied — re-evaluating now.', 'live', '');
+  autonomyHeartbeat();
+});
+document.getElementById('autonomyAdvancedToggle').addEventListener('click', () => {
+  document.getElementById('autonomyAdvanced').classList.toggle('hidden');
+});
+['aMinConf', 'aCooldown', 'aMaxOpen', 'aInterval', 'aBtHours', 'aMinMeta', 'aDailyCap', 'aMinGrade',
+ 'aKillFill', 'aKillOpen', 'aKillDrift'].forEach(id => {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener('change', () => { saveAutonomyState(); renderQuota(); });
+});
+
+// React to connectivity changes straight away rather than waiting out a heartbeat.
+window.addEventListener('online', () => {
+  if (!autonomy.enabled) return;
+  autonomy.skipCycles = 0;
+  autonomy.consecutiveErrors = 0;
+  setAutonomyStatus('Back online — catching up…', 'warn', '');
+  autonomyCatchUp().then(autonomyHeartbeat);
+});
+window.addEventListener('offline', () => {
+  if (autonomy.enabled) setAutonomyStatus('Paused — no internet connection. Resumes automatically.', 'warn', '');
+});
+// Coming back to a backgrounded tab is a good moment to check for missed work:
+// mobile browsers in particular throttle timers hard once a tab is hidden.
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && autonomy.enabled) autonomyHeartbeat();
+});
+
+// ============================================================
+// BOOTSTRAP
+// ------------------------------------------------------------
+// Ordering matters here, which is why it is one explicit sequence rather than
+// scattered top-level calls: persisted learning state has to be restored (and
+// its weights applied) before the first analysis, and every DOM const further
+// up this file has to exist before anything reads it.
+// ============================================================
+// ============================================================
+// SETTINGS THAT SURVIVE A RELOAD
+// ------------------------------------------------------------
+// Only the paper account's balance and the autonomy thresholds were ever
+// persisted. Everything else a person could change — risk per trade, spread,
+// slippage, max concurrent, the partial-take-profit rules, all fourteen factor
+// weights, the target R:R, every backtest parameter, the news-window settings —
+// was read straight off the DOM and lost the moment the page reloaded. Tuning
+// the system was therefore something you had to redo from memory each session,
+// and an autonomous run would quietly revert to defaults after any refresh.
+//
+// One store, one list, restored before the first analysis so the weights are in
+// force when it runs. Ids that already have an owner are deliberately absent —
+// autonomy keeps its own (AUTONOMY_KEY), the paper on/off switches live with the
+// account, and the API keys are opt-in through "remember keys" rather than
+// swept up here.
+const SETTINGS_KEY = 'smc-settings-v1';
+const SETTINGS_IDS = [
+  // paper account
+  'pStartBalance', 'pRiskPct', 'pSpread', 'pSlippage', 'pMaxPos',
+  'pSizingMode', 'pFixedLots', 'pContractSize', 'pLotStep', 'pMinLots',
+  'pPartialPct', 'pHoldMeta', 'pPartialEnabled',
+  // factor weights
+  'wWeekly', 'wDaily', 'wHtf', 'wMtf', 'wLtf', 'wOb', 'wFvg', 'wLiq',
+  'wPd', 'wPriceAction', 'wClassic', 'wCorrelation', 'wFundamental', 'wNews',
+  // signal + backtest
+  'targetRR', 'pBars', 'pCapital', 'pRisk', 'pCostPips', 'pMinConf', 'pTargetRR',
+  // news window and macro model
+  'newsBeforeMin', 'newsAfterMin', 'newsBlockEnabled', 'newsBlockMedium',
+  'newsFlattenEnabled', 'newsFlattenMin', 'newsAlertMin', 'useMacroModel',
+  'weekendFlattenEnabled', 'weekendFlattenMin'
+];
+
+function saveSettings() {
+  const out = {};
+  SETTINGS_IDS.forEach(id => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    out[id] = el.type === 'checkbox' ? !!el.checked : el.value;
+  });
+  try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(out)); }
+  catch (e) { return false; }
+  return true;
+}
+
+function loadSettings() {
+  let saved;
+  try { saved = JSON.parse(localStorage.getItem(SETTINGS_KEY) || 'null'); }
+  catch (e) { return; }
+  if (!saved || typeof saved !== 'object') return;
+  SETTINGS_IDS.forEach(id => {
+    if (!(id in saved)) return;
+    const el = document.getElementById(id);
+    if (!el) return;
+    if (el.type === 'checkbox') el.checked = !!saved[id];
+    else if (saved[id] != null) el.value = saved[id];
+  });
+  // Sliders carry a printed value beside them that does not follow a
+  // programmatic change, so a restored weight would show the old number.
+  syncSliderLabels();
+}
+
+function syncSliderLabels() {
+  weightIds.forEach(id => {
+    const el = document.getElementById(id), out = document.getElementById(id + 'V');
+    if (el && out) out.textContent = el.value;
+  });
+  const rr = document.getElementById('targetRR'), rrOut = document.getElementById('targetRRV');
+  if (rr && rrOut) rrOut.textContent = '1:' + rr.value;
+}
+
+let settingsSaveTimer = null;
+function flagSettingsSaved() {
+  const el = document.getElementById('settingsSavedNote');
+  if (!el) return;
+  el.textContent = 'Settings saved.';
+  el.style.color = '#3ecf8e';
+  clearTimeout(settingsSaveTimer);
+  settingsSaveTimer = setTimeout(() => { el.textContent = ''; }, 2500);
+}
+
+function wireSettingsPersistence() {
+  SETTINGS_IDS.forEach(id => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    const handler = () => { if (saveSettings()) flagSettingsSaved(); };
+    el.addEventListener('change', handler);
+    // Sliders and number spinners fire `input` continuously; `change` alone
+    // would miss a drag that never blurs.
+    if (el.type === 'range' || el.type === 'number') el.addEventListener('input', handler);
+  });
+}
+
+// ============================================================
+// IS THIS TAB STILL RUNNING THE CURRENT CODE?
+// ------------------------------------------------------------
+// This app is built to be left open for days doing unattended analysis, which
+// means a tab can go on running the modules it loaded at open time long after a
+// fix has shipped. That is not hypothetical: the macro engine ran on 1976-2006
+// FRED data, the fix deployed, and an open tab would have carried on producing
+// confident, wrong numbers with nothing on screen to say so.
+//
+// The check compares the ETag of app.js now against the one seen at startup, so
+// it needs no version constant to keep in sync and no build step. `no-store`
+// forces the request past the browser cache; the server already sends
+// must-revalidate, so this is cheap.
+const UPDATE_CHECK_MS = 30 * 60 * 1000;
+let loadedBuildTag = null;
+let updateWatchHandle = null;
+
+async function currentBuildTag() {
+  try {
+    const r = await fetch('app.js', { method: 'HEAD', cache: 'no-store' });
+    return r.headers.get('etag') || r.headers.get('last-modified') || null;
+  } catch (e) {
+    return null; // offline, or the check is blocked — try again next time
+  }
+}
+
+async function checkForNewBuild() {
+  const tag = await currentBuildTag();
+  if (!tag) return;
+  if (loadedBuildTag == null) { loadedBuildTag = tag; return; }
+  if (tag === loadedBuildTag) return;
+  const banner = document.getElementById('updateBanner');
+  if (banner) banner.classList.remove('hidden');
+}
+
+function startUpdateWatch() {
+  const reload = document.getElementById('updateReload');
+  if (reload) reload.addEventListener('click', () => window.location.reload());
+  checkForNewBuild();
+  if (updateWatchHandle) clearInterval(updateWatchHandle);
+  updateWatchHandle = setInterval(checkForNewBuild, UPDATE_CHECK_MS);
+}
+
+async function bootstrap() {
+  // Before anything reads a control: the weights, risk settings and thresholds
+  // have to be the saved ones by the time the first analysis runs.
+  loadSettings();
+  wireSettingsPersistence();
+  await loadLearningState();
+  await loadSignalLog();
+  await loadShadowLog();
+  applyKnowledgeBaseWeights();
+  await loadPaper();
+  await loadKnowledge();
+  await loadCalendarCache();
+  loadAutonomyState();
+  loadQuota();
+  // Every store the merge touches is loaded by this point — the log it merges
+  // into, the paper account it books positions in, the learning state it
+  // updates. Replay anything the worker sent while that was still loading.
+  flushPendingIngest();
+  renderSignalLog();   // first render happened before the paper account loaded
+  startLivenessTicker();
+  startUpdateWatch();
+  startNewsWatch();
+  renderQuota();
+  renderAutonomyStats();
+  renderAnalysisQuality();
+  renderPaper();
+  renderDataInventory();
+  renderCalendar();
+  renderReasoning();
+  renderKnowledge();
+  runAudit();
+  renderAudit();
+  refreshWorkerTotals().then(renderDataInventory);
+  refreshAll();
+
+  const saved = await loadSavedKeys();
+  if (!saved) {
+    document.getElementById('autoBacktestStatus').textContent = 'Connect a data provider to enable auto-backtesting.';
+  } else {
+    document.getElementById('rememberKeysCheckbox').checked = true;
+    if (saved.provider) providerSelect.value = saved.provider;
+    if (saved.fredKey) document.getElementById('fredKeyInput').value = saved.fredKey;
+    if (saved.newsKey) document.getElementById('newsKeyInput').value = saved.newsKey;
+    if (typeof saved.autoBacktest === 'boolean') document.getElementById('autoBacktestCheckbox').checked = saved.autoBacktest;
+    if (saved.apiKey) {
+      document.getElementById('apiKeyInput').value = saved.apiKey;
+      connStatus.textContent = 'Restoring saved connection...';
+      await connectProvider(); // also re-fetches correlation/fundamentals/news with the restored keys
+    } else if (saved.fredKey || saved.newsKey) {
+      // No price provider was connected, but FRED/news keys were saved independently — restore those engines too.
+      await refreshCorrelation(activeProvider, apiKey, saved.fredKey || '');
+      await refreshFundamentals(saved.fredKey || '');
+      await refreshNewsSentiment(saved.newsKey || '');
+      refreshAll();
+      document.getElementById('autoBacktestStatus').textContent = 'Connect a data provider to enable auto-backtesting.';
+    } else {
+      document.getElementById('autoBacktestStatus').textContent = 'Connect a data provider to enable auto-backtesting.';
+    }
+  }
+
+  // The calendar gates trading, so it must be loaded before autonomy's first pass.
+  await refreshCalendar(false);
+  renderCalendar();
+  renderReasoning();
+
+  // Recover anything that resolved while the app was closed, then pick the loop back up.
+  if (autonomy.enabled) {
+    await autonomyCatchUp();
+    startAutonomy();
+  } else {
+    setAutonomyStatus('Off — check the box above to start.', 'idle', '');
+  }
+}
+bootstrap();
+ + fmt(p.entryFill) + ' · SL 
+  }
+
+  const closed = paper.positions.filter(p => p.status === 'closed' && inEra(p)).slice(0, 8);
+  if (closed.length) {
+    html += '<div style="font-size:10px;color:#454a56;margin:10px 0 6px;">Recent closed</div>';
+    html += closed.map(p =>
+      '<div class="zone-item"><span><span class="dirtag ' + p.dir + '">' + p.dir + '</span> ' + (p.outcome === 'won' ? (p.partial ? '◐' : '✓') : p.outcome === 'lost' ? '✗' : '–')
+      + ' <span style="color:#454a56;">' + lotLabel(p) + ' · exit $' + fmt(p.exitPrice) + '</span></span>'
+      + '<span class="mono ' + pnlCls(p.pnl) + '">' + money(p.pnl) + (p.rMultiple != null ? ' <span style="color:#454a56;">' + (p.rMultiple >= 0 ? '+' : '') + fmt(p.rMultiple) + 'R</span>' : '') + '</span></div>'
+    ).join('');
+  }
+
+  if (!resting.length && !open.length && !closed.length) {
+    html += '<div class="zone-empty">' + (a.archivedCount
+      ? 'Account reset — no trades in this era yet. The record above is intact.'
+      : 'No paper trades yet. Positions open automatically as the engine logs signals.') + '</div>';
+  }
+  root.innerHTML = html;
+}
+
+function renderPaperStatusNote() {
+  const note = document.getElementById('paperStatus');
+  if (!note) return;
+  if (!paper.enabled) { note.textContent = 'Off — no positions will be opened.'; return; }
+  note.textContent = paper.manual
+    ? 'On — new signals will open simulated positions. No real orders are placed.'
+    : 'On for the engine\'s own signals. Signals you generate by hand are excluded (signal panel).';
+}
+
+document.getElementById('paperEnabled').addEventListener('change', function () {
+  paper.enabled = this.checked;
+  savePaper();
+  renderPaper();
+  renderPaperStatusNote();
+  renderPaperManualHint();
+});
+
+const paperManualCb = document.getElementById('paperManual');
+if (paperManualCb) paperManualCb.addEventListener('change', function () {
+  paper.manual = this.checked;
+  // Ticking it with the account off is a request to paper-trade, so honour it
+  // rather than silently doing nothing.
+  if (paper.manual && !paper.enabled) {
+    paper.enabled = true;
+    const master = document.getElementById('paperEnabled');
+    if (master) master.checked = true;
+  }
+  savePaper();
+  renderPaper();
+  renderPaperStatusNote();
+  renderPaperManualHint();
+});
+document.getElementById('paperAdvancedToggle').addEventListener('click', () => {
+  document.getElementById('paperAdvanced').classList.toggle('hidden');
+});
+['pStartBalance', 'pRiskPct', 'pSpread', 'pSlippage', 'pMaxPos', 'pPartialPct', 'pHoldMeta', 'pPartialEnabled'].forEach(id => {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener('change', () => { paper.startingBalance = paperConfig().startingBalance; savePaper(); renderPaper(); });
+});
+document.getElementById('paperReset').addEventListener('click', async () => {
+  const price = currentMarkPrice();
+  const live = paper.positions.filter(p => p.status === 'open' || p.status === 'pending').length;
+  const keeping = paper.positions.filter(p => p.status === 'closed').length;
+  const msg = 'Reset the paper account back to $' + fmt(paperConfig().startingBalance) + '?\n\n'
+    + (live ? live + ' live position(s) will be closed at the current price first.\n' : '')
+    + keeping + ' completed trade(s) stay on record — they are what the system learns from, '
+    + 'and they keep counting towards the lifetime win rate. They just stop counting towards the balance.';
+  if (!window.confirm(msg)) return;
+  const out = resetPaperAccount(paper.positions, isFinite(price) ? price : undefined, Date.now());
+  paper.positions = out.positions;
+  paper.epoch = out.epoch;
+  await savePaper();
+  renderPaper();
+  renderDataInventory();
+});
+
+// ============================================================
+// ANALYSIS QUALITY PANEL
+// ------------------------------------------------------------
+// Renders the three self-audits. Every number here is deliberately allowed to
+// say "not enough data yet" rather than show a confident-looking figure built
+// on four trades — a reassuring number from a tiny sample is worse than no
+// number, because it gets believed.
+// ============================================================
+function fmtR(v) { return v == null ? '—' : (v >= 0 ? '+' : '') + v.toFixed(2) + 'R'; }
+function fmtPct(v) { return v == null ? '—' : (v * 100).toFixed(0) + '%'; }
+function rClass(v) { return v == null ? 'fneu' : v > 0.05 ? 'fpos' : v < -0.05 ? 'fneg' : 'fneu'; }
+
+function renderAnalysisQuality() {
+  const root = document.getElementById('qualityContent');
+  if (!root) return;
+
+  const cal = computeCalibration(signalLog);
+  const bd = computeConditionBreakdown(signalLog);
+  const audit = computeGateAudit(signalLog, shadowLog);
+
+  const rows = (list, label) => {
+    const usable = list.filter(r => r.n >= 3);
+    if (!usable.length) return '<div class="zone-empty">' + label + ': not enough resolved trades yet (need 3+ per group).</div>';
+    return usable.map(r =>
+      '<div class="zone-item"><span>' + r.key + ' <span style="color:#454a56;">(' + r.n + ')</span></span>' +
+      '<span class="mono ' + rClass(r.expectancyR) + '">' + fmtR(r.expectancyR) + ' · ' + fmtPct(r.winRate) + '</span></div>'
+    ).join('');
+  };
+
+  const o = bd.overall;
+  let html = '';
+
+  html += '<div class="data-source-note" style="margin-bottom:8px;">Expectancy is shown in R — average profit per unit risked. At a 1:4 target a 30% win rate is already profitable, so win rate alone is a poor scorecard and R is the honest one.</div>';
+
+  html += '<div class="metrics" style="margin-bottom:10px;">'
+    + '<div class="card"><div class="label">Resolved</div><div class="value mono">' + o.n + '</div></div>'
+    + '<div class="card"><div class="label">Win Rate</div><div class="value mono">' + fmtPct(o.winRate) + '</div></div>'
+    + '<div class="card"><div class="label">Expectancy</div><div class="value mono ' + rClass(o.expectancyR) + '">' + fmtR(o.expectancyR) + '</div></div>'
+    + '<div class="card"><div class="label">Total</div><div class="value mono ' + rClass(o.totalR) + '">' + fmtR(o.totalR) + '</div></div>'
+    + '</div>';
+
+  // 1. Is the confidence number worth anything?
+  html += '<div class="panel-title" style="font-size:11px;margin-top:12px;">Is the confidence score meaningful?</div>';
+  html += '<div class="event-line" style="border-left-color:#e8c37a;">' + cal.verdict + '</div>';
+  if (cal.discrimination != null) {
+    html += '<div class="zone-item"><span>High-confidence half vs low-confidence half</span><span class="mono ' + rClass(cal.discrimination) + '">'
+      + (cal.discrimination >= 0 ? '+' : '') + (cal.discrimination * 100).toFixed(0) + ' pp win rate</span></div>';
+  }
+  if (cal.buckets.length) {
+    html += '<table class="factor-table"><tr><th style="text-align:left;color:#5c6270;font-weight:500;">Confidence band</th><th style="color:#5c6270;font-weight:500;">Win rate</th><th style="color:#5c6270;font-weight:500;">Expectancy</th></tr>';
+    html += cal.buckets.map(b =>
+      '<tr><td>' + b.lo + '–' + b.hi + '% <span style="color:#454a56;">(' + b.n + ')</span></td>'
+      + '<td>' + fmtPct(b.winRate) + '</td>'
+      + '<td class="' + rClass(b.expectancyR) + '">' + fmtR(b.expectancyR) + '</td></tr>').join('');
+    html += '</table>';
+  }
+
+  // 2. Where does the edge actually live?
+  html += '<div class="panel-title" style="font-size:11px;margin-top:14px;">Where the edge actually lives</div>';
+  html += '<div style="font-size:10px;color:#454a56;margin-bottom:6px;">By session</div>' + rows(bd.bySession, 'Session');
+  html += '<div style="font-size:10px;color:#454a56;margin:8px 0 6px;">By market regime</div>' + rows(bd.byRegime, 'Regime');
+  html += '<div style="font-size:10px;color:#454a56;margin:8px 0 6px;">By grade</div>' + rows(bd.byGrade, 'Grade');
+  html += '<div style="font-size:10px;color:#454a56;margin:8px 0 6px;">By direction</div>' + rows(bd.byDirection, 'Direction');
+
+  // 3. The roads not taken.
+  html += '<div class="panel-title" style="font-size:11px;margin-top:14px;">The setups it turned down</div>';
+  html += '<div class="data-source-note" style="margin-bottom:6px;">Every setup the filter rejected is tracked and resolved against real price anyway. This is the comparison a human journal can never make, because nobody records their non-trades.</div>';
+  html += '<div class="zone-item"><span>Taken</span><span class="mono ' + rClass(audit.taken.expectancyR) + '">'
+    + fmtR(audit.taken.expectancyR) + ' <span style="color:#454a56;">(' + audit.taken.n + ')</span></span></div>';
+  html += '<div class="zone-item"><span>Declined</span><span class="mono ' + rClass(audit.declined.expectancyR) + '">'
+    + fmtR(audit.declined.expectancyR) + ' <span style="color:#454a56;">(' + audit.declined.n + ')</span></span></div>';
+  const pending = shadowLog.filter(s => s.status === 'pending' || s.status === 'open').length;
+  if (pending) html += '<div class="zone-item"><span>Declined, still running</span><span class="mono">' + pending + '</span></div>';
+  html += '<div class="event-line" style="border-left-color:#c99bff;margin-top:6px;">' + audit.verdict + '</div>';
+
+  root.innerHTML = html;
+}
+document.getElementById('resetQuality').addEventListener('click', async () => {
+  shadowLog = [];
+  await saveShadowLog();
+  renderAnalysisQuality();
+});
+
+// ============================================================
+// AUTONOMOUS MODE
+// ------------------------------------------------------------
+// The unattended operator. Once the user ticks the box, a single heartbeat
+// drives everything: fetch fresh candles, grade any signal that has since hit
+// its stop or target, re-analyse, commit a new signal if the gate clears, and
+// periodically re-backtest and retrain on the record it has built.
+//
+// Three things make this survive real-world conditions rather than only a tab
+// left open on a desk:
+//   * One 60s heartbeat with due-time checks, not a pile of setIntervals. A
+//     laptop that sleeps for six hours wakes up, sees every task is overdue,
+//     and runs them once — rather than firing a backlog of missed timers.
+//   * Losing the connection is expected, not exceptional. Offline is a quiet
+//     pause; repeated failures back off exponentially instead of hammering a
+//     rate-limited provider until the key is blocked.
+//   * Time with the tab closed is recovered, not lost. catchUp() replays the
+//     gap from real candle history on the next load, so signals that resolved
+//     while nobody was watching still become training data.
+// ============================================================
+
+const AUTONOMY_KEY = 'smc-autonomy-v1';
+const AUTONOMY_HEARTBEAT_MS = 60 * 1000;
+
+let autonomyHandle = null;
+let autonomyBusy = false;
+
+function autonomyConfig() {
+  const num = (id, fallback) => {
+    const el = document.getElementById(id);
+    const v = el ? parseFloat(el.value) : NaN;
+    return isFinite(v) ? v : fallback;
+  };
+  return Object.assign({}, AUTONOMY_DEFAULTS, {
+    minConfidence: num('aMinConf', AUTONOMY_DEFAULTS.minConfidence),
+    cooldownMinutes: num('aCooldown', AUTONOMY_DEFAULTS.cooldownMinutes),
+    maxOpenSignals: num('aMaxOpen', AUTONOMY_DEFAULTS.maxOpenSignals),
+    analysisIntervalMinutes: num('aInterval', AUTONOMY_DEFAULTS.analysisIntervalMinutes),
+    backtestIntervalHours: num('aBtHours', AUTONOMY_DEFAULTS.backtestIntervalHours),
+    minMetaScore: num('aMinMeta', AUTONOMY_DEFAULTS.minMetaScore),
+    // Kill switch. 0 in any field disables that arm rather than expiring
+    // everything instantly, which is what a 0 limit would otherwise mean.
+    maxHoursToFill: num('aKillFill', AUTONOMY_DEFAULTS.maxHoursToFill),
+    maxHoursOpen: num('aKillOpen', AUTONOMY_DEFAULTS.maxHoursOpen),
+    maxDriftRToFill: num('aKillDrift', AUTONOMY_DEFAULTS.maxDriftRToFill),
+    partialTP: partialTPConfig(),
+    newsState: currentNewsState(),
+    gradeFloor: (document.getElementById('aMinGrade') || {}).value || AUTONOMY_DEFAULTS.gradeFloor
+  });
+}
+
+function saveAutonomyState() {
+  try {
+    localStorage.setItem(AUTONOMY_KEY, JSON.stringify({
+      enabled: autonomy.enabled,
+      cycles: autonomy.cycles,
+      gateTally: autonomy.gateTally,
+      signalsTaken: autonomy.signalsTaken,
+      autoResolved: autonomy.autoResolved,
+      lastAnalysisAt: autonomy.lastAnalysisAt,
+      lastBacktestAt: autonomy.lastBacktestAt,
+      lastSignalAt: autonomy.lastSignalAt,
+      cfg: {
+        aMinConf: document.getElementById('aMinConf').value,
+        aCooldown: document.getElementById('aCooldown').value,
+        aKillFill: document.getElementById('aKillFill').value,
+        aKillOpen: document.getElementById('aKillOpen').value,
+        aKillDrift: document.getElementById('aKillDrift').value,
+        aMaxOpen: document.getElementById('aMaxOpen').value,
+        aInterval: document.getElementById('aInterval').value,
+        aBtHours: document.getElementById('aBtHours').value,
+        aMinMeta: document.getElementById('aMinMeta').value,
+        aDailyCap: document.getElementById('aDailyCap').value,
+        aMinGrade: document.getElementById('aMinGrade').value
+      }
+    }));
+  } catch (e) { /* storage unavailable — autonomy still works, it just won't remember across reloads */ }
+}
+
+function loadAutonomyState() {
+  try {
+    const raw = localStorage.getItem(AUTONOMY_KEY);
+    if (!raw) return;
+    const saved = JSON.parse(raw);
+    Object.assign(autonomy, {
+      enabled: !!saved.enabled,
+      cycles: saved.cycles || 0,
+      gateTally: saved.gateTally || {},
+      signalsTaken: saved.signalsTaken || 0,
+      autoResolved: saved.autoResolved || 0,
+      lastAnalysisAt: saved.lastAnalysisAt || null,
+      lastBacktestAt: saved.lastBacktestAt || null,
+      lastSignalAt: saved.lastSignalAt || null
+    });
+    if (saved.cfg) {
+      Object.keys(saved.cfg).forEach(id => {
+        const el = document.getElementById(id);
+        if (el && saved.cfg[id] != null) el.value = saved.cfg[id];
+      });
+    }
+    document.getElementById('autonomyEnabled').checked = autonomy.enabled;
+  } catch (e) { /* nothing saved yet */ }
+}
+
+function setAutonomyStatus(text, tone, reason) {
+  const dot = document.getElementById('autonomyDot');
+  const status = document.getElementById('autonomyStatus');
+  const reasonEl = document.getElementById('autonomyReason');
+  if (!status) return;
+  status.textContent = text;
+  const colours = { live: '#3ecf8e', warn: '#ffa726', error: '#ef4d5f', idle: '#454a56' };
+  const c = colours[tone] || colours.idle;
+  dot.style.background = c;
+  dot.style.boxShadow = tone === 'live' ? '0 0 7px ' + c : 'none';
+  status.style.color = tone === 'idle' ? '#9298a5' : c;
+  if (reason !== undefined) reasonEl.textContent = reason || '';
+}
+
+function renderAutonomyStats() {
+  const live = signalLog.filter(s => s.status === 'pending' || s.status === 'open');
+  document.getElementById('aCycles').textContent = autonomy.cycles;
+  document.getElementById('aSignals').textContent = autonomy.signalsTaken;
+  document.getElementById('aResolved').textContent = autonomy.autoResolved;
+  document.getElementById('aOpen').textContent = live.length;
+
+  const killedEl = document.getElementById('aKilled');
+  if (killedEl) killedEl.textContent = signalLog.filter(s => s.status === 'expired').length;
+
+  // How long the oldest live trade has been sitting. This is the number that
+  // was invisible before: an order resting for a day looked identical to one
+  // placed a minute ago.
+  const oldestEl = document.getElementById('aOldest');
+  if (oldestEl) {
+    const cfg = autonomyConfig();
+    // Each trade is aged against the limit that actually applies to it: a
+    // resting order against the fill limit, a filled one against the hold
+    // limit. Using the larger of the two would leave an order 2.5x past its own
+    // deadline showing no warning at all.
+    const ages = live.map(s => {
+      const filled = s.status === 'open';
+      const t = Date.parse(filled ? (s.filledAt || s.time) : s.time);
+      if (!isFinite(t)) return null;
+      const hours = (Date.now() - t) / 3600000;
+      const limit = filled ? cfg.maxHoursOpen : cfg.maxHoursToFill;
+      return { hours, ratio: limit > 0 ? hours / limit : 0 };
+    }).filter(v => v != null);
+    if (!ages.length) {
+      oldestEl.textContent = '—';
+      oldestEl.style.color = '';
+    } else {
+      const worst = ages.reduce((a, b) => b.hours > a.hours ? b : a, ages[0]);
+      const closest = ages.reduce((a, b) => b.ratio > a.ratio ? b : a, ages[0]);
+      oldestEl.textContent = worst.hours < 1 ? Math.round(worst.hours * 60) + 'm' : worst.hours.toFixed(1) + 'h';
+      // Amber as a trade approaches its own kill limit, red once past it, so
+      // one about to be culled is visible before it disappears.
+      oldestEl.style.color = closest.ratio >= 1 ? '#ef4d5f' : closest.ratio >= 0.75 ? '#ffa726' : '';
+    }
+  }
+
+  const el = document.getElementById('gateTally');
+  if (!el) return;
+  const entries = Object.keys(autonomy.gateTally || {})
+    .map(k => ({ code: k, n: autonomy.gateTally[k] }))
+    .sort((a, b) => b.n - a.n);
+  if (!entries.length) { el.innerHTML = ''; return; }
+  el.innerHTML = '<div style="font-size:10px;color:#454a56;margin:8px 0 4px;">Why cycles ended this way</div>'
+    + entries.map(e => '<div class="zone-item" style="padding:3px 0;"><span style="font-size:11px;">'
+        + (GATE_LABELS[e.code] || e.code) + '</span><span class="mono" style="font-size:11px;color:'
+        + (e.code === 'taken' ? '#3ecf8e' : '#5c6270') + ';">' + e.n + '</span></div>').join('');
+}
+
+// Grade every unresolved signal against `candles`. Used both by the heartbeat
+// (fresh candles each cycle) and by catchUp() (deep history after downtime).
+// Returns how many signals reached a win/loss verdict.
+function resolveOpenSignals(candles, cfg) {
+  if (!candles || candles.length < 2) return 0;
+  let resolved = 0, killed = 0, changed = false;
+
+  // The auditor decides which live trades are past saving, not the engine.
+  // Letting the engine judge whether its own trade has gone bad is the thing
+  // the auditor exists to avoid — and it re-derives fill state from raw candles
+  // rather than trusting the signal's own status, so a "pending" order price
+  // actually traded through is caught rather than aged as if it never filled.
+  const tradeAudit = auditOpenTrades(signalLog, candles, {
+    maxHoursToFill: cfg.maxHoursToFill,
+    maxHoursOpen: cfg.maxHoursOpen,
+    maxDriftRToFill: cfg.maxDriftRToFill
+  });
+  lastTradeAudit = tradeAudit;
+  const killedBy = new Map(tradeAudit.kills.map(k => [k.id, k]));
+
+  signalLog.forEach(sig => {
+    if (sig.status !== 'pending' && sig.status !== 'open') return;
+    // An auditor kill outranks whatever the resolver would have said, EXCEPT
+    // when price has already settled the trade: a stop or target that has
+    // genuinely been hit is a real outcome and real evidence, and discarding it
+    // to enforce a time limit would throw away the data the limit exists to
+    // protect.
+    const verdict = resolveSignal(sig, candles, cfg);
+    const kill = killedBy.get(sig.id);
+    if (kill && verdict.status !== 'won' && verdict.status !== 'lost') {
+      sig.status = 'expired';
+      sig.expiryReason = 'auditor: ' + kill.reason;
+      sig.killSwitch = kill.code;
+      sig.resolvedAt = new Date().toISOString();
+      sig.resolvedBy = 'auditor';
+      paperCloseForSignal(sig.id, 'expired');
+      killed++; changed = true;
+      return;
+    }
+    if (verdict.status === 'won' || verdict.status === 'lost') {
+      if (applySignalOutcome(sig, verdict.status === 'won', {
+        auto: true, exitPrice: verdict.exitPrice, ambiguousBar: verdict.ambiguousBar, partial: verdict.partial
+      })) { resolved++; changed = true; }
+    } else if (verdict.status === 'expired') {
+      sig.status = 'expired';
+      sig.expiryReason = verdict.reason || null;
+      sig.killSwitch = verdict.killSwitch || null;
+      sig.resolvedAt = new Date().toISOString();
+      sig.resolvedBy = 'auto';
+      paperCloseForSignal(sig.id, 'expired');
+      if (verdict.killSwitch) killed++;
+      changed = true; // expired signals never become training data — no outcome to learn from
+    } else if (verdict.status === 'open' && sig.status === 'pending') {
+      sig.status = 'open'; // limit entry got tagged; it's a live position now
+      sig.filledAt = new Date().toISOString();
+      paperFillForSignal(sig.id, sig.filledAt);
+      changed = true;
+    }
+  });
+  if (changed) { saveSignalLog(); renderSignalLog(); }
+  if (resolved) autonomy.autoResolved += resolved;
+  if (killed) autonomy.killed = (autonomy.killed || 0) + killed;
+  resolveShadowSignals(candles, cfg);
+  return resolved;
+}
+
+// Shadows get the same treatment, minus the learning updates — a setup the
+// engine declined should inform the audit, not train the weights as though it
+// had been traded.
+function resolveShadowSignals(candles, cfg) {
+  if (!candles || candles.length < 2 || !shadowLog.length) return;
+  let changed = false;
+  shadowLog.forEach(sig => {
+    if (sig.status !== 'pending' && sig.status !== 'open') return;
+    const verdict = resolveSignal(sig, candles, cfg);
+    if (verdict.status === 'won' || verdict.status === 'lost') {
+      sig.status = verdict.status;
+      sig.resolvedAt = new Date().toISOString();
+      changed = true;
+    } else if (verdict.status === 'expired') {
+      sig.status = 'expired'; sig.expiryReason = verdict.reason || null; changed = true;
+    } else if (verdict.status === 'open' && sig.status === 'pending') {
+      sig.status = 'open'; changed = true;
+    }
+  });
+  if (changed) { saveShadowLog(); renderAnalysisQuality(); }
+}
+
+// One unattended pass. Everything that can fail is inside the caller's try.
+async function autonomyCycle() {
+  const cfg = autonomyConfig();
+  const now = Date.now();
+
+  // 0. Calendar first. It gates whether a signal may be taken at all, so it has
+  // to be current BEFORE the gate reads it — refreshing at the end of the cycle
+  // meant the first pass after a reconnect ran against an empty calendar and
+  // could take a position straight into a release window.
+  await refreshCalendar(false);
+
+  // 1. Fresh candles. resyncCandles() already refreshes liveData from the provider.
+  await resyncCandles();
+
+  // 2. Grade what the market has already decided since the last pass.
+  const graded = resolveOpenSignals(liveData, cfg);
+
+  // 3. Re-analyse on the new data.
+  refreshAll();
+  autonomy.lastAnalysisAt = now;
+
+  // 4. Commit a signal only if the gate clears.
+  let reason;
+  if (lastComposite) {
+    const plan = buildTradePlan(lastComposite, getTargetRR());
+    // The auditor is advisory everywhere except here. A critical finding means
+    // the analysis contradicts itself or the data it was built on — that is not
+    // a risk preference, and no confidence score should be able to override it.
+    const audit = runAudit();
+    renderAudit();
+    let gate;
+    if (audit && audit.blocking) {
+      gate = { take: false, code: 'audit',
+        reason: 'independent audit found ' + audit.critical + ' critical issue(s): ' + audit.findings[0].title };
+    } else {
+      gate = autonomyGate(lastComposite, plan, signalLog, autonomy.lastSignalAt, cfg);
+    }
+    // Tally why each cycle ended as it did. One latest-reason line cannot show
+    // whether 13 quiet cycles mean "no setup existed" or "the filter blocked
+    // every one" — and those need opposite responses.
+    const code = gate.code || 'unknown';
+    autonomy.gateTally[code] = (autonomy.gateTally[code] || 0) + 1;
+    if (gate.take) {
+      updateSignalUI(lastComposite, plan, true, 'auto'); // logIt = true -> addSignalToLog
+      autonomy.signalsTaken++;
+      autonomy.lastSignalAt = now;
+      reason = 'Took a ' + lastComposite.direction + ' at $' + fmt(plan.entry) +
+               ' (' + lastComposite.confidence + '% confidence' + (gate.grade ? ', grade ' + gate.grade : '') + ').';
+    } else {
+      updateSignalUI(lastComposite, plan, false); // keep the panel current without logging
+      // Track what was passed on, so the filter can be audited later rather
+      // than trusted forever.
+      addShadowSignal(lastComposite, plan, gate.reason);
+      reason = 'No signal taken — ' + gate.reason + '.';
+    }
+  } else {
+    reason = 'Analysis produced no result this cycle.';
+  }
+  if (graded) reason = 'Self-graded ' + graded + ' signal' + (graded === 1 ? '' : 's') + '. ' + reason;
+  autonomy.lastReason = reason;
+
+  // 5. Periodic re-backtest / retrain on the accumulated record.
+  const btDue = !autonomy.lastBacktestAt || (now - autonomy.lastBacktestAt) >= cfg.backtestIntervalHours * 3600 * 1000;
+  if (btDue) {
+    autonomy.lastBacktestAt = now;
+    await runBacktestCycle(true);
+  }
+
+  renderAnalysisQuality();
+  renderDataInventory();
+  renderCalendar();
+  renderReasoning();
+  runAudit();
+  renderAudit();
+  autonomy.cycles++;
+  autonomy.consecutiveErrors = 0;
+  autonomy.lastError = null;
+  saveAutonomyState();
+  renderAutonomyStats();
+  if (candlesStaleForBudget) {
+    setAutonomyStatus('Running on cached candles — daily API budget spent, resumes 00:00 UTC.', 'warn',
+      'Still grading open signals and re-analysing, but on the last candles fetched rather than fresh ones. ' + reason);
+  } else {
+    setAutonomyStatus('Running autonomously — last pass ' + new Date(now).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) + '.', 'live', reason);
+  }
+}
+
+// The heartbeat: decides whether a cycle is due, and handles every reason it
+// might not be. Deliberately does no analysis itself.
+async function autonomyHeartbeat() {
+  if (!autonomy.enabled || autonomyBusy) return;
+
+  if (!navigator.onLine) {
+    setAutonomyStatus('Paused — no internet connection. Resumes automatically.', 'warn',
+      'Nothing is lost while offline; the gap gets replayed from candle history once the connection is back.');
+    return;
+  }
+  if (dataMode !== 'live') {
+    setAutonomyStatus('Waiting for a live data provider — connect an API key above.', 'warn',
+      'Autonomous mode needs real candles; it will not run on the simulated feed.');
+    return;
+  }
+  // Gold is shut from Friday ~21:00 UTC to Sunday ~22:00 UTC. Analysing a frozen
+  // feed produces confident-looking signals off Friday's last bar, and every one
+  // of them enters the learning record as a real read of a market that was not
+  // trading. Nothing to analyse, so nothing runs.
+  if (!isMarketOpen(Date.now())) {
+    const clock = marketClock(Date.now());
+    const h = clock.hoursUntilOpen;
+    setAutonomyStatus('Market closed — resumes when gold reopens in ' +
+      (h < 1 ? Math.round(h * 60) + 'm' : h.toFixed(1) + 'h') + '.', 'warn',
+      'The feed is frozen at Friday\u2019s close. Analysing it would generate signals from a market that is not trading.');
+    return;
+  }
+  if (autonomy.skipCycles > 0) {
+    autonomy.skipCycles--;
+    setAutonomyStatus('Backing off after an error — retrying in ' + (autonomy.skipCycles + 1) + ' min.', 'warn', autonomy.lastError);
+    return;
+  }
+
+  const cfg = autonomyConfig();
+  const dueAt = (autonomy.lastAnalysisAt || 0) + cfg.analysisIntervalMinutes * 60 * 1000;
+  if (Date.now() < dueAt) {
+    const mins = Math.ceil((dueAt - Date.now()) / 60000);
+    setAutonomyStatus('Running autonomously — next pass in ' + mins + ' min.', 'live', autonomy.lastReason);
+    return;
+  }
+
+  autonomyBusy = true;
+  try {
+    await autonomyCycle();
+  } catch (e) {
+    autonomy.consecutiveErrors++;
+    autonomy.lastError = (e && e.message) || String(e);
+    // Exponential backoff, capped at ~30 min. A rate-limited or expired key
+    // should not turn into a request every minute for the rest of the day.
+    autonomy.skipCycles = Math.min(Math.pow(2, autonomy.consecutiveErrors), 30);
+    setAutonomyStatus('Cycle failed (' + autonomy.consecutiveErrors + ' in a row) — backing off ' + autonomy.skipCycles + ' min.', 'error', autonomy.lastError);
+    saveAutonomyState();
+  } finally {
+    autonomyBusy = false;
+  }
+}
+
+// Replay the time the app was closed or disconnected. Pulls the deepest history
+// the provider allows and grades every still-open signal against it, so a signal
+// that hit its target overnight is training data by the time the user looks.
+async function autonomyCatchUp() {
+  if (dataMode !== 'live' || !navigator.onLine) return;
+  const stillOpen = signalLog.filter(s => s.status === 'pending' || s.status === 'open');
+  if (!stillOpen.length) return;
+  setAutonomyStatus('Catching up — replaying ' + stillOpen.length + ' unresolved signal(s) against real history…', 'warn', '');
+  try {
+    const history = await PROVIDERS[activeProvider].timeSeries(apiKey, LIVE_INTERVAL, 5000);
+    const n = resolveOpenSignals(history, autonomyConfig());
+    renderAutonomyStats();
+    saveAutonomyState();
+    setAutonomyStatus('Catch-up complete.', autonomy.enabled ? 'live' : 'idle',
+      n ? 'Graded ' + n + ' signal(s) that resolved while the app was closed.'
+        : 'No signals had resolved while the app was closed.');
+  } catch (e) {
+    // Not fatal — the regular heartbeat will keep trying against live candles.
+    setAutonomyStatus('Catch-up could not fetch history — continuing on live candles.', 'warn', (e && e.message) || String(e));
+  }
+}
+
+function startAutonomy() {
+  if (autonomyHandle) clearInterval(autonomyHandle);
+  autonomyHandle = setInterval(autonomyHeartbeat, AUTONOMY_HEARTBEAT_MS);
+  autonomy.skipCycles = 0;
+  autonomy.consecutiveErrors = 0;
+  setAutonomyStatus('Autonomous mode on — first pass starting…', 'live', '');
+  autonomy.lastAnalysisAt = null; // force an immediate first pass
+  autonomyHeartbeat();
+}
+
+function stopAutonomy() {
+  if (autonomyHandle) { clearInterval(autonomyHandle); autonomyHandle = null; }
+  setAutonomyStatus('Off — check the box above to start.', 'idle', '');
+}
+
+document.getElementById('autonomyEnabled').addEventListener('change', function () {
+  autonomy.enabled = this.checked;
+  saveAutonomyState();
+  if (autonomy.enabled) startAutonomy(); else stopAutonomy();
+});
+providerSelect.addEventListener('change', renderQuota);
+const umm = document.getElementById('useMacroModel');
+if (umm) umm.addEventListener('change', () => { renderKnowledge(); renderReasoning(); });
+
+// A posture for building up a record rather than protecting capital. The engine
+// learns from resolved trades, and at the default B floor a ranging market
+// simply never qualifies — so a cautious setup collects nothing and the
+// knowledge base never starts.
+document.getElementById('aPresetCollect').addEventListener('click', () => {
+  // D, not C: even a perfect five-timeframe alignment only scores ~49%, so a C
+  // floor (>=30%) still rejects ordinary conditions and collects almost nothing.
+  document.getElementById('aMinGrade').value = 'D';
+  document.getElementById('aMinConf').value = 15;
+  document.getElementById('aCooldown').value = 30;
+  document.getElementById('aMaxOpen').value = 5;
+  document.getElementById('aMinMeta').value = -0.5;
+  saveAutonomyState();
+  autonomy.lastAnalysisAt = null; // re-evaluate immediately under the new thresholds
+  setAutonomyStatus('Data-collection thresholds applied — re-evaluating now.', 'live', '');
+  autonomyHeartbeat();
+});
+document.getElementById('autonomyAdvancedToggle').addEventListener('click', () => {
+  document.getElementById('autonomyAdvanced').classList.toggle('hidden');
+});
+['aMinConf', 'aCooldown', 'aMaxOpen', 'aInterval', 'aBtHours', 'aMinMeta', 'aDailyCap', 'aMinGrade',
+ 'aKillFill', 'aKillOpen', 'aKillDrift'].forEach(id => {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener('change', () => { saveAutonomyState(); renderQuota(); });
+});
+
+// React to connectivity changes straight away rather than waiting out a heartbeat.
+window.addEventListener('online', () => {
+  if (!autonomy.enabled) return;
+  autonomy.skipCycles = 0;
+  autonomy.consecutiveErrors = 0;
+  setAutonomyStatus('Back online — catching up…', 'warn', '');
+  autonomyCatchUp().then(autonomyHeartbeat);
+});
+window.addEventListener('offline', () => {
+  if (autonomy.enabled) setAutonomyStatus('Paused — no internet connection. Resumes automatically.', 'warn', '');
+});
+// Coming back to a backgrounded tab is a good moment to check for missed work:
+// mobile browsers in particular throttle timers hard once a tab is hidden.
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && autonomy.enabled) autonomyHeartbeat();
+});
+
+// ============================================================
+// BOOTSTRAP
+// ------------------------------------------------------------
+// Ordering matters here, which is why it is one explicit sequence rather than
+// scattered top-level calls: persisted learning state has to be restored (and
+// its weights applied) before the first analysis, and every DOM const further
+// up this file has to exist before anything reads it.
+// ============================================================
+// ============================================================
+// SETTINGS THAT SURVIVE A RELOAD
+// ------------------------------------------------------------
+// Only the paper account's balance and the autonomy thresholds were ever
+// persisted. Everything else a person could change — risk per trade, spread,
+// slippage, max concurrent, the partial-take-profit rules, all fourteen factor
+// weights, the target R:R, every backtest parameter, the news-window settings —
+// was read straight off the DOM and lost the moment the page reloaded. Tuning
+// the system was therefore something you had to redo from memory each session,
+// and an autonomous run would quietly revert to defaults after any refresh.
+//
+// One store, one list, restored before the first analysis so the weights are in
+// force when it runs. Ids that already have an owner are deliberately absent —
+// autonomy keeps its own (AUTONOMY_KEY), the paper on/off switches live with the
+// account, and the API keys are opt-in through "remember keys" rather than
+// swept up here.
+const SETTINGS_KEY = 'smc-settings-v1';
+const SETTINGS_IDS = [
+  // paper account
+  'pStartBalance', 'pRiskPct', 'pSpread', 'pSlippage', 'pMaxPos',
+  'pSizingMode', 'pFixedLots', 'pContractSize', 'pLotStep', 'pMinLots',
+  'pPartialPct', 'pHoldMeta', 'pPartialEnabled',
+  // factor weights
+  'wWeekly', 'wDaily', 'wHtf', 'wMtf', 'wLtf', 'wOb', 'wFvg', 'wLiq',
+  'wPd', 'wPriceAction', 'wClassic', 'wCorrelation', 'wFundamental', 'wNews',
+  // signal + backtest
+  'targetRR', 'pBars', 'pCapital', 'pRisk', 'pCostPips', 'pMinConf', 'pTargetRR',
+  // news window and macro model
+  'newsBeforeMin', 'newsAfterMin', 'newsBlockEnabled', 'newsBlockMedium',
+  'newsFlattenEnabled', 'newsFlattenMin', 'newsAlertMin', 'useMacroModel',
+  'weekendFlattenEnabled', 'weekendFlattenMin'
+];
+
+function saveSettings() {
+  const out = {};
+  SETTINGS_IDS.forEach(id => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    out[id] = el.type === 'checkbox' ? !!el.checked : el.value;
+  });
+  try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(out)); }
+  catch (e) { return false; }
+  return true;
+}
+
+function loadSettings() {
+  let saved;
+  try { saved = JSON.parse(localStorage.getItem(SETTINGS_KEY) || 'null'); }
+  catch (e) { return; }
+  if (!saved || typeof saved !== 'object') return;
+  SETTINGS_IDS.forEach(id => {
+    if (!(id in saved)) return;
+    const el = document.getElementById(id);
+    if (!el) return;
+    if (el.type === 'checkbox') el.checked = !!saved[id];
+    else if (saved[id] != null) el.value = saved[id];
+  });
+  // Sliders carry a printed value beside them that does not follow a
+  // programmatic change, so a restored weight would show the old number.
+  syncSliderLabels();
+}
+
+function syncSliderLabels() {
+  weightIds.forEach(id => {
+    const el = document.getElementById(id), out = document.getElementById(id + 'V');
+    if (el && out) out.textContent = el.value;
+  });
+  const rr = document.getElementById('targetRR'), rrOut = document.getElementById('targetRRV');
+  if (rr && rrOut) rrOut.textContent = '1:' + rr.value;
+}
+
+let settingsSaveTimer = null;
+function flagSettingsSaved() {
+  const el = document.getElementById('settingsSavedNote');
+  if (!el) return;
+  el.textContent = 'Settings saved.';
+  el.style.color = '#3ecf8e';
+  clearTimeout(settingsSaveTimer);
+  settingsSaveTimer = setTimeout(() => { el.textContent = ''; }, 2500);
+}
+
+function wireSettingsPersistence() {
+  SETTINGS_IDS.forEach(id => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    const handler = () => { if (saveSettings()) flagSettingsSaved(); };
+    el.addEventListener('change', handler);
+    // Sliders and number spinners fire `input` continuously; `change` alone
+    // would miss a drag that never blurs.
+    if (el.type === 'range' || el.type === 'number') el.addEventListener('input', handler);
+  });
+}
+
+// ============================================================
+// IS THIS TAB STILL RUNNING THE CURRENT CODE?
+// ------------------------------------------------------------
+// This app is built to be left open for days doing unattended analysis, which
+// means a tab can go on running the modules it loaded at open time long after a
+// fix has shipped. That is not hypothetical: the macro engine ran on 1976-2006
+// FRED data, the fix deployed, and an open tab would have carried on producing
+// confident, wrong numbers with nothing on screen to say so.
+//
+// The check compares the ETag of app.js now against the one seen at startup, so
+// it needs no version constant to keep in sync and no build step. `no-store`
+// forces the request past the browser cache; the server already sends
+// must-revalidate, so this is cheap.
+const UPDATE_CHECK_MS = 30 * 60 * 1000;
+let loadedBuildTag = null;
+let updateWatchHandle = null;
+
+async function currentBuildTag() {
+  try {
+    const r = await fetch('app.js', { method: 'HEAD', cache: 'no-store' });
+    return r.headers.get('etag') || r.headers.get('last-modified') || null;
+  } catch (e) {
+    return null; // offline, or the check is blocked — try again next time
+  }
+}
+
+async function checkForNewBuild() {
+  const tag = await currentBuildTag();
+  if (!tag) return;
+  if (loadedBuildTag == null) { loadedBuildTag = tag; return; }
+  if (tag === loadedBuildTag) return;
+  const banner = document.getElementById('updateBanner');
+  if (banner) banner.classList.remove('hidden');
+}
+
+function startUpdateWatch() {
+  const reload = document.getElementById('updateReload');
+  if (reload) reload.addEventListener('click', () => window.location.reload());
+  checkForNewBuild();
+  if (updateWatchHandle) clearInterval(updateWatchHandle);
+  updateWatchHandle = setInterval(checkForNewBuild, UPDATE_CHECK_MS);
+}
+
+async function bootstrap() {
+  // Before anything reads a control: the weights, risk settings and thresholds
+  // have to be the saved ones by the time the first analysis runs.
+  loadSettings();
+  wireSettingsPersistence();
+  await loadLearningState();
+  await loadSignalLog();
+  await loadShadowLog();
+  applyKnowledgeBaseWeights();
+  await loadPaper();
+  await loadKnowledge();
+  await loadCalendarCache();
+  loadAutonomyState();
+  loadQuota();
+  // Every store the merge touches is loaded by this point — the log it merges
+  // into, the paper account it books positions in, the learning state it
+  // updates. Replay anything the worker sent while that was still loading.
+  flushPendingIngest();
+  renderSignalLog();   // first render happened before the paper account loaded
+  startLivenessTicker();
+  startUpdateWatch();
+  startNewsWatch();
+  renderQuota();
+  renderAutonomyStats();
+  renderAnalysisQuality();
+  renderPaper();
+  renderDataInventory();
+  renderCalendar();
+  renderReasoning();
+  renderKnowledge();
+  runAudit();
+  renderAudit();
+  refreshWorkerTotals().then(renderDataInventory);
+  refreshAll();
+
+  const saved = await loadSavedKeys();
+  if (!saved) {
+    document.getElementById('autoBacktestStatus').textContent = 'Connect a data provider to enable auto-backtesting.';
+  } else {
+    document.getElementById('rememberKeysCheckbox').checked = true;
+    if (saved.provider) providerSelect.value = saved.provider;
+    if (saved.fredKey) document.getElementById('fredKeyInput').value = saved.fredKey;
+    if (saved.newsKey) document.getElementById('newsKeyInput').value = saved.newsKey;
+    if (typeof saved.autoBacktest === 'boolean') document.getElementById('autoBacktestCheckbox').checked = saved.autoBacktest;
+    if (saved.apiKey) {
+      document.getElementById('apiKeyInput').value = saved.apiKey;
+      connStatus.textContent = 'Restoring saved connection...';
+      await connectProvider(); // also re-fetches correlation/fundamentals/news with the restored keys
+    } else if (saved.fredKey || saved.newsKey) {
+      // No price provider was connected, but FRED/news keys were saved independently — restore those engines too.
+      await refreshCorrelation(activeProvider, apiKey, saved.fredKey || '');
+      await refreshFundamentals(saved.fredKey || '');
+      await refreshNewsSentiment(saved.newsKey || '');
+      refreshAll();
+      document.getElementById('autoBacktestStatus').textContent = 'Connect a data provider to enable auto-backtesting.';
+    } else {
+      document.getElementById('autoBacktestStatus').textContent = 'Connect a data provider to enable auto-backtesting.';
+    }
+  }
+
+  // The calendar gates trading, so it must be loaded before autonomy's first pass.
+  await refreshCalendar(false);
+  renderCalendar();
+  renderReasoning();
+
+  // Recover anything that resolved while the app was closed, then pick the loop back up.
+  if (autonomy.enabled) {
+    await autonomyCatchUp();
+    startAutonomy();
+  } else {
+    setAutonomyStatus('Off — check the box above to start.', 'idle', '');
+  }
+}
+bootstrap();
+ + fmt(p.sl) + ' · TP 
+  }
+
+  const closed = paper.positions.filter(p => p.status === 'closed' && inEra(p)).slice(0, 8);
+  if (closed.length) {
+    html += '<div style="font-size:10px;color:#454a56;margin:10px 0 6px;">Recent closed</div>';
+    html += closed.map(p =>
+      '<div class="zone-item"><span><span class="dirtag ' + p.dir + '">' + p.dir + '</span> ' + (p.outcome === 'won' ? (p.partial ? '◐' : '✓') : p.outcome === 'lost' ? '✗' : '–')
+      + ' <span style="color:#454a56;">' + lotLabel(p) + ' · exit $' + fmt(p.exitPrice) + '</span></span>'
+      + '<span class="mono ' + pnlCls(p.pnl) + '">' + money(p.pnl) + (p.rMultiple != null ? ' <span style="color:#454a56;">' + (p.rMultiple >= 0 ? '+' : '') + fmt(p.rMultiple) + 'R</span>' : '') + '</span></div>'
+    ).join('');
+  }
+
+  if (!resting.length && !open.length && !closed.length) {
+    html += '<div class="zone-empty">' + (a.archivedCount
+      ? 'Account reset — no trades in this era yet. The record above is intact.'
+      : 'No paper trades yet. Positions open automatically as the engine logs signals.') + '</div>';
+  }
+  root.innerHTML = html;
+}
+
+function renderPaperStatusNote() {
+  const note = document.getElementById('paperStatus');
+  if (!note) return;
+  if (!paper.enabled) { note.textContent = 'Off — no positions will be opened.'; return; }
+  note.textContent = paper.manual
+    ? 'On — new signals will open simulated positions. No real orders are placed.'
+    : 'On for the engine\'s own signals. Signals you generate by hand are excluded (signal panel).';
+}
+
+document.getElementById('paperEnabled').addEventListener('change', function () {
+  paper.enabled = this.checked;
+  savePaper();
+  renderPaper();
+  renderPaperStatusNote();
+  renderPaperManualHint();
+});
+
+const paperManualCb = document.getElementById('paperManual');
+if (paperManualCb) paperManualCb.addEventListener('change', function () {
+  paper.manual = this.checked;
+  // Ticking it with the account off is a request to paper-trade, so honour it
+  // rather than silently doing nothing.
+  if (paper.manual && !paper.enabled) {
+    paper.enabled = true;
+    const master = document.getElementById('paperEnabled');
+    if (master) master.checked = true;
+  }
+  savePaper();
+  renderPaper();
+  renderPaperStatusNote();
+  renderPaperManualHint();
+});
+document.getElementById('paperAdvancedToggle').addEventListener('click', () => {
+  document.getElementById('paperAdvanced').classList.toggle('hidden');
+});
+['pStartBalance', 'pRiskPct', 'pSpread', 'pSlippage', 'pMaxPos', 'pPartialPct', 'pHoldMeta', 'pPartialEnabled'].forEach(id => {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener('change', () => { paper.startingBalance = paperConfig().startingBalance; savePaper(); renderPaper(); });
+});
+document.getElementById('paperReset').addEventListener('click', async () => {
+  const price = currentMarkPrice();
+  const live = paper.positions.filter(p => p.status === 'open' || p.status === 'pending').length;
+  const keeping = paper.positions.filter(p => p.status === 'closed').length;
+  const msg = 'Reset the paper account back to $' + fmt(paperConfig().startingBalance) + '?\n\n'
+    + (live ? live + ' live position(s) will be closed at the current price first.\n' : '')
+    + keeping + ' completed trade(s) stay on record — they are what the system learns from, '
+    + 'and they keep counting towards the lifetime win rate. They just stop counting towards the balance.';
+  if (!window.confirm(msg)) return;
+  const out = resetPaperAccount(paper.positions, isFinite(price) ? price : undefined, Date.now());
+  paper.positions = out.positions;
+  paper.epoch = out.epoch;
+  await savePaper();
+  renderPaper();
+  renderDataInventory();
+});
+
+// ============================================================
+// ANALYSIS QUALITY PANEL
+// ------------------------------------------------------------
+// Renders the three self-audits. Every number here is deliberately allowed to
+// say "not enough data yet" rather than show a confident-looking figure built
+// on four trades — a reassuring number from a tiny sample is worse than no
+// number, because it gets believed.
+// ============================================================
+function fmtR(v) { return v == null ? '—' : (v >= 0 ? '+' : '') + v.toFixed(2) + 'R'; }
+function fmtPct(v) { return v == null ? '—' : (v * 100).toFixed(0) + '%'; }
+function rClass(v) { return v == null ? 'fneu' : v > 0.05 ? 'fpos' : v < -0.05 ? 'fneg' : 'fneu'; }
+
+function renderAnalysisQuality() {
+  const root = document.getElementById('qualityContent');
+  if (!root) return;
+
+  const cal = computeCalibration(signalLog);
+  const bd = computeConditionBreakdown(signalLog);
+  const audit = computeGateAudit(signalLog, shadowLog);
+
+  const rows = (list, label) => {
+    const usable = list.filter(r => r.n >= 3);
+    if (!usable.length) return '<div class="zone-empty">' + label + ': not enough resolved trades yet (need 3+ per group).</div>';
+    return usable.map(r =>
+      '<div class="zone-item"><span>' + r.key + ' <span style="color:#454a56;">(' + r.n + ')</span></span>' +
+      '<span class="mono ' + rClass(r.expectancyR) + '">' + fmtR(r.expectancyR) + ' · ' + fmtPct(r.winRate) + '</span></div>'
+    ).join('');
+  };
+
+  const o = bd.overall;
+  let html = '';
+
+  html += '<div class="data-source-note" style="margin-bottom:8px;">Expectancy is shown in R — average profit per unit risked. At a 1:4 target a 30% win rate is already profitable, so win rate alone is a poor scorecard and R is the honest one.</div>';
+
+  html += '<div class="metrics" style="margin-bottom:10px;">'
+    + '<div class="card"><div class="label">Resolved</div><div class="value mono">' + o.n + '</div></div>'
+    + '<div class="card"><div class="label">Win Rate</div><div class="value mono">' + fmtPct(o.winRate) + '</div></div>'
+    + '<div class="card"><div class="label">Expectancy</div><div class="value mono ' + rClass(o.expectancyR) + '">' + fmtR(o.expectancyR) + '</div></div>'
+    + '<div class="card"><div class="label">Total</div><div class="value mono ' + rClass(o.totalR) + '">' + fmtR(o.totalR) + '</div></div>'
+    + '</div>';
+
+  // 1. Is the confidence number worth anything?
+  html += '<div class="panel-title" style="font-size:11px;margin-top:12px;">Is the confidence score meaningful?</div>';
+  html += '<div class="event-line" style="border-left-color:#e8c37a;">' + cal.verdict + '</div>';
+  if (cal.discrimination != null) {
+    html += '<div class="zone-item"><span>High-confidence half vs low-confidence half</span><span class="mono ' + rClass(cal.discrimination) + '">'
+      + (cal.discrimination >= 0 ? '+' : '') + (cal.discrimination * 100).toFixed(0) + ' pp win rate</span></div>';
+  }
+  if (cal.buckets.length) {
+    html += '<table class="factor-table"><tr><th style="text-align:left;color:#5c6270;font-weight:500;">Confidence band</th><th style="color:#5c6270;font-weight:500;">Win rate</th><th style="color:#5c6270;font-weight:500;">Expectancy</th></tr>';
+    html += cal.buckets.map(b =>
+      '<tr><td>' + b.lo + '–' + b.hi + '% <span style="color:#454a56;">(' + b.n + ')</span></td>'
+      + '<td>' + fmtPct(b.winRate) + '</td>'
+      + '<td class="' + rClass(b.expectancyR) + '">' + fmtR(b.expectancyR) + '</td></tr>').join('');
+    html += '</table>';
+  }
+
+  // 2. Where does the edge actually live?
+  html += '<div class="panel-title" style="font-size:11px;margin-top:14px;">Where the edge actually lives</div>';
+  html += '<div style="font-size:10px;color:#454a56;margin-bottom:6px;">By session</div>' + rows(bd.bySession, 'Session');
+  html += '<div style="font-size:10px;color:#454a56;margin:8px 0 6px;">By market regime</div>' + rows(bd.byRegime, 'Regime');
+  html += '<div style="font-size:10px;color:#454a56;margin:8px 0 6px;">By grade</div>' + rows(bd.byGrade, 'Grade');
+  html += '<div style="font-size:10px;color:#454a56;margin:8px 0 6px;">By direction</div>' + rows(bd.byDirection, 'Direction');
+
+  // 3. The roads not taken.
+  html += '<div class="panel-title" style="font-size:11px;margin-top:14px;">The setups it turned down</div>';
+  html += '<div class="data-source-note" style="margin-bottom:6px;">Every setup the filter rejected is tracked and resolved against real price anyway. This is the comparison a human journal can never make, because nobody records their non-trades.</div>';
+  html += '<div class="zone-item"><span>Taken</span><span class="mono ' + rClass(audit.taken.expectancyR) + '">'
+    + fmtR(audit.taken.expectancyR) + ' <span style="color:#454a56;">(' + audit.taken.n + ')</span></span></div>';
+  html += '<div class="zone-item"><span>Declined</span><span class="mono ' + rClass(audit.declined.expectancyR) + '">'
+    + fmtR(audit.declined.expectancyR) + ' <span style="color:#454a56;">(' + audit.declined.n + ')</span></span></div>';
+  const pending = shadowLog.filter(s => s.status === 'pending' || s.status === 'open').length;
+  if (pending) html += '<div class="zone-item"><span>Declined, still running</span><span class="mono">' + pending + '</span></div>';
+  html += '<div class="event-line" style="border-left-color:#c99bff;margin-top:6px;">' + audit.verdict + '</div>';
+
+  root.innerHTML = html;
+}
+document.getElementById('resetQuality').addEventListener('click', async () => {
+  shadowLog = [];
+  await saveShadowLog();
+  renderAnalysisQuality();
+});
+
+// ============================================================
+// AUTONOMOUS MODE
+// ------------------------------------------------------------
+// The unattended operator. Once the user ticks the box, a single heartbeat
+// drives everything: fetch fresh candles, grade any signal that has since hit
+// its stop or target, re-analyse, commit a new signal if the gate clears, and
+// periodically re-backtest and retrain on the record it has built.
+//
+// Three things make this survive real-world conditions rather than only a tab
+// left open on a desk:
+//   * One 60s heartbeat with due-time checks, not a pile of setIntervals. A
+//     laptop that sleeps for six hours wakes up, sees every task is overdue,
+//     and runs them once — rather than firing a backlog of missed timers.
+//   * Losing the connection is expected, not exceptional. Offline is a quiet
+//     pause; repeated failures back off exponentially instead of hammering a
+//     rate-limited provider until the key is blocked.
+//   * Time with the tab closed is recovered, not lost. catchUp() replays the
+//     gap from real candle history on the next load, so signals that resolved
+//     while nobody was watching still become training data.
+// ============================================================
+
+const AUTONOMY_KEY = 'smc-autonomy-v1';
+const AUTONOMY_HEARTBEAT_MS = 60 * 1000;
+
+let autonomyHandle = null;
+let autonomyBusy = false;
+
+function autonomyConfig() {
+  const num = (id, fallback) => {
+    const el = document.getElementById(id);
+    const v = el ? parseFloat(el.value) : NaN;
+    return isFinite(v) ? v : fallback;
+  };
+  return Object.assign({}, AUTONOMY_DEFAULTS, {
+    minConfidence: num('aMinConf', AUTONOMY_DEFAULTS.minConfidence),
+    cooldownMinutes: num('aCooldown', AUTONOMY_DEFAULTS.cooldownMinutes),
+    maxOpenSignals: num('aMaxOpen', AUTONOMY_DEFAULTS.maxOpenSignals),
+    analysisIntervalMinutes: num('aInterval', AUTONOMY_DEFAULTS.analysisIntervalMinutes),
+    backtestIntervalHours: num('aBtHours', AUTONOMY_DEFAULTS.backtestIntervalHours),
+    minMetaScore: num('aMinMeta', AUTONOMY_DEFAULTS.minMetaScore),
+    // Kill switch. 0 in any field disables that arm rather than expiring
+    // everything instantly, which is what a 0 limit would otherwise mean.
+    maxHoursToFill: num('aKillFill', AUTONOMY_DEFAULTS.maxHoursToFill),
+    maxHoursOpen: num('aKillOpen', AUTONOMY_DEFAULTS.maxHoursOpen),
+    maxDriftRToFill: num('aKillDrift', AUTONOMY_DEFAULTS.maxDriftRToFill),
+    partialTP: partialTPConfig(),
+    newsState: currentNewsState(),
+    gradeFloor: (document.getElementById('aMinGrade') || {}).value || AUTONOMY_DEFAULTS.gradeFloor
+  });
+}
+
+function saveAutonomyState() {
+  try {
+    localStorage.setItem(AUTONOMY_KEY, JSON.stringify({
+      enabled: autonomy.enabled,
+      cycles: autonomy.cycles,
+      gateTally: autonomy.gateTally,
+      signalsTaken: autonomy.signalsTaken,
+      autoResolved: autonomy.autoResolved,
+      lastAnalysisAt: autonomy.lastAnalysisAt,
+      lastBacktestAt: autonomy.lastBacktestAt,
+      lastSignalAt: autonomy.lastSignalAt,
+      cfg: {
+        aMinConf: document.getElementById('aMinConf').value,
+        aCooldown: document.getElementById('aCooldown').value,
+        aKillFill: document.getElementById('aKillFill').value,
+        aKillOpen: document.getElementById('aKillOpen').value,
+        aKillDrift: document.getElementById('aKillDrift').value,
+        aMaxOpen: document.getElementById('aMaxOpen').value,
+        aInterval: document.getElementById('aInterval').value,
+        aBtHours: document.getElementById('aBtHours').value,
+        aMinMeta: document.getElementById('aMinMeta').value,
+        aDailyCap: document.getElementById('aDailyCap').value,
+        aMinGrade: document.getElementById('aMinGrade').value
+      }
+    }));
+  } catch (e) { /* storage unavailable — autonomy still works, it just won't remember across reloads */ }
+}
+
+function loadAutonomyState() {
+  try {
+    const raw = localStorage.getItem(AUTONOMY_KEY);
+    if (!raw) return;
+    const saved = JSON.parse(raw);
+    Object.assign(autonomy, {
+      enabled: !!saved.enabled,
+      cycles: saved.cycles || 0,
+      gateTally: saved.gateTally || {},
+      signalsTaken: saved.signalsTaken || 0,
+      autoResolved: saved.autoResolved || 0,
+      lastAnalysisAt: saved.lastAnalysisAt || null,
+      lastBacktestAt: saved.lastBacktestAt || null,
+      lastSignalAt: saved.lastSignalAt || null
+    });
+    if (saved.cfg) {
+      Object.keys(saved.cfg).forEach(id => {
+        const el = document.getElementById(id);
+        if (el && saved.cfg[id] != null) el.value = saved.cfg[id];
+      });
+    }
+    document.getElementById('autonomyEnabled').checked = autonomy.enabled;
+  } catch (e) { /* nothing saved yet */ }
+}
+
+function setAutonomyStatus(text, tone, reason) {
+  const dot = document.getElementById('autonomyDot');
+  const status = document.getElementById('autonomyStatus');
+  const reasonEl = document.getElementById('autonomyReason');
+  if (!status) return;
+  status.textContent = text;
+  const colours = { live: '#3ecf8e', warn: '#ffa726', error: '#ef4d5f', idle: '#454a56' };
+  const c = colours[tone] || colours.idle;
+  dot.style.background = c;
+  dot.style.boxShadow = tone === 'live' ? '0 0 7px ' + c : 'none';
+  status.style.color = tone === 'idle' ? '#9298a5' : c;
+  if (reason !== undefined) reasonEl.textContent = reason || '';
+}
+
+function renderAutonomyStats() {
+  const live = signalLog.filter(s => s.status === 'pending' || s.status === 'open');
+  document.getElementById('aCycles').textContent = autonomy.cycles;
+  document.getElementById('aSignals').textContent = autonomy.signalsTaken;
+  document.getElementById('aResolved').textContent = autonomy.autoResolved;
+  document.getElementById('aOpen').textContent = live.length;
+
+  const killedEl = document.getElementById('aKilled');
+  if (killedEl) killedEl.textContent = signalLog.filter(s => s.status === 'expired').length;
+
+  // How long the oldest live trade has been sitting. This is the number that
+  // was invisible before: an order resting for a day looked identical to one
+  // placed a minute ago.
+  const oldestEl = document.getElementById('aOldest');
+  if (oldestEl) {
+    const cfg = autonomyConfig();
+    // Each trade is aged against the limit that actually applies to it: a
+    // resting order against the fill limit, a filled one against the hold
+    // limit. Using the larger of the two would leave an order 2.5x past its own
+    // deadline showing no warning at all.
+    const ages = live.map(s => {
+      const filled = s.status === 'open';
+      const t = Date.parse(filled ? (s.filledAt || s.time) : s.time);
+      if (!isFinite(t)) return null;
+      const hours = (Date.now() - t) / 3600000;
+      const limit = filled ? cfg.maxHoursOpen : cfg.maxHoursToFill;
+      return { hours, ratio: limit > 0 ? hours / limit : 0 };
+    }).filter(v => v != null);
+    if (!ages.length) {
+      oldestEl.textContent = '—';
+      oldestEl.style.color = '';
+    } else {
+      const worst = ages.reduce((a, b) => b.hours > a.hours ? b : a, ages[0]);
+      const closest = ages.reduce((a, b) => b.ratio > a.ratio ? b : a, ages[0]);
+      oldestEl.textContent = worst.hours < 1 ? Math.round(worst.hours * 60) + 'm' : worst.hours.toFixed(1) + 'h';
+      // Amber as a trade approaches its own kill limit, red once past it, so
+      // one about to be culled is visible before it disappears.
+      oldestEl.style.color = closest.ratio >= 1 ? '#ef4d5f' : closest.ratio >= 0.75 ? '#ffa726' : '';
+    }
+  }
+
+  const el = document.getElementById('gateTally');
+  if (!el) return;
+  const entries = Object.keys(autonomy.gateTally || {})
+    .map(k => ({ code: k, n: autonomy.gateTally[k] }))
+    .sort((a, b) => b.n - a.n);
+  if (!entries.length) { el.innerHTML = ''; return; }
+  el.innerHTML = '<div style="font-size:10px;color:#454a56;margin:8px 0 4px;">Why cycles ended this way</div>'
+    + entries.map(e => '<div class="zone-item" style="padding:3px 0;"><span style="font-size:11px;">'
+        + (GATE_LABELS[e.code] || e.code) + '</span><span class="mono" style="font-size:11px;color:'
+        + (e.code === 'taken' ? '#3ecf8e' : '#5c6270') + ';">' + e.n + '</span></div>').join('');
+}
+
+// Grade every unresolved signal against `candles`. Used both by the heartbeat
+// (fresh candles each cycle) and by catchUp() (deep history after downtime).
+// Returns how many signals reached a win/loss verdict.
+function resolveOpenSignals(candles, cfg) {
+  if (!candles || candles.length < 2) return 0;
+  let resolved = 0, killed = 0, changed = false;
+
+  // The auditor decides which live trades are past saving, not the engine.
+  // Letting the engine judge whether its own trade has gone bad is the thing
+  // the auditor exists to avoid — and it re-derives fill state from raw candles
+  // rather than trusting the signal's own status, so a "pending" order price
+  // actually traded through is caught rather than aged as if it never filled.
+  const tradeAudit = auditOpenTrades(signalLog, candles, {
+    maxHoursToFill: cfg.maxHoursToFill,
+    maxHoursOpen: cfg.maxHoursOpen,
+    maxDriftRToFill: cfg.maxDriftRToFill
+  });
+  lastTradeAudit = tradeAudit;
+  const killedBy = new Map(tradeAudit.kills.map(k => [k.id, k]));
+
+  signalLog.forEach(sig => {
+    if (sig.status !== 'pending' && sig.status !== 'open') return;
+    // An auditor kill outranks whatever the resolver would have said, EXCEPT
+    // when price has already settled the trade: a stop or target that has
+    // genuinely been hit is a real outcome and real evidence, and discarding it
+    // to enforce a time limit would throw away the data the limit exists to
+    // protect.
+    const verdict = resolveSignal(sig, candles, cfg);
+    const kill = killedBy.get(sig.id);
+    if (kill && verdict.status !== 'won' && verdict.status !== 'lost') {
+      sig.status = 'expired';
+      sig.expiryReason = 'auditor: ' + kill.reason;
+      sig.killSwitch = kill.code;
+      sig.resolvedAt = new Date().toISOString();
+      sig.resolvedBy = 'auditor';
+      paperCloseForSignal(sig.id, 'expired');
+      killed++; changed = true;
+      return;
+    }
+    if (verdict.status === 'won' || verdict.status === 'lost') {
+      if (applySignalOutcome(sig, verdict.status === 'won', {
+        auto: true, exitPrice: verdict.exitPrice, ambiguousBar: verdict.ambiguousBar, partial: verdict.partial
+      })) { resolved++; changed = true; }
+    } else if (verdict.status === 'expired') {
+      sig.status = 'expired';
+      sig.expiryReason = verdict.reason || null;
+      sig.killSwitch = verdict.killSwitch || null;
+      sig.resolvedAt = new Date().toISOString();
+      sig.resolvedBy = 'auto';
+      paperCloseForSignal(sig.id, 'expired');
+      if (verdict.killSwitch) killed++;
+      changed = true; // expired signals never become training data — no outcome to learn from
+    } else if (verdict.status === 'open' && sig.status === 'pending') {
+      sig.status = 'open'; // limit entry got tagged; it's a live position now
+      sig.filledAt = new Date().toISOString();
+      paperFillForSignal(sig.id, sig.filledAt);
+      changed = true;
+    }
+  });
+  if (changed) { saveSignalLog(); renderSignalLog(); }
+  if (resolved) autonomy.autoResolved += resolved;
+  if (killed) autonomy.killed = (autonomy.killed || 0) + killed;
+  resolveShadowSignals(candles, cfg);
+  return resolved;
+}
+
+// Shadows get the same treatment, minus the learning updates — a setup the
+// engine declined should inform the audit, not train the weights as though it
+// had been traded.
+function resolveShadowSignals(candles, cfg) {
+  if (!candles || candles.length < 2 || !shadowLog.length) return;
+  let changed = false;
+  shadowLog.forEach(sig => {
+    if (sig.status !== 'pending' && sig.status !== 'open') return;
+    const verdict = resolveSignal(sig, candles, cfg);
+    if (verdict.status === 'won' || verdict.status === 'lost') {
+      sig.status = verdict.status;
+      sig.resolvedAt = new Date().toISOString();
+      changed = true;
+    } else if (verdict.status === 'expired') {
+      sig.status = 'expired'; sig.expiryReason = verdict.reason || null; changed = true;
+    } else if (verdict.status === 'open' && sig.status === 'pending') {
+      sig.status = 'open'; changed = true;
+    }
+  });
+  if (changed) { saveShadowLog(); renderAnalysisQuality(); }
+}
+
+// One unattended pass. Everything that can fail is inside the caller's try.
+async function autonomyCycle() {
+  const cfg = autonomyConfig();
+  const now = Date.now();
+
+  // 0. Calendar first. It gates whether a signal may be taken at all, so it has
+  // to be current BEFORE the gate reads it — refreshing at the end of the cycle
+  // meant the first pass after a reconnect ran against an empty calendar and
+  // could take a position straight into a release window.
+  await refreshCalendar(false);
+
+  // 1. Fresh candles. resyncCandles() already refreshes liveData from the provider.
+  await resyncCandles();
+
+  // 2. Grade what the market has already decided since the last pass.
+  const graded = resolveOpenSignals(liveData, cfg);
+
+  // 3. Re-analyse on the new data.
+  refreshAll();
+  autonomy.lastAnalysisAt = now;
+
+  // 4. Commit a signal only if the gate clears.
+  let reason;
+  if (lastComposite) {
+    const plan = buildTradePlan(lastComposite, getTargetRR());
+    // The auditor is advisory everywhere except here. A critical finding means
+    // the analysis contradicts itself or the data it was built on — that is not
+    // a risk preference, and no confidence score should be able to override it.
+    const audit = runAudit();
+    renderAudit();
+    let gate;
+    if (audit && audit.blocking) {
+      gate = { take: false, code: 'audit',
+        reason: 'independent audit found ' + audit.critical + ' critical issue(s): ' + audit.findings[0].title };
+    } else {
+      gate = autonomyGate(lastComposite, plan, signalLog, autonomy.lastSignalAt, cfg);
+    }
+    // Tally why each cycle ended as it did. One latest-reason line cannot show
+    // whether 13 quiet cycles mean "no setup existed" or "the filter blocked
+    // every one" — and those need opposite responses.
+    const code = gate.code || 'unknown';
+    autonomy.gateTally[code] = (autonomy.gateTally[code] || 0) + 1;
+    if (gate.take) {
+      updateSignalUI(lastComposite, plan, true, 'auto'); // logIt = true -> addSignalToLog
+      autonomy.signalsTaken++;
+      autonomy.lastSignalAt = now;
+      reason = 'Took a ' + lastComposite.direction + ' at $' + fmt(plan.entry) +
+               ' (' + lastComposite.confidence + '% confidence' + (gate.grade ? ', grade ' + gate.grade : '') + ').';
+    } else {
+      updateSignalUI(lastComposite, plan, false); // keep the panel current without logging
+      // Track what was passed on, so the filter can be audited later rather
+      // than trusted forever.
+      addShadowSignal(lastComposite, plan, gate.reason);
+      reason = 'No signal taken — ' + gate.reason + '.';
+    }
+  } else {
+    reason = 'Analysis produced no result this cycle.';
+  }
+  if (graded) reason = 'Self-graded ' + graded + ' signal' + (graded === 1 ? '' : 's') + '. ' + reason;
+  autonomy.lastReason = reason;
+
+  // 5. Periodic re-backtest / retrain on the accumulated record.
+  const btDue = !autonomy.lastBacktestAt || (now - autonomy.lastBacktestAt) >= cfg.backtestIntervalHours * 3600 * 1000;
+  if (btDue) {
+    autonomy.lastBacktestAt = now;
+    await runBacktestCycle(true);
+  }
+
+  renderAnalysisQuality();
+  renderDataInventory();
+  renderCalendar();
+  renderReasoning();
+  runAudit();
+  renderAudit();
+  autonomy.cycles++;
+  autonomy.consecutiveErrors = 0;
+  autonomy.lastError = null;
+  saveAutonomyState();
+  renderAutonomyStats();
+  if (candlesStaleForBudget) {
+    setAutonomyStatus('Running on cached candles — daily API budget spent, resumes 00:00 UTC.', 'warn',
+      'Still grading open signals and re-analysing, but on the last candles fetched rather than fresh ones. ' + reason);
+  } else {
+    setAutonomyStatus('Running autonomously — last pass ' + new Date(now).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) + '.', 'live', reason);
+  }
+}
+
+// The heartbeat: decides whether a cycle is due, and handles every reason it
+// might not be. Deliberately does no analysis itself.
+async function autonomyHeartbeat() {
+  if (!autonomy.enabled || autonomyBusy) return;
+
+  if (!navigator.onLine) {
+    setAutonomyStatus('Paused — no internet connection. Resumes automatically.', 'warn',
+      'Nothing is lost while offline; the gap gets replayed from candle history once the connection is back.');
+    return;
+  }
+  if (dataMode !== 'live') {
+    setAutonomyStatus('Waiting for a live data provider — connect an API key above.', 'warn',
+      'Autonomous mode needs real candles; it will not run on the simulated feed.');
+    return;
+  }
+  // Gold is shut from Friday ~21:00 UTC to Sunday ~22:00 UTC. Analysing a frozen
+  // feed produces confident-looking signals off Friday's last bar, and every one
+  // of them enters the learning record as a real read of a market that was not
+  // trading. Nothing to analyse, so nothing runs.
+  if (!isMarketOpen(Date.now())) {
+    const clock = marketClock(Date.now());
+    const h = clock.hoursUntilOpen;
+    setAutonomyStatus('Market closed — resumes when gold reopens in ' +
+      (h < 1 ? Math.round(h * 60) + 'm' : h.toFixed(1) + 'h') + '.', 'warn',
+      'The feed is frozen at Friday\u2019s close. Analysing it would generate signals from a market that is not trading.');
+    return;
+  }
+  if (autonomy.skipCycles > 0) {
+    autonomy.skipCycles--;
+    setAutonomyStatus('Backing off after an error — retrying in ' + (autonomy.skipCycles + 1) + ' min.', 'warn', autonomy.lastError);
+    return;
+  }
+
+  const cfg = autonomyConfig();
+  const dueAt = (autonomy.lastAnalysisAt || 0) + cfg.analysisIntervalMinutes * 60 * 1000;
+  if (Date.now() < dueAt) {
+    const mins = Math.ceil((dueAt - Date.now()) / 60000);
+    setAutonomyStatus('Running autonomously — next pass in ' + mins + ' min.', 'live', autonomy.lastReason);
+    return;
+  }
+
+  autonomyBusy = true;
+  try {
+    await autonomyCycle();
+  } catch (e) {
+    autonomy.consecutiveErrors++;
+    autonomy.lastError = (e && e.message) || String(e);
+    // Exponential backoff, capped at ~30 min. A rate-limited or expired key
+    // should not turn into a request every minute for the rest of the day.
+    autonomy.skipCycles = Math.min(Math.pow(2, autonomy.consecutiveErrors), 30);
+    setAutonomyStatus('Cycle failed (' + autonomy.consecutiveErrors + ' in a row) — backing off ' + autonomy.skipCycles + ' min.', 'error', autonomy.lastError);
+    saveAutonomyState();
+  } finally {
+    autonomyBusy = false;
+  }
+}
+
+// Replay the time the app was closed or disconnected. Pulls the deepest history
+// the provider allows and grades every still-open signal against it, so a signal
+// that hit its target overnight is training data by the time the user looks.
+async function autonomyCatchUp() {
+  if (dataMode !== 'live' || !navigator.onLine) return;
+  const stillOpen = signalLog.filter(s => s.status === 'pending' || s.status === 'open');
+  if (!stillOpen.length) return;
+  setAutonomyStatus('Catching up — replaying ' + stillOpen.length + ' unresolved signal(s) against real history…', 'warn', '');
+  try {
+    const history = await PROVIDERS[activeProvider].timeSeries(apiKey, LIVE_INTERVAL, 5000);
+    const n = resolveOpenSignals(history, autonomyConfig());
+    renderAutonomyStats();
+    saveAutonomyState();
+    setAutonomyStatus('Catch-up complete.', autonomy.enabled ? 'live' : 'idle',
+      n ? 'Graded ' + n + ' signal(s) that resolved while the app was closed.'
+        : 'No signals had resolved while the app was closed.');
+  } catch (e) {
+    // Not fatal — the regular heartbeat will keep trying against live candles.
+    setAutonomyStatus('Catch-up could not fetch history — continuing on live candles.', 'warn', (e && e.message) || String(e));
+  }
+}
+
+function startAutonomy() {
+  if (autonomyHandle) clearInterval(autonomyHandle);
+  autonomyHandle = setInterval(autonomyHeartbeat, AUTONOMY_HEARTBEAT_MS);
+  autonomy.skipCycles = 0;
+  autonomy.consecutiveErrors = 0;
+  setAutonomyStatus('Autonomous mode on — first pass starting…', 'live', '');
+  autonomy.lastAnalysisAt = null; // force an immediate first pass
+  autonomyHeartbeat();
+}
+
+function stopAutonomy() {
+  if (autonomyHandle) { clearInterval(autonomyHandle); autonomyHandle = null; }
+  setAutonomyStatus('Off — check the box above to start.', 'idle', '');
+}
+
+document.getElementById('autonomyEnabled').addEventListener('change', function () {
+  autonomy.enabled = this.checked;
+  saveAutonomyState();
+  if (autonomy.enabled) startAutonomy(); else stopAutonomy();
+});
+providerSelect.addEventListener('change', renderQuota);
+const umm = document.getElementById('useMacroModel');
+if (umm) umm.addEventListener('change', () => { renderKnowledge(); renderReasoning(); });
+
+// A posture for building up a record rather than protecting capital. The engine
+// learns from resolved trades, and at the default B floor a ranging market
+// simply never qualifies — so a cautious setup collects nothing and the
+// knowledge base never starts.
+document.getElementById('aPresetCollect').addEventListener('click', () => {
+  // D, not C: even a perfect five-timeframe alignment only scores ~49%, so a C
+  // floor (>=30%) still rejects ordinary conditions and collects almost nothing.
+  document.getElementById('aMinGrade').value = 'D';
+  document.getElementById('aMinConf').value = 15;
+  document.getElementById('aCooldown').value = 30;
+  document.getElementById('aMaxOpen').value = 5;
+  document.getElementById('aMinMeta').value = -0.5;
+  saveAutonomyState();
+  autonomy.lastAnalysisAt = null; // re-evaluate immediately under the new thresholds
+  setAutonomyStatus('Data-collection thresholds applied — re-evaluating now.', 'live', '');
+  autonomyHeartbeat();
+});
+document.getElementById('autonomyAdvancedToggle').addEventListener('click', () => {
+  document.getElementById('autonomyAdvanced').classList.toggle('hidden');
+});
+['aMinConf', 'aCooldown', 'aMaxOpen', 'aInterval', 'aBtHours', 'aMinMeta', 'aDailyCap', 'aMinGrade',
+ 'aKillFill', 'aKillOpen', 'aKillDrift'].forEach(id => {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener('change', () => { saveAutonomyState(); renderQuota(); });
+});
+
+// React to connectivity changes straight away rather than waiting out a heartbeat.
+window.addEventListener('online', () => {
+  if (!autonomy.enabled) return;
+  autonomy.skipCycles = 0;
+  autonomy.consecutiveErrors = 0;
+  setAutonomyStatus('Back online — catching up…', 'warn', '');
+  autonomyCatchUp().then(autonomyHeartbeat);
+});
+window.addEventListener('offline', () => {
+  if (autonomy.enabled) setAutonomyStatus('Paused — no internet connection. Resumes automatically.', 'warn', '');
+});
+// Coming back to a backgrounded tab is a good moment to check for missed work:
+// mobile browsers in particular throttle timers hard once a tab is hidden.
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && autonomy.enabled) autonomyHeartbeat();
+});
+
+// ============================================================
+// BOOTSTRAP
+// ------------------------------------------------------------
+// Ordering matters here, which is why it is one explicit sequence rather than
+// scattered top-level calls: persisted learning state has to be restored (and
+// its weights applied) before the first analysis, and every DOM const further
+// up this file has to exist before anything reads it.
+// ============================================================
+// ============================================================
+// SETTINGS THAT SURVIVE A RELOAD
+// ------------------------------------------------------------
+// Only the paper account's balance and the autonomy thresholds were ever
+// persisted. Everything else a person could change — risk per trade, spread,
+// slippage, max concurrent, the partial-take-profit rules, all fourteen factor
+// weights, the target R:R, every backtest parameter, the news-window settings —
+// was read straight off the DOM and lost the moment the page reloaded. Tuning
+// the system was therefore something you had to redo from memory each session,
+// and an autonomous run would quietly revert to defaults after any refresh.
+//
+// One store, one list, restored before the first analysis so the weights are in
+// force when it runs. Ids that already have an owner are deliberately absent —
+// autonomy keeps its own (AUTONOMY_KEY), the paper on/off switches live with the
+// account, and the API keys are opt-in through "remember keys" rather than
+// swept up here.
+const SETTINGS_KEY = 'smc-settings-v1';
+const SETTINGS_IDS = [
+  // paper account
+  'pStartBalance', 'pRiskPct', 'pSpread', 'pSlippage', 'pMaxPos',
+  'pSizingMode', 'pFixedLots', 'pContractSize', 'pLotStep', 'pMinLots',
+  'pPartialPct', 'pHoldMeta', 'pPartialEnabled',
+  // factor weights
+  'wWeekly', 'wDaily', 'wHtf', 'wMtf', 'wLtf', 'wOb', 'wFvg', 'wLiq',
+  'wPd', 'wPriceAction', 'wClassic', 'wCorrelation', 'wFundamental', 'wNews',
+  // signal + backtest
+  'targetRR', 'pBars', 'pCapital', 'pRisk', 'pCostPips', 'pMinConf', 'pTargetRR',
+  // news window and macro model
+  'newsBeforeMin', 'newsAfterMin', 'newsBlockEnabled', 'newsBlockMedium',
+  'newsFlattenEnabled', 'newsFlattenMin', 'newsAlertMin', 'useMacroModel',
+  'weekendFlattenEnabled', 'weekendFlattenMin'
+];
+
+function saveSettings() {
+  const out = {};
+  SETTINGS_IDS.forEach(id => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    out[id] = el.type === 'checkbox' ? !!el.checked : el.value;
+  });
+  try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(out)); }
+  catch (e) { return false; }
+  return true;
+}
+
+function loadSettings() {
+  let saved;
+  try { saved = JSON.parse(localStorage.getItem(SETTINGS_KEY) || 'null'); }
+  catch (e) { return; }
+  if (!saved || typeof saved !== 'object') return;
+  SETTINGS_IDS.forEach(id => {
+    if (!(id in saved)) return;
+    const el = document.getElementById(id);
+    if (!el) return;
+    if (el.type === 'checkbox') el.checked = !!saved[id];
+    else if (saved[id] != null) el.value = saved[id];
+  });
+  // Sliders carry a printed value beside them that does not follow a
+  // programmatic change, so a restored weight would show the old number.
+  syncSliderLabels();
+}
+
+function syncSliderLabels() {
+  weightIds.forEach(id => {
+    const el = document.getElementById(id), out = document.getElementById(id + 'V');
+    if (el && out) out.textContent = el.value;
+  });
+  const rr = document.getElementById('targetRR'), rrOut = document.getElementById('targetRRV');
+  if (rr && rrOut) rrOut.textContent = '1:' + rr.value;
+}
+
+let settingsSaveTimer = null;
+function flagSettingsSaved() {
+  const el = document.getElementById('settingsSavedNote');
+  if (!el) return;
+  el.textContent = 'Settings saved.';
+  el.style.color = '#3ecf8e';
+  clearTimeout(settingsSaveTimer);
+  settingsSaveTimer = setTimeout(() => { el.textContent = ''; }, 2500);
+}
+
+function wireSettingsPersistence() {
+  SETTINGS_IDS.forEach(id => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    const handler = () => { if (saveSettings()) flagSettingsSaved(); };
+    el.addEventListener('change', handler);
+    // Sliders and number spinners fire `input` continuously; `change` alone
+    // would miss a drag that never blurs.
+    if (el.type === 'range' || el.type === 'number') el.addEventListener('input', handler);
+  });
+}
+
+// ============================================================
+// IS THIS TAB STILL RUNNING THE CURRENT CODE?
+// ------------------------------------------------------------
+// This app is built to be left open for days doing unattended analysis, which
+// means a tab can go on running the modules it loaded at open time long after a
+// fix has shipped. That is not hypothetical: the macro engine ran on 1976-2006
+// FRED data, the fix deployed, and an open tab would have carried on producing
+// confident, wrong numbers with nothing on screen to say so.
+//
+// The check compares the ETag of app.js now against the one seen at startup, so
+// it needs no version constant to keep in sync and no build step. `no-store`
+// forces the request past the browser cache; the server already sends
+// must-revalidate, so this is cheap.
+const UPDATE_CHECK_MS = 30 * 60 * 1000;
+let loadedBuildTag = null;
+let updateWatchHandle = null;
+
+async function currentBuildTag() {
+  try {
+    const r = await fetch('app.js', { method: 'HEAD', cache: 'no-store' });
+    return r.headers.get('etag') || r.headers.get('last-modified') || null;
+  } catch (e) {
+    return null; // offline, or the check is blocked — try again next time
+  }
+}
+
+async function checkForNewBuild() {
+  const tag = await currentBuildTag();
+  if (!tag) return;
+  if (loadedBuildTag == null) { loadedBuildTag = tag; return; }
+  if (tag === loadedBuildTag) return;
+  const banner = document.getElementById('updateBanner');
+  if (banner) banner.classList.remove('hidden');
+}
+
+function startUpdateWatch() {
+  const reload = document.getElementById('updateReload');
+  if (reload) reload.addEventListener('click', () => window.location.reload());
+  checkForNewBuild();
+  if (updateWatchHandle) clearInterval(updateWatchHandle);
+  updateWatchHandle = setInterval(checkForNewBuild, UPDATE_CHECK_MS);
+}
+
+async function bootstrap() {
+  // Before anything reads a control: the weights, risk settings and thresholds
+  // have to be the saved ones by the time the first analysis runs.
+  loadSettings();
+  wireSettingsPersistence();
+  await loadLearningState();
+  await loadSignalLog();
+  await loadShadowLog();
+  applyKnowledgeBaseWeights();
+  await loadPaper();
+  await loadKnowledge();
+  await loadCalendarCache();
+  loadAutonomyState();
+  loadQuota();
+  // Every store the merge touches is loaded by this point — the log it merges
+  // into, the paper account it books positions in, the learning state it
+  // updates. Replay anything the worker sent while that was still loading.
+  flushPendingIngest();
+  renderSignalLog();   // first render happened before the paper account loaded
+  startLivenessTicker();
+  startUpdateWatch();
+  startNewsWatch();
+  renderQuota();
+  renderAutonomyStats();
+  renderAnalysisQuality();
+  renderPaper();
+  renderDataInventory();
+  renderCalendar();
+  renderReasoning();
+  renderKnowledge();
+  runAudit();
+  renderAudit();
+  refreshWorkerTotals().then(renderDataInventory);
+  refreshAll();
+
+  const saved = await loadSavedKeys();
+  if (!saved) {
+    document.getElementById('autoBacktestStatus').textContent = 'Connect a data provider to enable auto-backtesting.';
+  } else {
+    document.getElementById('rememberKeysCheckbox').checked = true;
+    if (saved.provider) providerSelect.value = saved.provider;
+    if (saved.fredKey) document.getElementById('fredKeyInput').value = saved.fredKey;
+    if (saved.newsKey) document.getElementById('newsKeyInput').value = saved.newsKey;
+    if (typeof saved.autoBacktest === 'boolean') document.getElementById('autoBacktestCheckbox').checked = saved.autoBacktest;
+    if (saved.apiKey) {
+      document.getElementById('apiKeyInput').value = saved.apiKey;
+      connStatus.textContent = 'Restoring saved connection...';
+      await connectProvider(); // also re-fetches correlation/fundamentals/news with the restored keys
+    } else if (saved.fredKey || saved.newsKey) {
+      // No price provider was connected, but FRED/news keys were saved independently — restore those engines too.
+      await refreshCorrelation(activeProvider, apiKey, saved.fredKey || '');
+      await refreshFundamentals(saved.fredKey || '');
+      await refreshNewsSentiment(saved.newsKey || '');
+      refreshAll();
+      document.getElementById('autoBacktestStatus').textContent = 'Connect a data provider to enable auto-backtesting.';
+    } else {
+      document.getElementById('autoBacktestStatus').textContent = 'Connect a data provider to enable auto-backtesting.';
+    }
+  }
+
+  // The calendar gates trading, so it must be loaded before autonomy's first pass.
+  await refreshCalendar(false);
+  renderCalendar();
+  renderReasoning();
+
+  // Recover anything that resolved while the app was closed, then pick the loop back up.
+  if (autonomy.enabled) {
+    await autonomyCatchUp();
+    startAutonomy();
+  } else {
+    setAutonomyStatus('Off — check the box above to start.', 'idle', '');
+  }
+}
+bootstrap();
+ + fmt(p.tp)
+        + '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:5px;">'
+        + '<button class="btn" data-paper-action="edit-sl" data-paper-id="' + p.id + '" style="padding:3px 7px;font-size:10px;">Edit SL</button>'
+        + '<button class="btn" data-paper-action="close" data-paper-id="' + p.id + '" style="padding:3px 7px;font-size:10px;border-color:#ef4d5f;color:#ef4d5f;">Close at market</button>'
+        + '</div></span><span class="mono ' + pnlCls(u) + '">' + money(u) + '</span></div>';
+    }).join('');
+  }
+
+  const closed = paper.positions.filter(p => p.status === 'closed' && inEra(p)).slice(0, 8);
+  if (closed.length) {
+    html += '<div style="font-size:10px;color:#454a56;margin:10px 0 6px;">Recent closed</div>';
+    html += closed.map(p =>
+      '<div class="zone-item"><span><span class="dirtag ' + p.dir + '">' + p.dir + '</span> ' + (p.outcome === 'won' ? (p.partial ? '◐' : '✓') : p.outcome === 'lost' ? '✗' : '–')
+      + ' <span style="color:#454a56;">' + lotLabel(p) + ' · exit $' + fmt(p.exitPrice) + '</span></span>'
+      + '<span class="mono ' + pnlCls(p.pnl) + '">' + money(p.pnl) + (p.rMultiple != null ? ' <span style="color:#454a56;">' + (p.rMultiple >= 0 ? '+' : '') + fmt(p.rMultiple) + 'R</span>' : '') + '</span></div>'
+    ).join('');
+  }
+
+  if (!resting.length && !open.length && !closed.length) {
+    html += '<div class="zone-empty">' + (a.archivedCount
+      ? 'Account reset — no trades in this era yet. The record above is intact.'
+      : 'No paper trades yet. Positions open automatically as the engine logs signals.') + '</div>';
+  }
+  root.innerHTML = html;
+}
+
+function renderPaperStatusNote() {
+  const note = document.getElementById('paperStatus');
+  if (!note) return;
+  if (!paper.enabled) { note.textContent = 'Off — no positions will be opened.'; return; }
+  note.textContent = paper.manual
+    ? 'On — new signals will open simulated positions. No real orders are placed.'
+    : 'On for the engine\'s own signals. Signals you generate by hand are excluded (signal panel).';
+}
+
+document.getElementById('paperEnabled').addEventListener('change', function () {
+  paper.enabled = this.checked;
+  savePaper();
+  renderPaper();
+  renderPaperStatusNote();
+  renderPaperManualHint();
+});
+
+const paperManualCb = document.getElementById('paperManual');
+if (paperManualCb) paperManualCb.addEventListener('change', function () {
+  paper.manual = this.checked;
+  // Ticking it with the account off is a request to paper-trade, so honour it
+  // rather than silently doing nothing.
+  if (paper.manual && !paper.enabled) {
+    paper.enabled = true;
+    const master = document.getElementById('paperEnabled');
+    if (master) master.checked = true;
+  }
+  savePaper();
+  renderPaper();
+  renderPaperStatusNote();
+  renderPaperManualHint();
+});
+document.getElementById('paperAdvancedToggle').addEventListener('click', () => {
+  document.getElementById('paperAdvanced').classList.toggle('hidden');
+});
+['pStartBalance', 'pRiskPct', 'pSpread', 'pSlippage', 'pMaxPos', 'pPartialPct', 'pHoldMeta', 'pPartialEnabled'].forEach(id => {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener('change', () => { paper.startingBalance = paperConfig().startingBalance; savePaper(); renderPaper(); });
+});
+document.getElementById('paperReset').addEventListener('click', async () => {
+  const price = currentMarkPrice();
+  const live = paper.positions.filter(p => p.status === 'open' || p.status === 'pending').length;
+  const keeping = paper.positions.filter(p => p.status === 'closed').length;
+  const msg = 'Reset the paper account back to $' + fmt(paperConfig().startingBalance) + '?\n\n'
+    + (live ? live + ' live position(s) will be closed at the current price first.\n' : '')
+    + keeping + ' completed trade(s) stay on record — they are what the system learns from, '
+    + 'and they keep counting towards the lifetime win rate. They just stop counting towards the balance.';
+  if (!window.confirm(msg)) return;
+  const out = resetPaperAccount(paper.positions, isFinite(price) ? price : undefined, Date.now());
+  paper.positions = out.positions;
+  paper.epoch = out.epoch;
+  await savePaper();
+  renderPaper();
+  renderDataInventory();
+});
+
+// ============================================================
+// ANALYSIS QUALITY PANEL
+// ------------------------------------------------------------
+// Renders the three self-audits. Every number here is deliberately allowed to
+// say "not enough data yet" rather than show a confident-looking figure built
+// on four trades — a reassuring number from a tiny sample is worse than no
+// number, because it gets believed.
+// ============================================================
+function fmtR(v) { return v == null ? '—' : (v >= 0 ? '+' : '') + v.toFixed(2) + 'R'; }
+function fmtPct(v) { return v == null ? '—' : (v * 100).toFixed(0) + '%'; }
+function rClass(v) { return v == null ? 'fneu' : v > 0.05 ? 'fpos' : v < -0.05 ? 'fneg' : 'fneu'; }
+
+function renderAnalysisQuality() {
+  const root = document.getElementById('qualityContent');
+  if (!root) return;
+
+  const cal = computeCalibration(signalLog);
+  const bd = computeConditionBreakdown(signalLog);
+  const audit = computeGateAudit(signalLog, shadowLog);
+
+  const rows = (list, label) => {
+    const usable = list.filter(r => r.n >= 3);
+    if (!usable.length) return '<div class="zone-empty">' + label + ': not enough resolved trades yet (need 3+ per group).</div>';
+    return usable.map(r =>
+      '<div class="zone-item"><span>' + r.key + ' <span style="color:#454a56;">(' + r.n + ')</span></span>' +
+      '<span class="mono ' + rClass(r.expectancyR) + '">' + fmtR(r.expectancyR) + ' · ' + fmtPct(r.winRate) + '</span></div>'
+    ).join('');
+  };
+
+  const o = bd.overall;
+  let html = '';
+
+  html += '<div class="data-source-note" style="margin-bottom:8px;">Expectancy is shown in R — average profit per unit risked. At a 1:4 target a 30% win rate is already profitable, so win rate alone is a poor scorecard and R is the honest one.</div>';
+
+  html += '<div class="metrics" style="margin-bottom:10px;">'
+    + '<div class="card"><div class="label">Resolved</div><div class="value mono">' + o.n + '</div></div>'
+    + '<div class="card"><div class="label">Win Rate</div><div class="value mono">' + fmtPct(o.winRate) + '</div></div>'
+    + '<div class="card"><div class="label">Expectancy</div><div class="value mono ' + rClass(o.expectancyR) + '">' + fmtR(o.expectancyR) + '</div></div>'
+    + '<div class="card"><div class="label">Total</div><div class="value mono ' + rClass(o.totalR) + '">' + fmtR(o.totalR) + '</div></div>'
+    + '</div>';
+
+  // 1. Is the confidence number worth anything?
+  html += '<div class="panel-title" style="font-size:11px;margin-top:12px;">Is the confidence score meaningful?</div>';
+  html += '<div class="event-line" style="border-left-color:#e8c37a;">' + cal.verdict + '</div>';
+  if (cal.discrimination != null) {
+    html += '<div class="zone-item"><span>High-confidence half vs low-confidence half</span><span class="mono ' + rClass(cal.discrimination) + '">'
+      + (cal.discrimination >= 0 ? '+' : '') + (cal.discrimination * 100).toFixed(0) + ' pp win rate</span></div>';
+  }
+  if (cal.buckets.length) {
+    html += '<table class="factor-table"><tr><th style="text-align:left;color:#5c6270;font-weight:500;">Confidence band</th><th style="color:#5c6270;font-weight:500;">Win rate</th><th style="color:#5c6270;font-weight:500;">Expectancy</th></tr>';
+    html += cal.buckets.map(b =>
+      '<tr><td>' + b.lo + '–' + b.hi + '% <span style="color:#454a56;">(' + b.n + ')</span></td>'
+      + '<td>' + fmtPct(b.winRate) + '</td>'
+      + '<td class="' + rClass(b.expectancyR) + '">' + fmtR(b.expectancyR) + '</td></tr>').join('');
+    html += '</table>';
+  }
+
+  // 2. Where does the edge actually live?
+  html += '<div class="panel-title" style="font-size:11px;margin-top:14px;">Where the edge actually lives</div>';
+  html += '<div style="font-size:10px;color:#454a56;margin-bottom:6px;">By session</div>' + rows(bd.bySession, 'Session');
+  html += '<div style="font-size:10px;color:#454a56;margin:8px 0 6px;">By market regime</div>' + rows(bd.byRegime, 'Regime');
+  html += '<div style="font-size:10px;color:#454a56;margin:8px 0 6px;">By grade</div>' + rows(bd.byGrade, 'Grade');
+  html += '<div style="font-size:10px;color:#454a56;margin:8px 0 6px;">By direction</div>' + rows(bd.byDirection, 'Direction');
+
+  // 3. The roads not taken.
+  html += '<div class="panel-title" style="font-size:11px;margin-top:14px;">The setups it turned down</div>';
+  html += '<div class="data-source-note" style="margin-bottom:6px;">Every setup the filter rejected is tracked and resolved against real price anyway. This is the comparison a human journal can never make, because nobody records their non-trades.</div>';
+  html += '<div class="zone-item"><span>Taken</span><span class="mono ' + rClass(audit.taken.expectancyR) + '">'
+    + fmtR(audit.taken.expectancyR) + ' <span style="color:#454a56;">(' + audit.taken.n + ')</span></span></div>';
+  html += '<div class="zone-item"><span>Declined</span><span class="mono ' + rClass(audit.declined.expectancyR) + '">'
+    + fmtR(audit.declined.expectancyR) + ' <span style="color:#454a56;">(' + audit.declined.n + ')</span></span></div>';
+  const pending = shadowLog.filter(s => s.status === 'pending' || s.status === 'open').length;
+  if (pending) html += '<div class="zone-item"><span>Declined, still running</span><span class="mono">' + pending + '</span></div>';
+  html += '<div class="event-line" style="border-left-color:#c99bff;margin-top:6px;">' + audit.verdict + '</div>';
+
+  root.innerHTML = html;
+}
+document.getElementById('resetQuality').addEventListener('click', async () => {
+  shadowLog = [];
+  await saveShadowLog();
+  renderAnalysisQuality();
+});
+
+// ============================================================
+// AUTONOMOUS MODE
+// ------------------------------------------------------------
+// The unattended operator. Once the user ticks the box, a single heartbeat
+// drives everything: fetch fresh candles, grade any signal that has since hit
+// its stop or target, re-analyse, commit a new signal if the gate clears, and
+// periodically re-backtest and retrain on the record it has built.
+//
+// Three things make this survive real-world conditions rather than only a tab
+// left open on a desk:
+//   * One 60s heartbeat with due-time checks, not a pile of setIntervals. A
+//     laptop that sleeps for six hours wakes up, sees every task is overdue,
+//     and runs them once — rather than firing a backlog of missed timers.
+//   * Losing the connection is expected, not exceptional. Offline is a quiet
+//     pause; repeated failures back off exponentially instead of hammering a
+//     rate-limited provider until the key is blocked.
+//   * Time with the tab closed is recovered, not lost. catchUp() replays the
+//     gap from real candle history on the next load, so signals that resolved
+//     while nobody was watching still become training data.
+// ============================================================
+
+const AUTONOMY_KEY = 'smc-autonomy-v1';
+const AUTONOMY_HEARTBEAT_MS = 60 * 1000;
+
+let autonomyHandle = null;
+let autonomyBusy = false;
+
+function autonomyConfig() {
+  const num = (id, fallback) => {
+    const el = document.getElementById(id);
+    const v = el ? parseFloat(el.value) : NaN;
+    return isFinite(v) ? v : fallback;
+  };
+  return Object.assign({}, AUTONOMY_DEFAULTS, {
+    minConfidence: num('aMinConf', AUTONOMY_DEFAULTS.minConfidence),
+    cooldownMinutes: num('aCooldown', AUTONOMY_DEFAULTS.cooldownMinutes),
+    maxOpenSignals: num('aMaxOpen', AUTONOMY_DEFAULTS.maxOpenSignals),
+    analysisIntervalMinutes: num('aInterval', AUTONOMY_DEFAULTS.analysisIntervalMinutes),
+    backtestIntervalHours: num('aBtHours', AUTONOMY_DEFAULTS.backtestIntervalHours),
+    minMetaScore: num('aMinMeta', AUTONOMY_DEFAULTS.minMetaScore),
+    // Kill switch. 0 in any field disables that arm rather than expiring
+    // everything instantly, which is what a 0 limit would otherwise mean.
+    maxHoursToFill: num('aKillFill', AUTONOMY_DEFAULTS.maxHoursToFill),
+    maxHoursOpen: num('aKillOpen', AUTONOMY_DEFAULTS.maxHoursOpen),
+    maxDriftRToFill: num('aKillDrift', AUTONOMY_DEFAULTS.maxDriftRToFill),
+    partialTP: partialTPConfig(),
+    newsState: currentNewsState(),
+    gradeFloor: (document.getElementById('aMinGrade') || {}).value || AUTONOMY_DEFAULTS.gradeFloor
+  });
+}
+
+function saveAutonomyState() {
+  try {
+    localStorage.setItem(AUTONOMY_KEY, JSON.stringify({
+      enabled: autonomy.enabled,
+      cycles: autonomy.cycles,
+      gateTally: autonomy.gateTally,
+      signalsTaken: autonomy.signalsTaken,
+      autoResolved: autonomy.autoResolved,
+      lastAnalysisAt: autonomy.lastAnalysisAt,
+      lastBacktestAt: autonomy.lastBacktestAt,
+      lastSignalAt: autonomy.lastSignalAt,
+      cfg: {
+        aMinConf: document.getElementById('aMinConf').value,
+        aCooldown: document.getElementById('aCooldown').value,
+        aKillFill: document.getElementById('aKillFill').value,
+        aKillOpen: document.getElementById('aKillOpen').value,
+        aKillDrift: document.getElementById('aKillDrift').value,
+        aMaxOpen: document.getElementById('aMaxOpen').value,
+        aInterval: document.getElementById('aInterval').value,
+        aBtHours: document.getElementById('aBtHours').value,
+        aMinMeta: document.getElementById('aMinMeta').value,
+        aDailyCap: document.getElementById('aDailyCap').value,
+        aMinGrade: document.getElementById('aMinGrade').value
+      }
+    }));
+  } catch (e) { /* storage unavailable — autonomy still works, it just won't remember across reloads */ }
+}
+
+function loadAutonomyState() {
+  try {
+    const raw = localStorage.getItem(AUTONOMY_KEY);
+    if (!raw) return;
+    const saved = JSON.parse(raw);
+    Object.assign(autonomy, {
+      enabled: !!saved.enabled,
+      cycles: saved.cycles || 0,
+      gateTally: saved.gateTally || {},
+      signalsTaken: saved.signalsTaken || 0,
+      autoResolved: saved.autoResolved || 0,
+      lastAnalysisAt: saved.lastAnalysisAt || null,
+      lastBacktestAt: saved.lastBacktestAt || null,
+      lastSignalAt: saved.lastSignalAt || null
+    });
+    if (saved.cfg) {
+      Object.keys(saved.cfg).forEach(id => {
+        const el = document.getElementById(id);
+        if (el && saved.cfg[id] != null) el.value = saved.cfg[id];
+      });
+    }
+    document.getElementById('autonomyEnabled').checked = autonomy.enabled;
+  } catch (e) { /* nothing saved yet */ }
+}
+
+function setAutonomyStatus(text, tone, reason) {
+  const dot = document.getElementById('autonomyDot');
+  const status = document.getElementById('autonomyStatus');
+  const reasonEl = document.getElementById('autonomyReason');
+  if (!status) return;
+  status.textContent = text;
+  const colours = { live: '#3ecf8e', warn: '#ffa726', error: '#ef4d5f', idle: '#454a56' };
+  const c = colours[tone] || colours.idle;
+  dot.style.background = c;
+  dot.style.boxShadow = tone === 'live' ? '0 0 7px ' + c : 'none';
+  status.style.color = tone === 'idle' ? '#9298a5' : c;
+  if (reason !== undefined) reasonEl.textContent = reason || '';
+}
+
+function renderAutonomyStats() {
+  const live = signalLog.filter(s => s.status === 'pending' || s.status === 'open');
+  document.getElementById('aCycles').textContent = autonomy.cycles;
+  document.getElementById('aSignals').textContent = autonomy.signalsTaken;
+  document.getElementById('aResolved').textContent = autonomy.autoResolved;
+  document.getElementById('aOpen').textContent = live.length;
+
+  const killedEl = document.getElementById('aKilled');
+  if (killedEl) killedEl.textContent = signalLog.filter(s => s.status === 'expired').length;
+
+  // How long the oldest live trade has been sitting. This is the number that
+  // was invisible before: an order resting for a day looked identical to one
+  // placed a minute ago.
+  const oldestEl = document.getElementById('aOldest');
+  if (oldestEl) {
+    const cfg = autonomyConfig();
+    // Each trade is aged against the limit that actually applies to it: a
+    // resting order against the fill limit, a filled one against the hold
+    // limit. Using the larger of the two would leave an order 2.5x past its own
+    // deadline showing no warning at all.
+    const ages = live.map(s => {
+      const filled = s.status === 'open';
+      const t = Date.parse(filled ? (s.filledAt || s.time) : s.time);
+      if (!isFinite(t)) return null;
+      const hours = (Date.now() - t) / 3600000;
+      const limit = filled ? cfg.maxHoursOpen : cfg.maxHoursToFill;
+      return { hours, ratio: limit > 0 ? hours / limit : 0 };
+    }).filter(v => v != null);
+    if (!ages.length) {
+      oldestEl.textContent = '—';
+      oldestEl.style.color = '';
+    } else {
+      const worst = ages.reduce((a, b) => b.hours > a.hours ? b : a, ages[0]);
+      const closest = ages.reduce((a, b) => b.ratio > a.ratio ? b : a, ages[0]);
+      oldestEl.textContent = worst.hours < 1 ? Math.round(worst.hours * 60) + 'm' : worst.hours.toFixed(1) + 'h';
+      // Amber as a trade approaches its own kill limit, red once past it, so
+      // one about to be culled is visible before it disappears.
+      oldestEl.style.color = closest.ratio >= 1 ? '#ef4d5f' : closest.ratio >= 0.75 ? '#ffa726' : '';
+    }
+  }
+
+  const el = document.getElementById('gateTally');
+  if (!el) return;
+  const entries = Object.keys(autonomy.gateTally || {})
+    .map(k => ({ code: k, n: autonomy.gateTally[k] }))
+    .sort((a, b) => b.n - a.n);
+  if (!entries.length) { el.innerHTML = ''; return; }
+  el.innerHTML = '<div style="font-size:10px;color:#454a56;margin:8px 0 4px;">Why cycles ended this way</div>'
+    + entries.map(e => '<div class="zone-item" style="padding:3px 0;"><span style="font-size:11px;">'
+        + (GATE_LABELS[e.code] || e.code) + '</span><span class="mono" style="font-size:11px;color:'
+        + (e.code === 'taken' ? '#3ecf8e' : '#5c6270') + ';">' + e.n + '</span></div>').join('');
+}
+
+// Grade every unresolved signal against `candles`. Used both by the heartbeat
+// (fresh candles each cycle) and by catchUp() (deep history after downtime).
+// Returns how many signals reached a win/loss verdict.
+function resolveOpenSignals(candles, cfg) {
+  if (!candles || candles.length < 2) return 0;
+  let resolved = 0, killed = 0, changed = false;
+
+  // The auditor decides which live trades are past saving, not the engine.
+  // Letting the engine judge whether its own trade has gone bad is the thing
+  // the auditor exists to avoid — and it re-derives fill state from raw candles
+  // rather than trusting the signal's own status, so a "pending" order price
+  // actually traded through is caught rather than aged as if it never filled.
+  const tradeAudit = auditOpenTrades(signalLog, candles, {
+    maxHoursToFill: cfg.maxHoursToFill,
+    maxHoursOpen: cfg.maxHoursOpen,
+    maxDriftRToFill: cfg.maxDriftRToFill
+  });
+  lastTradeAudit = tradeAudit;
+  const killedBy = new Map(tradeAudit.kills.map(k => [k.id, k]));
+
+  signalLog.forEach(sig => {
+    if (sig.status !== 'pending' && sig.status !== 'open') return;
+    // An auditor kill outranks whatever the resolver would have said, EXCEPT
+    // when price has already settled the trade: a stop or target that has
+    // genuinely been hit is a real outcome and real evidence, and discarding it
+    // to enforce a time limit would throw away the data the limit exists to
+    // protect.
+    const verdict = resolveSignal(sig, candles, cfg);
+    const kill = killedBy.get(sig.id);
+    if (kill && verdict.status !== 'won' && verdict.status !== 'lost') {
+      sig.status = 'expired';
+      sig.expiryReason = 'auditor: ' + kill.reason;
+      sig.killSwitch = kill.code;
+      sig.resolvedAt = new Date().toISOString();
+      sig.resolvedBy = 'auditor';
+      paperCloseForSignal(sig.id, 'expired');
+      killed++; changed = true;
+      return;
+    }
+    if (verdict.status === 'won' || verdict.status === 'lost') {
+      if (applySignalOutcome(sig, verdict.status === 'won', {
+        auto: true, exitPrice: verdict.exitPrice, ambiguousBar: verdict.ambiguousBar, partial: verdict.partial
+      })) { resolved++; changed = true; }
+    } else if (verdict.status === 'expired') {
+      sig.status = 'expired';
+      sig.expiryReason = verdict.reason || null;
+      sig.killSwitch = verdict.killSwitch || null;
+      sig.resolvedAt = new Date().toISOString();
+      sig.resolvedBy = 'auto';
+      paperCloseForSignal(sig.id, 'expired');
+      if (verdict.killSwitch) killed++;
+      changed = true; // expired signals never become training data — no outcome to learn from
+    } else if (verdict.status === 'open' && sig.status === 'pending') {
+      sig.status = 'open'; // limit entry got tagged; it's a live position now
+      sig.filledAt = new Date().toISOString();
+      paperFillForSignal(sig.id, sig.filledAt);
+      changed = true;
+    }
+  });
+  if (changed) { saveSignalLog(); renderSignalLog(); }
+  if (resolved) autonomy.autoResolved += resolved;
+  if (killed) autonomy.killed = (autonomy.killed || 0) + killed;
+  resolveShadowSignals(candles, cfg);
+  return resolved;
+}
+
+// Shadows get the same treatment, minus the learning updates — a setup the
+// engine declined should inform the audit, not train the weights as though it
+// had been traded.
+function resolveShadowSignals(candles, cfg) {
+  if (!candles || candles.length < 2 || !shadowLog.length) return;
+  let changed = false;
+  shadowLog.forEach(sig => {
+    if (sig.status !== 'pending' && sig.status !== 'open') return;
+    const verdict = resolveSignal(sig, candles, cfg);
+    if (verdict.status === 'won' || verdict.status === 'lost') {
+      sig.status = verdict.status;
+      sig.resolvedAt = new Date().toISOString();
+      changed = true;
+    } else if (verdict.status === 'expired') {
+      sig.status = 'expired'; sig.expiryReason = verdict.reason || null; changed = true;
+    } else if (verdict.status === 'open' && sig.status === 'pending') {
+      sig.status = 'open'; changed = true;
+    }
+  });
+  if (changed) { saveShadowLog(); renderAnalysisQuality(); }
+}
+
+// One unattended pass. Everything that can fail is inside the caller's try.
+async function autonomyCycle() {
+  const cfg = autonomyConfig();
+  const now = Date.now();
+
+  // 0. Calendar first. It gates whether a signal may be taken at all, so it has
+  // to be current BEFORE the gate reads it — refreshing at the end of the cycle
+  // meant the first pass after a reconnect ran against an empty calendar and
+  // could take a position straight into a release window.
+  await refreshCalendar(false);
+
+  // 1. Fresh candles. resyncCandles() already refreshes liveData from the provider.
+  await resyncCandles();
+
+  // 2. Grade what the market has already decided since the last pass.
+  const graded = resolveOpenSignals(liveData, cfg);
+
+  // 3. Re-analyse on the new data.
+  refreshAll();
+  autonomy.lastAnalysisAt = now;
+
+  // 4. Commit a signal only if the gate clears.
+  let reason;
+  if (lastComposite) {
+    const plan = buildTradePlan(lastComposite, getTargetRR());
+    // The auditor is advisory everywhere except here. A critical finding means
+    // the analysis contradicts itself or the data it was built on — that is not
+    // a risk preference, and no confidence score should be able to override it.
+    const audit = runAudit();
+    renderAudit();
+    let gate;
+    if (audit && audit.blocking) {
+      gate = { take: false, code: 'audit',
+        reason: 'independent audit found ' + audit.critical + ' critical issue(s): ' + audit.findings[0].title };
+    } else {
+      gate = autonomyGate(lastComposite, plan, signalLog, autonomy.lastSignalAt, cfg);
+    }
+    // Tally why each cycle ended as it did. One latest-reason line cannot show
+    // whether 13 quiet cycles mean "no setup existed" or "the filter blocked
+    // every one" — and those need opposite responses.
+    const code = gate.code || 'unknown';
+    autonomy.gateTally[code] = (autonomy.gateTally[code] || 0) + 1;
+    if (gate.take) {
+      updateSignalUI(lastComposite, plan, true, 'auto'); // logIt = true -> addSignalToLog
+      autonomy.signalsTaken++;
+      autonomy.lastSignalAt = now;
+      reason = 'Took a ' + lastComposite.direction + ' at $' + fmt(plan.entry) +
+               ' (' + lastComposite.confidence + '% confidence' + (gate.grade ? ', grade ' + gate.grade : '') + ').';
+    } else {
+      updateSignalUI(lastComposite, plan, false); // keep the panel current without logging
+      // Track what was passed on, so the filter can be audited later rather
+      // than trusted forever.
+      addShadowSignal(lastComposite, plan, gate.reason);
+      reason = 'No signal taken — ' + gate.reason + '.';
+    }
+  } else {
+    reason = 'Analysis produced no result this cycle.';
+  }
+  if (graded) reason = 'Self-graded ' + graded + ' signal' + (graded === 1 ? '' : 's') + '. ' + reason;
+  autonomy.lastReason = reason;
+
+  // 5. Periodic re-backtest / retrain on the accumulated record.
+  const btDue = !autonomy.lastBacktestAt || (now - autonomy.lastBacktestAt) >= cfg.backtestIntervalHours * 3600 * 1000;
+  if (btDue) {
+    autonomy.lastBacktestAt = now;
+    await runBacktestCycle(true);
+  }
+
+  renderAnalysisQuality();
+  renderDataInventory();
+  renderCalendar();
+  renderReasoning();
+  runAudit();
+  renderAudit();
+  autonomy.cycles++;
+  autonomy.consecutiveErrors = 0;
+  autonomy.lastError = null;
+  saveAutonomyState();
+  renderAutonomyStats();
+  if (candlesStaleForBudget) {
+    setAutonomyStatus('Running on cached candles — daily API budget spent, resumes 00:00 UTC.', 'warn',
+      'Still grading open signals and re-analysing, but on the last candles fetched rather than fresh ones. ' + reason);
+  } else {
+    setAutonomyStatus('Running autonomously — last pass ' + new Date(now).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) + '.', 'live', reason);
+  }
+}
+
+// The heartbeat: decides whether a cycle is due, and handles every reason it
+// might not be. Deliberately does no analysis itself.
+async function autonomyHeartbeat() {
+  if (!autonomy.enabled || autonomyBusy) return;
+
+  if (!navigator.onLine) {
+    setAutonomyStatus('Paused — no internet connection. Resumes automatically.', 'warn',
+      'Nothing is lost while offline; the gap gets replayed from candle history once the connection is back.');
+    return;
+  }
+  if (dataMode !== 'live') {
+    setAutonomyStatus('Waiting for a live data provider — connect an API key above.', 'warn',
+      'Autonomous mode needs real candles; it will not run on the simulated feed.');
+    return;
+  }
+  // Gold is shut from Friday ~21:00 UTC to Sunday ~22:00 UTC. Analysing a frozen
+  // feed produces confident-looking signals off Friday's last bar, and every one
+  // of them enters the learning record as a real read of a market that was not
+  // trading. Nothing to analyse, so nothing runs.
+  if (!isMarketOpen(Date.now())) {
+    const clock = marketClock(Date.now());
+    const h = clock.hoursUntilOpen;
+    setAutonomyStatus('Market closed — resumes when gold reopens in ' +
+      (h < 1 ? Math.round(h * 60) + 'm' : h.toFixed(1) + 'h') + '.', 'warn',
+      'The feed is frozen at Friday\u2019s close. Analysing it would generate signals from a market that is not trading.');
+    return;
+  }
+  if (autonomy.skipCycles > 0) {
+    autonomy.skipCycles--;
+    setAutonomyStatus('Backing off after an error — retrying in ' + (autonomy.skipCycles + 1) + ' min.', 'warn', autonomy.lastError);
+    return;
+  }
+
+  const cfg = autonomyConfig();
+  const dueAt = (autonomy.lastAnalysisAt || 0) + cfg.analysisIntervalMinutes * 60 * 1000;
+  if (Date.now() < dueAt) {
+    const mins = Math.ceil((dueAt - Date.now()) / 60000);
+    setAutonomyStatus('Running autonomously — next pass in ' + mins + ' min.', 'live', autonomy.lastReason);
+    return;
+  }
+
+  autonomyBusy = true;
+  try {
+    await autonomyCycle();
+  } catch (e) {
+    autonomy.consecutiveErrors++;
+    autonomy.lastError = (e && e.message) || String(e);
+    // Exponential backoff, capped at ~30 min. A rate-limited or expired key
+    // should not turn into a request every minute for the rest of the day.
+    autonomy.skipCycles = Math.min(Math.pow(2, autonomy.consecutiveErrors), 30);
+    setAutonomyStatus('Cycle failed (' + autonomy.consecutiveErrors + ' in a row) — backing off ' + autonomy.skipCycles + ' min.', 'error', autonomy.lastError);
+    saveAutonomyState();
+  } finally {
+    autonomyBusy = false;
+  }
+}
+
+// Replay the time the app was closed or disconnected. Pulls the deepest history
+// the provider allows and grades every still-open signal against it, so a signal
+// that hit its target overnight is training data by the time the user looks.
+async function autonomyCatchUp() {
+  if (dataMode !== 'live' || !navigator.onLine) return;
+  const stillOpen = signalLog.filter(s => s.status === 'pending' || s.status === 'open');
+  if (!stillOpen.length) return;
+  setAutonomyStatus('Catching up — replaying ' + stillOpen.length + ' unresolved signal(s) against real history…', 'warn', '');
+  try {
+    const history = await PROVIDERS[activeProvider].timeSeries(apiKey, LIVE_INTERVAL, 5000);
+    const n = resolveOpenSignals(history, autonomyConfig());
+    renderAutonomyStats();
+    saveAutonomyState();
+    setAutonomyStatus('Catch-up complete.', autonomy.enabled ? 'live' : 'idle',
+      n ? 'Graded ' + n + ' signal(s) that resolved while the app was closed.'
+        : 'No signals had resolved while the app was closed.');
+  } catch (e) {
+    // Not fatal — the regular heartbeat will keep trying against live candles.
+    setAutonomyStatus('Catch-up could not fetch history — continuing on live candles.', 'warn', (e && e.message) || String(e));
+  }
+}
+
+function startAutonomy() {
+  if (autonomyHandle) clearInterval(autonomyHandle);
+  autonomyHandle = setInterval(autonomyHeartbeat, AUTONOMY_HEARTBEAT_MS);
+  autonomy.skipCycles = 0;
+  autonomy.consecutiveErrors = 0;
+  setAutonomyStatus('Autonomous mode on — first pass starting…', 'live', '');
+  autonomy.lastAnalysisAt = null; // force an immediate first pass
+  autonomyHeartbeat();
+}
+
+function stopAutonomy() {
+  if (autonomyHandle) { clearInterval(autonomyHandle); autonomyHandle = null; }
+  setAutonomyStatus('Off — check the box above to start.', 'idle', '');
+}
+
+document.getElementById('autonomyEnabled').addEventListener('change', function () {
+  autonomy.enabled = this.checked;
+  saveAutonomyState();
+  if (autonomy.enabled) startAutonomy(); else stopAutonomy();
+});
+providerSelect.addEventListener('change', renderQuota);
+const umm = document.getElementById('useMacroModel');
+if (umm) umm.addEventListener('change', () => { renderKnowledge(); renderReasoning(); });
+
+// A posture for building up a record rather than protecting capital. The engine
+// learns from resolved trades, and at the default B floor a ranging market
+// simply never qualifies — so a cautious setup collects nothing and the
+// knowledge base never starts.
+document.getElementById('aPresetCollect').addEventListener('click', () => {
+  // D, not C: even a perfect five-timeframe alignment only scores ~49%, so a C
+  // floor (>=30%) still rejects ordinary conditions and collects almost nothing.
+  document.getElementById('aMinGrade').value = 'D';
+  document.getElementById('aMinConf').value = 15;
+  document.getElementById('aCooldown').value = 30;
+  document.getElementById('aMaxOpen').value = 5;
+  document.getElementById('aMinMeta').value = -0.5;
+  saveAutonomyState();
+  autonomy.lastAnalysisAt = null; // re-evaluate immediately under the new thresholds
+  setAutonomyStatus('Data-collection thresholds applied — re-evaluating now.', 'live', '');
+  autonomyHeartbeat();
+});
+document.getElementById('autonomyAdvancedToggle').addEventListener('click', () => {
+  document.getElementById('autonomyAdvanced').classList.toggle('hidden');
+});
+['aMinConf', 'aCooldown', 'aMaxOpen', 'aInterval', 'aBtHours', 'aMinMeta', 'aDailyCap', 'aMinGrade',
+ 'aKillFill', 'aKillOpen', 'aKillDrift'].forEach(id => {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener('change', () => { saveAutonomyState(); renderQuota(); });
+});
+
+// React to connectivity changes straight away rather than waiting out a heartbeat.
+window.addEventListener('online', () => {
+  if (!autonomy.enabled) return;
+  autonomy.skipCycles = 0;
+  autonomy.consecutiveErrors = 0;
+  setAutonomyStatus('Back online — catching up…', 'warn', '');
+  autonomyCatchUp().then(autonomyHeartbeat);
+});
+window.addEventListener('offline', () => {
+  if (autonomy.enabled) setAutonomyStatus('Paused — no internet connection. Resumes automatically.', 'warn', '');
+});
+// Coming back to a backgrounded tab is a good moment to check for missed work:
+// mobile browsers in particular throttle timers hard once a tab is hidden.
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && autonomy.enabled) autonomyHeartbeat();
+});
+
+// ============================================================
+// BOOTSTRAP
+// ------------------------------------------------------------
+// Ordering matters here, which is why it is one explicit sequence rather than
+// scattered top-level calls: persisted learning state has to be restored (and
+// its weights applied) before the first analysis, and every DOM const further
+// up this file has to exist before anything reads it.
+// ============================================================
+// ============================================================
+// SETTINGS THAT SURVIVE A RELOAD
+// ------------------------------------------------------------
+// Only the paper account's balance and the autonomy thresholds were ever
+// persisted. Everything else a person could change — risk per trade, spread,
+// slippage, max concurrent, the partial-take-profit rules, all fourteen factor
+// weights, the target R:R, every backtest parameter, the news-window settings —
+// was read straight off the DOM and lost the moment the page reloaded. Tuning
+// the system was therefore something you had to redo from memory each session,
+// and an autonomous run would quietly revert to defaults after any refresh.
+//
+// One store, one list, restored before the first analysis so the weights are in
+// force when it runs. Ids that already have an owner are deliberately absent —
+// autonomy keeps its own (AUTONOMY_KEY), the paper on/off switches live with the
+// account, and the API keys are opt-in through "remember keys" rather than
+// swept up here.
+const SETTINGS_KEY = 'smc-settings-v1';
+const SETTINGS_IDS = [
+  // paper account
+  'pStartBalance', 'pRiskPct', 'pSpread', 'pSlippage', 'pMaxPos',
+  'pSizingMode', 'pFixedLots', 'pContractSize', 'pLotStep', 'pMinLots',
+  'pPartialPct', 'pHoldMeta', 'pPartialEnabled',
+  // factor weights
+  'wWeekly', 'wDaily', 'wHtf', 'wMtf', 'wLtf', 'wOb', 'wFvg', 'wLiq',
+  'wPd', 'wPriceAction', 'wClassic', 'wCorrelation', 'wFundamental', 'wNews',
+  // signal + backtest
+  'targetRR', 'pBars', 'pCapital', 'pRisk', 'pCostPips', 'pMinConf', 'pTargetRR',
+  // news window and macro model
+  'newsBeforeMin', 'newsAfterMin', 'newsBlockEnabled', 'newsBlockMedium',
+  'newsFlattenEnabled', 'newsFlattenMin', 'newsAlertMin', 'useMacroModel',
+  'weekendFlattenEnabled', 'weekendFlattenMin'
+];
+
+function saveSettings() {
+  const out = {};
+  SETTINGS_IDS.forEach(id => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    out[id] = el.type === 'checkbox' ? !!el.checked : el.value;
+  });
+  try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(out)); }
+  catch (e) { return false; }
+  return true;
+}
+
+function loadSettings() {
+  let saved;
+  try { saved = JSON.parse(localStorage.getItem(SETTINGS_KEY) || 'null'); }
+  catch (e) { return; }
+  if (!saved || typeof saved !== 'object') return;
+  SETTINGS_IDS.forEach(id => {
+    if (!(id in saved)) return;
+    const el = document.getElementById(id);
+    if (!el) return;
+    if (el.type === 'checkbox') el.checked = !!saved[id];
+    else if (saved[id] != null) el.value = saved[id];
+  });
+  // Sliders carry a printed value beside them that does not follow a
+  // programmatic change, so a restored weight would show the old number.
+  syncSliderLabels();
+}
+
+function syncSliderLabels() {
+  weightIds.forEach(id => {
+    const el = document.getElementById(id), out = document.getElementById(id + 'V');
+    if (el && out) out.textContent = el.value;
+  });
+  const rr = document.getElementById('targetRR'), rrOut = document.getElementById('targetRRV');
+  if (rr && rrOut) rrOut.textContent = '1:' + rr.value;
+}
+
+let settingsSaveTimer = null;
+function flagSettingsSaved() {
+  const el = document.getElementById('settingsSavedNote');
+  if (!el) return;
+  el.textContent = 'Settings saved.';
+  el.style.color = '#3ecf8e';
+  clearTimeout(settingsSaveTimer);
+  settingsSaveTimer = setTimeout(() => { el.textContent = ''; }, 2500);
+}
+
+function wireSettingsPersistence() {
+  SETTINGS_IDS.forEach(id => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    const handler = () => { if (saveSettings()) flagSettingsSaved(); };
+    el.addEventListener('change', handler);
+    // Sliders and number spinners fire `input` continuously; `change` alone
+    // would miss a drag that never blurs.
+    if (el.type === 'range' || el.type === 'number') el.addEventListener('input', handler);
+  });
+}
+
+// ============================================================
+// IS THIS TAB STILL RUNNING THE CURRENT CODE?
+// ------------------------------------------------------------
+// This app is built to be left open for days doing unattended analysis, which
+// means a tab can go on running the modules it loaded at open time long after a
+// fix has shipped. That is not hypothetical: the macro engine ran on 1976-2006
+// FRED data, the fix deployed, and an open tab would have carried on producing
+// confident, wrong numbers with nothing on screen to say so.
+//
+// The check compares the ETag of app.js now against the one seen at startup, so
+// it needs no version constant to keep in sync and no build step. `no-store`
+// forces the request past the browser cache; the server already sends
+// must-revalidate, so this is cheap.
+const UPDATE_CHECK_MS = 30 * 60 * 1000;
+let loadedBuildTag = null;
+let updateWatchHandle = null;
+
+async function currentBuildTag() {
+  try {
+    const r = await fetch('app.js', { method: 'HEAD', cache: 'no-store' });
+    return r.headers.get('etag') || r.headers.get('last-modified') || null;
+  } catch (e) {
+    return null; // offline, or the check is blocked — try again next time
+  }
+}
+
+async function checkForNewBuild() {
+  const tag = await currentBuildTag();
+  if (!tag) return;
+  if (loadedBuildTag == null) { loadedBuildTag = tag; return; }
+  if (tag === loadedBuildTag) return;
+  const banner = document.getElementById('updateBanner');
+  if (banner) banner.classList.remove('hidden');
+}
+
+function startUpdateWatch() {
+  const reload = document.getElementById('updateReload');
+  if (reload) reload.addEventListener('click', () => window.location.reload());
+  checkForNewBuild();
+  if (updateWatchHandle) clearInterval(updateWatchHandle);
+  updateWatchHandle = setInterval(checkForNewBuild, UPDATE_CHECK_MS);
+}
+
+async function bootstrap() {
+  // Before anything reads a control: the weights, risk settings and thresholds
+  // have to be the saved ones by the time the first analysis runs.
+  loadSettings();
+  wireSettingsPersistence();
+  await loadLearningState();
+  await loadSignalLog();
+  await loadShadowLog();
+  applyKnowledgeBaseWeights();
+  await loadPaper();
+  await loadKnowledge();
+  await loadCalendarCache();
+  loadAutonomyState();
+  loadQuota();
+  // Every store the merge touches is loaded by this point — the log it merges
+  // into, the paper account it books positions in, the learning state it
+  // updates. Replay anything the worker sent while that was still loading.
+  flushPendingIngest();
+  renderSignalLog();   // first render happened before the paper account loaded
+  startLivenessTicker();
+  startUpdateWatch();
+  startNewsWatch();
+  renderQuota();
+  renderAutonomyStats();
+  renderAnalysisQuality();
+  renderPaper();
+  renderDataInventory();
+  renderCalendar();
+  renderReasoning();
+  renderKnowledge();
+  runAudit();
+  renderAudit();
+  refreshWorkerTotals().then(renderDataInventory);
+  refreshAll();
+
+  const saved = await loadSavedKeys();
+  if (!saved) {
+    document.getElementById('autoBacktestStatus').textContent = 'Connect a data provider to enable auto-backtesting.';
+  } else {
+    document.getElementById('rememberKeysCheckbox').checked = true;
+    if (saved.provider) providerSelect.value = saved.provider;
+    if (saved.fredKey) document.getElementById('fredKeyInput').value = saved.fredKey;
+    if (saved.newsKey) document.getElementById('newsKeyInput').value = saved.newsKey;
+    if (typeof saved.autoBacktest === 'boolean') document.getElementById('autoBacktestCheckbox').checked = saved.autoBacktest;
+    if (saved.apiKey) {
+      document.getElementById('apiKeyInput').value = saved.apiKey;
+      connStatus.textContent = 'Restoring saved connection...';
+      await connectProvider(); // also re-fetches correlation/fundamentals/news with the restored keys
+    } else if (saved.fredKey || saved.newsKey) {
+      // No price provider was connected, but FRED/news keys were saved independently — restore those engines too.
+      await refreshCorrelation(activeProvider, apiKey, saved.fredKey || '');
+      await refreshFundamentals(saved.fredKey || '');
+      await refreshNewsSentiment(saved.newsKey || '');
+      refreshAll();
+      document.getElementById('autoBacktestStatus').textContent = 'Connect a data provider to enable auto-backtesting.';
+    } else {
+      document.getElementById('autoBacktestStatus').textContent = 'Connect a data provider to enable auto-backtesting.';
+    }
+  }
+
+  // The calendar gates trading, so it must be loaded before autonomy's first pass.
+  await refreshCalendar(false);
+  renderCalendar();
+  renderReasoning();
+
+  // Recover anything that resolved while the app was closed, then pick the loop back up.
+  if (autonomy.enabled) {
+    await autonomyCatchUp();
+    startAutonomy();
+  } else {
+    setAutonomyStatus('Off — check the box above to start.', 'idle', '');
+  }
+}
+bootstrap();
+ + fmt(p.requestedEntry)
+      + '</span><span><span class="mono" style="color:#5c6270;">not filled</span> '
+      + '<button class="btn" data-paper-action="close" data-paper-id="' + p.id + '" style="padding:3px 7px;font-size:10px;">Cancel</button></span></div>').join('');
+  }
+
+  const open = paper.positions.filter(p => p.status === 'open' && inEra(p));
+  if (open.length) {
+    html += '<div style="font-size:10px;color:#454a56;margin:10px 0 6px;">Open positions</div>';
+    html += open.map(p => {
+      const u = unrealisedPnl(p, price);
+      return '<div class="zone-item" style="align-items:flex-start;"><span><span class="dirtag ' + p.dir + '">' + p.dir + '</span> ' + lotLabel(p)
+        + ' · entry 
+  }
+
+  const closed = paper.positions.filter(p => p.status === 'closed' && inEra(p)).slice(0, 8);
+  if (closed.length) {
+    html += '<div style="font-size:10px;color:#454a56;margin:10px 0 6px;">Recent closed</div>';
+    html += closed.map(p =>
+      '<div class="zone-item"><span><span class="dirtag ' + p.dir + '">' + p.dir + '</span> ' + (p.outcome === 'won' ? (p.partial ? '◐' : '✓') : p.outcome === 'lost' ? '✗' : '–')
+      + ' <span style="color:#454a56;">' + lotLabel(p) + ' · exit $' + fmt(p.exitPrice) + '</span></span>'
+      + '<span class="mono ' + pnlCls(p.pnl) + '">' + money(p.pnl) + (p.rMultiple != null ? ' <span style="color:#454a56;">' + (p.rMultiple >= 0 ? '+' : '') + fmt(p.rMultiple) + 'R</span>' : '') + '</span></div>'
+    ).join('');
+  }
+
+  if (!resting.length && !open.length && !closed.length) {
+    html += '<div class="zone-empty">' + (a.archivedCount
+      ? 'Account reset — no trades in this era yet. The record above is intact.'
+      : 'No paper trades yet. Positions open automatically as the engine logs signals.') + '</div>';
+  }
+  root.innerHTML = html;
+}
+
+function renderPaperStatusNote() {
+  const note = document.getElementById('paperStatus');
+  if (!note) return;
+  if (!paper.enabled) { note.textContent = 'Off — no positions will be opened.'; return; }
+  note.textContent = paper.manual
+    ? 'On — new signals will open simulated positions. No real orders are placed.'
+    : 'On for the engine\'s own signals. Signals you generate by hand are excluded (signal panel).';
+}
+
+document.getElementById('paperEnabled').addEventListener('change', function () {
+  paper.enabled = this.checked;
+  savePaper();
+  renderPaper();
+  renderPaperStatusNote();
+  renderPaperManualHint();
+});
+
+const paperManualCb = document.getElementById('paperManual');
+if (paperManualCb) paperManualCb.addEventListener('change', function () {
+  paper.manual = this.checked;
+  // Ticking it with the account off is a request to paper-trade, so honour it
+  // rather than silently doing nothing.
+  if (paper.manual && !paper.enabled) {
+    paper.enabled = true;
+    const master = document.getElementById('paperEnabled');
+    if (master) master.checked = true;
+  }
+  savePaper();
+  renderPaper();
+  renderPaperStatusNote();
+  renderPaperManualHint();
+});
+document.getElementById('paperAdvancedToggle').addEventListener('click', () => {
+  document.getElementById('paperAdvanced').classList.toggle('hidden');
+});
+['pStartBalance', 'pRiskPct', 'pSpread', 'pSlippage', 'pMaxPos', 'pPartialPct', 'pHoldMeta', 'pPartialEnabled'].forEach(id => {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener('change', () => { paper.startingBalance = paperConfig().startingBalance; savePaper(); renderPaper(); });
+});
+document.getElementById('paperReset').addEventListener('click', async () => {
+  const price = currentMarkPrice();
+  const live = paper.positions.filter(p => p.status === 'open' || p.status === 'pending').length;
+  const keeping = paper.positions.filter(p => p.status === 'closed').length;
+  const msg = 'Reset the paper account back to $' + fmt(paperConfig().startingBalance) + '?\n\n'
+    + (live ? live + ' live position(s) will be closed at the current price first.\n' : '')
+    + keeping + ' completed trade(s) stay on record — they are what the system learns from, '
+    + 'and they keep counting towards the lifetime win rate. They just stop counting towards the balance.';
+  if (!window.confirm(msg)) return;
+  const out = resetPaperAccount(paper.positions, isFinite(price) ? price : undefined, Date.now());
+  paper.positions = out.positions;
+  paper.epoch = out.epoch;
+  await savePaper();
+  renderPaper();
+  renderDataInventory();
+});
+
+// ============================================================
+// ANALYSIS QUALITY PANEL
+// ------------------------------------------------------------
+// Renders the three self-audits. Every number here is deliberately allowed to
+// say "not enough data yet" rather than show a confident-looking figure built
+// on four trades — a reassuring number from a tiny sample is worse than no
+// number, because it gets believed.
+// ============================================================
+function fmtR(v) { return v == null ? '—' : (v >= 0 ? '+' : '') + v.toFixed(2) + 'R'; }
+function fmtPct(v) { return v == null ? '—' : (v * 100).toFixed(0) + '%'; }
+function rClass(v) { return v == null ? 'fneu' : v > 0.05 ? 'fpos' : v < -0.05 ? 'fneg' : 'fneu'; }
+
+function renderAnalysisQuality() {
+  const root = document.getElementById('qualityContent');
+  if (!root) return;
+
+  const cal = computeCalibration(signalLog);
+  const bd = computeConditionBreakdown(signalLog);
+  const audit = computeGateAudit(signalLog, shadowLog);
+
+  const rows = (list, label) => {
+    const usable = list.filter(r => r.n >= 3);
+    if (!usable.length) return '<div class="zone-empty">' + label + ': not enough resolved trades yet (need 3+ per group).</div>';
+    return usable.map(r =>
+      '<div class="zone-item"><span>' + r.key + ' <span style="color:#454a56;">(' + r.n + ')</span></span>' +
+      '<span class="mono ' + rClass(r.expectancyR) + '">' + fmtR(r.expectancyR) + ' · ' + fmtPct(r.winRate) + '</span></div>'
+    ).join('');
+  };
+
+  const o = bd.overall;
+  let html = '';
+
+  html += '<div class="data-source-note" style="margin-bottom:8px;">Expectancy is shown in R — average profit per unit risked. At a 1:4 target a 30% win rate is already profitable, so win rate alone is a poor scorecard and R is the honest one.</div>';
+
+  html += '<div class="metrics" style="margin-bottom:10px;">'
+    + '<div class="card"><div class="label">Resolved</div><div class="value mono">' + o.n + '</div></div>'
+    + '<div class="card"><div class="label">Win Rate</div><div class="value mono">' + fmtPct(o.winRate) + '</div></div>'
+    + '<div class="card"><div class="label">Expectancy</div><div class="value mono ' + rClass(o.expectancyR) + '">' + fmtR(o.expectancyR) + '</div></div>'
+    + '<div class="card"><div class="label">Total</div><div class="value mono ' + rClass(o.totalR) + '">' + fmtR(o.totalR) + '</div></div>'
+    + '</div>';
+
+  // 1. Is the confidence number worth anything?
+  html += '<div class="panel-title" style="font-size:11px;margin-top:12px;">Is the confidence score meaningful?</div>';
+  html += '<div class="event-line" style="border-left-color:#e8c37a;">' + cal.verdict + '</div>';
+  if (cal.discrimination != null) {
+    html += '<div class="zone-item"><span>High-confidence half vs low-confidence half</span><span class="mono ' + rClass(cal.discrimination) + '">'
+      + (cal.discrimination >= 0 ? '+' : '') + (cal.discrimination * 100).toFixed(0) + ' pp win rate</span></div>';
+  }
+  if (cal.buckets.length) {
+    html += '<table class="factor-table"><tr><th style="text-align:left;color:#5c6270;font-weight:500;">Confidence band</th><th style="color:#5c6270;font-weight:500;">Win rate</th><th style="color:#5c6270;font-weight:500;">Expectancy</th></tr>';
+    html += cal.buckets.map(b =>
+      '<tr><td>' + b.lo + '–' + b.hi + '% <span style="color:#454a56;">(' + b.n + ')</span></td>'
+      + '<td>' + fmtPct(b.winRate) + '</td>'
+      + '<td class="' + rClass(b.expectancyR) + '">' + fmtR(b.expectancyR) + '</td></tr>').join('');
+    html += '</table>';
+  }
+
+  // 2. Where does the edge actually live?
+  html += '<div class="panel-title" style="font-size:11px;margin-top:14px;">Where the edge actually lives</div>';
+  html += '<div style="font-size:10px;color:#454a56;margin-bottom:6px;">By session</div>' + rows(bd.bySession, 'Session');
+  html += '<div style="font-size:10px;color:#454a56;margin:8px 0 6px;">By market regime</div>' + rows(bd.byRegime, 'Regime');
+  html += '<div style="font-size:10px;color:#454a56;margin:8px 0 6px;">By grade</div>' + rows(bd.byGrade, 'Grade');
+  html += '<div style="font-size:10px;color:#454a56;margin:8px 0 6px;">By direction</div>' + rows(bd.byDirection, 'Direction');
+
+  // 3. The roads not taken.
+  html += '<div class="panel-title" style="font-size:11px;margin-top:14px;">The setups it turned down</div>';
+  html += '<div class="data-source-note" style="margin-bottom:6px;">Every setup the filter rejected is tracked and resolved against real price anyway. This is the comparison a human journal can never make, because nobody records their non-trades.</div>';
+  html += '<div class="zone-item"><span>Taken</span><span class="mono ' + rClass(audit.taken.expectancyR) + '">'
+    + fmtR(audit.taken.expectancyR) + ' <span style="color:#454a56;">(' + audit.taken.n + ')</span></span></div>';
+  html += '<div class="zone-item"><span>Declined</span><span class="mono ' + rClass(audit.declined.expectancyR) + '">'
+    + fmtR(audit.declined.expectancyR) + ' <span style="color:#454a56;">(' + audit.declined.n + ')</span></span></div>';
+  const pending = shadowLog.filter(s => s.status === 'pending' || s.status === 'open').length;
+  if (pending) html += '<div class="zone-item"><span>Declined, still running</span><span class="mono">' + pending + '</span></div>';
+  html += '<div class="event-line" style="border-left-color:#c99bff;margin-top:6px;">' + audit.verdict + '</div>';
+
+  root.innerHTML = html;
+}
+document.getElementById('resetQuality').addEventListener('click', async () => {
+  shadowLog = [];
+  await saveShadowLog();
+  renderAnalysisQuality();
+});
+
+// ============================================================
+// AUTONOMOUS MODE
+// ------------------------------------------------------------
+// The unattended operator. Once the user ticks the box, a single heartbeat
+// drives everything: fetch fresh candles, grade any signal that has since hit
+// its stop or target, re-analyse, commit a new signal if the gate clears, and
+// periodically re-backtest and retrain on the record it has built.
+//
+// Three things make this survive real-world conditions rather than only a tab
+// left open on a desk:
+//   * One 60s heartbeat with due-time checks, not a pile of setIntervals. A
+//     laptop that sleeps for six hours wakes up, sees every task is overdue,
+//     and runs them once — rather than firing a backlog of missed timers.
+//   * Losing the connection is expected, not exceptional. Offline is a quiet
+//     pause; repeated failures back off exponentially instead of hammering a
+//     rate-limited provider until the key is blocked.
+//   * Time with the tab closed is recovered, not lost. catchUp() replays the
+//     gap from real candle history on the next load, so signals that resolved
+//     while nobody was watching still become training data.
+// ============================================================
+
+const AUTONOMY_KEY = 'smc-autonomy-v1';
+const AUTONOMY_HEARTBEAT_MS = 60 * 1000;
+
+let autonomyHandle = null;
+let autonomyBusy = false;
+
+function autonomyConfig() {
+  const num = (id, fallback) => {
+    const el = document.getElementById(id);
+    const v = el ? parseFloat(el.value) : NaN;
+    return isFinite(v) ? v : fallback;
+  };
+  return Object.assign({}, AUTONOMY_DEFAULTS, {
+    minConfidence: num('aMinConf', AUTONOMY_DEFAULTS.minConfidence),
+    cooldownMinutes: num('aCooldown', AUTONOMY_DEFAULTS.cooldownMinutes),
+    maxOpenSignals: num('aMaxOpen', AUTONOMY_DEFAULTS.maxOpenSignals),
+    analysisIntervalMinutes: num('aInterval', AUTONOMY_DEFAULTS.analysisIntervalMinutes),
+    backtestIntervalHours: num('aBtHours', AUTONOMY_DEFAULTS.backtestIntervalHours),
+    minMetaScore: num('aMinMeta', AUTONOMY_DEFAULTS.minMetaScore),
+    // Kill switch. 0 in any field disables that arm rather than expiring
+    // everything instantly, which is what a 0 limit would otherwise mean.
+    maxHoursToFill: num('aKillFill', AUTONOMY_DEFAULTS.maxHoursToFill),
+    maxHoursOpen: num('aKillOpen', AUTONOMY_DEFAULTS.maxHoursOpen),
+    maxDriftRToFill: num('aKillDrift', AUTONOMY_DEFAULTS.maxDriftRToFill),
+    partialTP: partialTPConfig(),
+    newsState: currentNewsState(),
+    gradeFloor: (document.getElementById('aMinGrade') || {}).value || AUTONOMY_DEFAULTS.gradeFloor
+  });
+}
+
+function saveAutonomyState() {
+  try {
+    localStorage.setItem(AUTONOMY_KEY, JSON.stringify({
+      enabled: autonomy.enabled,
+      cycles: autonomy.cycles,
+      gateTally: autonomy.gateTally,
+      signalsTaken: autonomy.signalsTaken,
+      autoResolved: autonomy.autoResolved,
+      lastAnalysisAt: autonomy.lastAnalysisAt,
+      lastBacktestAt: autonomy.lastBacktestAt,
+      lastSignalAt: autonomy.lastSignalAt,
+      cfg: {
+        aMinConf: document.getElementById('aMinConf').value,
+        aCooldown: document.getElementById('aCooldown').value,
+        aKillFill: document.getElementById('aKillFill').value,
+        aKillOpen: document.getElementById('aKillOpen').value,
+        aKillDrift: document.getElementById('aKillDrift').value,
+        aMaxOpen: document.getElementById('aMaxOpen').value,
+        aInterval: document.getElementById('aInterval').value,
+        aBtHours: document.getElementById('aBtHours').value,
+        aMinMeta: document.getElementById('aMinMeta').value,
+        aDailyCap: document.getElementById('aDailyCap').value,
+        aMinGrade: document.getElementById('aMinGrade').value
+      }
+    }));
+  } catch (e) { /* storage unavailable — autonomy still works, it just won't remember across reloads */ }
+}
+
+function loadAutonomyState() {
+  try {
+    const raw = localStorage.getItem(AUTONOMY_KEY);
+    if (!raw) return;
+    const saved = JSON.parse(raw);
+    Object.assign(autonomy, {
+      enabled: !!saved.enabled,
+      cycles: saved.cycles || 0,
+      gateTally: saved.gateTally || {},
+      signalsTaken: saved.signalsTaken || 0,
+      autoResolved: saved.autoResolved || 0,
+      lastAnalysisAt: saved.lastAnalysisAt || null,
+      lastBacktestAt: saved.lastBacktestAt || null,
+      lastSignalAt: saved.lastSignalAt || null
+    });
+    if (saved.cfg) {
+      Object.keys(saved.cfg).forEach(id => {
+        const el = document.getElementById(id);
+        if (el && saved.cfg[id] != null) el.value = saved.cfg[id];
+      });
+    }
+    document.getElementById('autonomyEnabled').checked = autonomy.enabled;
+  } catch (e) { /* nothing saved yet */ }
+}
+
+function setAutonomyStatus(text, tone, reason) {
+  const dot = document.getElementById('autonomyDot');
+  const status = document.getElementById('autonomyStatus');
+  const reasonEl = document.getElementById('autonomyReason');
+  if (!status) return;
+  status.textContent = text;
+  const colours = { live: '#3ecf8e', warn: '#ffa726', error: '#ef4d5f', idle: '#454a56' };
+  const c = colours[tone] || colours.idle;
+  dot.style.background = c;
+  dot.style.boxShadow = tone === 'live' ? '0 0 7px ' + c : 'none';
+  status.style.color = tone === 'idle' ? '#9298a5' : c;
+  if (reason !== undefined) reasonEl.textContent = reason || '';
+}
+
+function renderAutonomyStats() {
+  const live = signalLog.filter(s => s.status === 'pending' || s.status === 'open');
+  document.getElementById('aCycles').textContent = autonomy.cycles;
+  document.getElementById('aSignals').textContent = autonomy.signalsTaken;
+  document.getElementById('aResolved').textContent = autonomy.autoResolved;
+  document.getElementById('aOpen').textContent = live.length;
+
+  const killedEl = document.getElementById('aKilled');
+  if (killedEl) killedEl.textContent = signalLog.filter(s => s.status === 'expired').length;
+
+  // How long the oldest live trade has been sitting. This is the number that
+  // was invisible before: an order resting for a day looked identical to one
+  // placed a minute ago.
+  const oldestEl = document.getElementById('aOldest');
+  if (oldestEl) {
+    const cfg = autonomyConfig();
+    // Each trade is aged against the limit that actually applies to it: a
+    // resting order against the fill limit, a filled one against the hold
+    // limit. Using the larger of the two would leave an order 2.5x past its own
+    // deadline showing no warning at all.
+    const ages = live.map(s => {
+      const filled = s.status === 'open';
+      const t = Date.parse(filled ? (s.filledAt || s.time) : s.time);
+      if (!isFinite(t)) return null;
+      const hours = (Date.now() - t) / 3600000;
+      const limit = filled ? cfg.maxHoursOpen : cfg.maxHoursToFill;
+      return { hours, ratio: limit > 0 ? hours / limit : 0 };
+    }).filter(v => v != null);
+    if (!ages.length) {
+      oldestEl.textContent = '—';
+      oldestEl.style.color = '';
+    } else {
+      const worst = ages.reduce((a, b) => b.hours > a.hours ? b : a, ages[0]);
+      const closest = ages.reduce((a, b) => b.ratio > a.ratio ? b : a, ages[0]);
+      oldestEl.textContent = worst.hours < 1 ? Math.round(worst.hours * 60) + 'm' : worst.hours.toFixed(1) + 'h';
+      // Amber as a trade approaches its own kill limit, red once past it, so
+      // one about to be culled is visible before it disappears.
+      oldestEl.style.color = closest.ratio >= 1 ? '#ef4d5f' : closest.ratio >= 0.75 ? '#ffa726' : '';
+    }
+  }
+
+  const el = document.getElementById('gateTally');
+  if (!el) return;
+  const entries = Object.keys(autonomy.gateTally || {})
+    .map(k => ({ code: k, n: autonomy.gateTally[k] }))
+    .sort((a, b) => b.n - a.n);
+  if (!entries.length) { el.innerHTML = ''; return; }
+  el.innerHTML = '<div style="font-size:10px;color:#454a56;margin:8px 0 4px;">Why cycles ended this way</div>'
+    + entries.map(e => '<div class="zone-item" style="padding:3px 0;"><span style="font-size:11px;">'
+        + (GATE_LABELS[e.code] || e.code) + '</span><span class="mono" style="font-size:11px;color:'
+        + (e.code === 'taken' ? '#3ecf8e' : '#5c6270') + ';">' + e.n + '</span></div>').join('');
+}
+
+// Grade every unresolved signal against `candles`. Used both by the heartbeat
+// (fresh candles each cycle) and by catchUp() (deep history after downtime).
+// Returns how many signals reached a win/loss verdict.
+function resolveOpenSignals(candles, cfg) {
+  if (!candles || candles.length < 2) return 0;
+  let resolved = 0, killed = 0, changed = false;
+
+  // The auditor decides which live trades are past saving, not the engine.
+  // Letting the engine judge whether its own trade has gone bad is the thing
+  // the auditor exists to avoid — and it re-derives fill state from raw candles
+  // rather than trusting the signal's own status, so a "pending" order price
+  // actually traded through is caught rather than aged as if it never filled.
+  const tradeAudit = auditOpenTrades(signalLog, candles, {
+    maxHoursToFill: cfg.maxHoursToFill,
+    maxHoursOpen: cfg.maxHoursOpen,
+    maxDriftRToFill: cfg.maxDriftRToFill
+  });
+  lastTradeAudit = tradeAudit;
+  const killedBy = new Map(tradeAudit.kills.map(k => [k.id, k]));
+
+  signalLog.forEach(sig => {
+    if (sig.status !== 'pending' && sig.status !== 'open') return;
+    // An auditor kill outranks whatever the resolver would have said, EXCEPT
+    // when price has already settled the trade: a stop or target that has
+    // genuinely been hit is a real outcome and real evidence, and discarding it
+    // to enforce a time limit would throw away the data the limit exists to
+    // protect.
+    const verdict = resolveSignal(sig, candles, cfg);
+    const kill = killedBy.get(sig.id);
+    if (kill && verdict.status !== 'won' && verdict.status !== 'lost') {
+      sig.status = 'expired';
+      sig.expiryReason = 'auditor: ' + kill.reason;
+      sig.killSwitch = kill.code;
+      sig.resolvedAt = new Date().toISOString();
+      sig.resolvedBy = 'auditor';
+      paperCloseForSignal(sig.id, 'expired');
+      killed++; changed = true;
+      return;
+    }
+    if (verdict.status === 'won' || verdict.status === 'lost') {
+      if (applySignalOutcome(sig, verdict.status === 'won', {
+        auto: true, exitPrice: verdict.exitPrice, ambiguousBar: verdict.ambiguousBar, partial: verdict.partial
+      })) { resolved++; changed = true; }
+    } else if (verdict.status === 'expired') {
+      sig.status = 'expired';
+      sig.expiryReason = verdict.reason || null;
+      sig.killSwitch = verdict.killSwitch || null;
+      sig.resolvedAt = new Date().toISOString();
+      sig.resolvedBy = 'auto';
+      paperCloseForSignal(sig.id, 'expired');
+      if (verdict.killSwitch) killed++;
+      changed = true; // expired signals never become training data — no outcome to learn from
+    } else if (verdict.status === 'open' && sig.status === 'pending') {
+      sig.status = 'open'; // limit entry got tagged; it's a live position now
+      sig.filledAt = new Date().toISOString();
+      paperFillForSignal(sig.id, sig.filledAt);
+      changed = true;
+    }
+  });
+  if (changed) { saveSignalLog(); renderSignalLog(); }
+  if (resolved) autonomy.autoResolved += resolved;
+  if (killed) autonomy.killed = (autonomy.killed || 0) + killed;
+  resolveShadowSignals(candles, cfg);
+  return resolved;
+}
+
+// Shadows get the same treatment, minus the learning updates — a setup the
+// engine declined should inform the audit, not train the weights as though it
+// had been traded.
+function resolveShadowSignals(candles, cfg) {
+  if (!candles || candles.length < 2 || !shadowLog.length) return;
+  let changed = false;
+  shadowLog.forEach(sig => {
+    if (sig.status !== 'pending' && sig.status !== 'open') return;
+    const verdict = resolveSignal(sig, candles, cfg);
+    if (verdict.status === 'won' || verdict.status === 'lost') {
+      sig.status = verdict.status;
+      sig.resolvedAt = new Date().toISOString();
+      changed = true;
+    } else if (verdict.status === 'expired') {
+      sig.status = 'expired'; sig.expiryReason = verdict.reason || null; changed = true;
+    } else if (verdict.status === 'open' && sig.status === 'pending') {
+      sig.status = 'open'; changed = true;
+    }
+  });
+  if (changed) { saveShadowLog(); renderAnalysisQuality(); }
+}
+
+// One unattended pass. Everything that can fail is inside the caller's try.
+async function autonomyCycle() {
+  const cfg = autonomyConfig();
+  const now = Date.now();
+
+  // 0. Calendar first. It gates whether a signal may be taken at all, so it has
+  // to be current BEFORE the gate reads it — refreshing at the end of the cycle
+  // meant the first pass after a reconnect ran against an empty calendar and
+  // could take a position straight into a release window.
+  await refreshCalendar(false);
+
+  // 1. Fresh candles. resyncCandles() already refreshes liveData from the provider.
+  await resyncCandles();
+
+  // 2. Grade what the market has already decided since the last pass.
+  const graded = resolveOpenSignals(liveData, cfg);
+
+  // 3. Re-analyse on the new data.
+  refreshAll();
+  autonomy.lastAnalysisAt = now;
+
+  // 4. Commit a signal only if the gate clears.
+  let reason;
+  if (lastComposite) {
+    const plan = buildTradePlan(lastComposite, getTargetRR());
+    // The auditor is advisory everywhere except here. A critical finding means
+    // the analysis contradicts itself or the data it was built on — that is not
+    // a risk preference, and no confidence score should be able to override it.
+    const audit = runAudit();
+    renderAudit();
+    let gate;
+    if (audit && audit.blocking) {
+      gate = { take: false, code: 'audit',
+        reason: 'independent audit found ' + audit.critical + ' critical issue(s): ' + audit.findings[0].title };
+    } else {
+      gate = autonomyGate(lastComposite, plan, signalLog, autonomy.lastSignalAt, cfg);
+    }
+    // Tally why each cycle ended as it did. One latest-reason line cannot show
+    // whether 13 quiet cycles mean "no setup existed" or "the filter blocked
+    // every one" — and those need opposite responses.
+    const code = gate.code || 'unknown';
+    autonomy.gateTally[code] = (autonomy.gateTally[code] || 0) + 1;
+    if (gate.take) {
+      updateSignalUI(lastComposite, plan, true, 'auto'); // logIt = true -> addSignalToLog
+      autonomy.signalsTaken++;
+      autonomy.lastSignalAt = now;
+      reason = 'Took a ' + lastComposite.direction + ' at $' + fmt(plan.entry) +
+               ' (' + lastComposite.confidence + '% confidence' + (gate.grade ? ', grade ' + gate.grade : '') + ').';
+    } else {
+      updateSignalUI(lastComposite, plan, false); // keep the panel current without logging
+      // Track what was passed on, so the filter can be audited later rather
+      // than trusted forever.
+      addShadowSignal(lastComposite, plan, gate.reason);
+      reason = 'No signal taken — ' + gate.reason + '.';
+    }
+  } else {
+    reason = 'Analysis produced no result this cycle.';
+  }
+  if (graded) reason = 'Self-graded ' + graded + ' signal' + (graded === 1 ? '' : 's') + '. ' + reason;
+  autonomy.lastReason = reason;
+
+  // 5. Periodic re-backtest / retrain on the accumulated record.
+  const btDue = !autonomy.lastBacktestAt || (now - autonomy.lastBacktestAt) >= cfg.backtestIntervalHours * 3600 * 1000;
+  if (btDue) {
+    autonomy.lastBacktestAt = now;
+    await runBacktestCycle(true);
+  }
+
+  renderAnalysisQuality();
+  renderDataInventory();
+  renderCalendar();
+  renderReasoning();
+  runAudit();
+  renderAudit();
+  autonomy.cycles++;
+  autonomy.consecutiveErrors = 0;
+  autonomy.lastError = null;
+  saveAutonomyState();
+  renderAutonomyStats();
+  if (candlesStaleForBudget) {
+    setAutonomyStatus('Running on cached candles — daily API budget spent, resumes 00:00 UTC.', 'warn',
+      'Still grading open signals and re-analysing, but on the last candles fetched rather than fresh ones. ' + reason);
+  } else {
+    setAutonomyStatus('Running autonomously — last pass ' + new Date(now).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) + '.', 'live', reason);
+  }
+}
+
+// The heartbeat: decides whether a cycle is due, and handles every reason it
+// might not be. Deliberately does no analysis itself.
+async function autonomyHeartbeat() {
+  if (!autonomy.enabled || autonomyBusy) return;
+
+  if (!navigator.onLine) {
+    setAutonomyStatus('Paused — no internet connection. Resumes automatically.', 'warn',
+      'Nothing is lost while offline; the gap gets replayed from candle history once the connection is back.');
+    return;
+  }
+  if (dataMode !== 'live') {
+    setAutonomyStatus('Waiting for a live data provider — connect an API key above.', 'warn',
+      'Autonomous mode needs real candles; it will not run on the simulated feed.');
+    return;
+  }
+  // Gold is shut from Friday ~21:00 UTC to Sunday ~22:00 UTC. Analysing a frozen
+  // feed produces confident-looking signals off Friday's last bar, and every one
+  // of them enters the learning record as a real read of a market that was not
+  // trading. Nothing to analyse, so nothing runs.
+  if (!isMarketOpen(Date.now())) {
+    const clock = marketClock(Date.now());
+    const h = clock.hoursUntilOpen;
+    setAutonomyStatus('Market closed — resumes when gold reopens in ' +
+      (h < 1 ? Math.round(h * 60) + 'm' : h.toFixed(1) + 'h') + '.', 'warn',
+      'The feed is frozen at Friday\u2019s close. Analysing it would generate signals from a market that is not trading.');
+    return;
+  }
+  if (autonomy.skipCycles > 0) {
+    autonomy.skipCycles--;
+    setAutonomyStatus('Backing off after an error — retrying in ' + (autonomy.skipCycles + 1) + ' min.', 'warn', autonomy.lastError);
+    return;
+  }
+
+  const cfg = autonomyConfig();
+  const dueAt = (autonomy.lastAnalysisAt || 0) + cfg.analysisIntervalMinutes * 60 * 1000;
+  if (Date.now() < dueAt) {
+    const mins = Math.ceil((dueAt - Date.now()) / 60000);
+    setAutonomyStatus('Running autonomously — next pass in ' + mins + ' min.', 'live', autonomy.lastReason);
+    return;
+  }
+
+  autonomyBusy = true;
+  try {
+    await autonomyCycle();
+  } catch (e) {
+    autonomy.consecutiveErrors++;
+    autonomy.lastError = (e && e.message) || String(e);
+    // Exponential backoff, capped at ~30 min. A rate-limited or expired key
+    // should not turn into a request every minute for the rest of the day.
+    autonomy.skipCycles = Math.min(Math.pow(2, autonomy.consecutiveErrors), 30);
+    setAutonomyStatus('Cycle failed (' + autonomy.consecutiveErrors + ' in a row) — backing off ' + autonomy.skipCycles + ' min.', 'error', autonomy.lastError);
+    saveAutonomyState();
+  } finally {
+    autonomyBusy = false;
+  }
+}
+
+// Replay the time the app was closed or disconnected. Pulls the deepest history
+// the provider allows and grades every still-open signal against it, so a signal
+// that hit its target overnight is training data by the time the user looks.
+async function autonomyCatchUp() {
+  if (dataMode !== 'live' || !navigator.onLine) return;
+  const stillOpen = signalLog.filter(s => s.status === 'pending' || s.status === 'open');
+  if (!stillOpen.length) return;
+  setAutonomyStatus('Catching up — replaying ' + stillOpen.length + ' unresolved signal(s) against real history…', 'warn', '');
+  try {
+    const history = await PROVIDERS[activeProvider].timeSeries(apiKey, LIVE_INTERVAL, 5000);
+    const n = resolveOpenSignals(history, autonomyConfig());
+    renderAutonomyStats();
+    saveAutonomyState();
+    setAutonomyStatus('Catch-up complete.', autonomy.enabled ? 'live' : 'idle',
+      n ? 'Graded ' + n + ' signal(s) that resolved while the app was closed.'
+        : 'No signals had resolved while the app was closed.');
+  } catch (e) {
+    // Not fatal — the regular heartbeat will keep trying against live candles.
+    setAutonomyStatus('Catch-up could not fetch history — continuing on live candles.', 'warn', (e && e.message) || String(e));
+  }
+}
+
+function startAutonomy() {
+  if (autonomyHandle) clearInterval(autonomyHandle);
+  autonomyHandle = setInterval(autonomyHeartbeat, AUTONOMY_HEARTBEAT_MS);
+  autonomy.skipCycles = 0;
+  autonomy.consecutiveErrors = 0;
+  setAutonomyStatus('Autonomous mode on — first pass starting…', 'live', '');
+  autonomy.lastAnalysisAt = null; // force an immediate first pass
+  autonomyHeartbeat();
+}
+
+function stopAutonomy() {
+  if (autonomyHandle) { clearInterval(autonomyHandle); autonomyHandle = null; }
+  setAutonomyStatus('Off — check the box above to start.', 'idle', '');
+}
+
+document.getElementById('autonomyEnabled').addEventListener('change', function () {
+  autonomy.enabled = this.checked;
+  saveAutonomyState();
+  if (autonomy.enabled) startAutonomy(); else stopAutonomy();
+});
+providerSelect.addEventListener('change', renderQuota);
+const umm = document.getElementById('useMacroModel');
+if (umm) umm.addEventListener('change', () => { renderKnowledge(); renderReasoning(); });
+
+// A posture for building up a record rather than protecting capital. The engine
+// learns from resolved trades, and at the default B floor a ranging market
+// simply never qualifies — so a cautious setup collects nothing and the
+// knowledge base never starts.
+document.getElementById('aPresetCollect').addEventListener('click', () => {
+  // D, not C: even a perfect five-timeframe alignment only scores ~49%, so a C
+  // floor (>=30%) still rejects ordinary conditions and collects almost nothing.
+  document.getElementById('aMinGrade').value = 'D';
+  document.getElementById('aMinConf').value = 15;
+  document.getElementById('aCooldown').value = 30;
+  document.getElementById('aMaxOpen').value = 5;
+  document.getElementById('aMinMeta').value = -0.5;
+  saveAutonomyState();
+  autonomy.lastAnalysisAt = null; // re-evaluate immediately under the new thresholds
+  setAutonomyStatus('Data-collection thresholds applied — re-evaluating now.', 'live', '');
+  autonomyHeartbeat();
+});
+document.getElementById('autonomyAdvancedToggle').addEventListener('click', () => {
+  document.getElementById('autonomyAdvanced').classList.toggle('hidden');
+});
+['aMinConf', 'aCooldown', 'aMaxOpen', 'aInterval', 'aBtHours', 'aMinMeta', 'aDailyCap', 'aMinGrade',
+ 'aKillFill', 'aKillOpen', 'aKillDrift'].forEach(id => {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener('change', () => { saveAutonomyState(); renderQuota(); });
+});
+
+// React to connectivity changes straight away rather than waiting out a heartbeat.
+window.addEventListener('online', () => {
+  if (!autonomy.enabled) return;
+  autonomy.skipCycles = 0;
+  autonomy.consecutiveErrors = 0;
+  setAutonomyStatus('Back online — catching up…', 'warn', '');
+  autonomyCatchUp().then(autonomyHeartbeat);
+});
+window.addEventListener('offline', () => {
+  if (autonomy.enabled) setAutonomyStatus('Paused — no internet connection. Resumes automatically.', 'warn', '');
+});
+// Coming back to a backgrounded tab is a good moment to check for missed work:
+// mobile browsers in particular throttle timers hard once a tab is hidden.
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && autonomy.enabled) autonomyHeartbeat();
+});
+
+// ============================================================
+// BOOTSTRAP
+// ------------------------------------------------------------
+// Ordering matters here, which is why it is one explicit sequence rather than
+// scattered top-level calls: persisted learning state has to be restored (and
+// its weights applied) before the first analysis, and every DOM const further
+// up this file has to exist before anything reads it.
+// ============================================================
+// ============================================================
+// SETTINGS THAT SURVIVE A RELOAD
+// ------------------------------------------------------------
+// Only the paper account's balance and the autonomy thresholds were ever
+// persisted. Everything else a person could change — risk per trade, spread,
+// slippage, max concurrent, the partial-take-profit rules, all fourteen factor
+// weights, the target R:R, every backtest parameter, the news-window settings —
+// was read straight off the DOM and lost the moment the page reloaded. Tuning
+// the system was therefore something you had to redo from memory each session,
+// and an autonomous run would quietly revert to defaults after any refresh.
+//
+// One store, one list, restored before the first analysis so the weights are in
+// force when it runs. Ids that already have an owner are deliberately absent —
+// autonomy keeps its own (AUTONOMY_KEY), the paper on/off switches live with the
+// account, and the API keys are opt-in through "remember keys" rather than
+// swept up here.
+const SETTINGS_KEY = 'smc-settings-v1';
+const SETTINGS_IDS = [
+  // paper account
+  'pStartBalance', 'pRiskPct', 'pSpread', 'pSlippage', 'pMaxPos',
+  'pSizingMode', 'pFixedLots', 'pContractSize', 'pLotStep', 'pMinLots',
+  'pPartialPct', 'pHoldMeta', 'pPartialEnabled',
+  // factor weights
+  'wWeekly', 'wDaily', 'wHtf', 'wMtf', 'wLtf', 'wOb', 'wFvg', 'wLiq',
+  'wPd', 'wPriceAction', 'wClassic', 'wCorrelation', 'wFundamental', 'wNews',
+  // signal + backtest
+  'targetRR', 'pBars', 'pCapital', 'pRisk', 'pCostPips', 'pMinConf', 'pTargetRR',
+  // news window and macro model
+  'newsBeforeMin', 'newsAfterMin', 'newsBlockEnabled', 'newsBlockMedium',
+  'newsFlattenEnabled', 'newsFlattenMin', 'newsAlertMin', 'useMacroModel',
+  'weekendFlattenEnabled', 'weekendFlattenMin'
+];
+
+function saveSettings() {
+  const out = {};
+  SETTINGS_IDS.forEach(id => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    out[id] = el.type === 'checkbox' ? !!el.checked : el.value;
+  });
+  try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(out)); }
+  catch (e) { return false; }
+  return true;
+}
+
+function loadSettings() {
+  let saved;
+  try { saved = JSON.parse(localStorage.getItem(SETTINGS_KEY) || 'null'); }
+  catch (e) { return; }
+  if (!saved || typeof saved !== 'object') return;
+  SETTINGS_IDS.forEach(id => {
+    if (!(id in saved)) return;
+    const el = document.getElementById(id);
+    if (!el) return;
+    if (el.type === 'checkbox') el.checked = !!saved[id];
+    else if (saved[id] != null) el.value = saved[id];
+  });
+  // Sliders carry a printed value beside them that does not follow a
+  // programmatic change, so a restored weight would show the old number.
+  syncSliderLabels();
+}
+
+function syncSliderLabels() {
+  weightIds.forEach(id => {
+    const el = document.getElementById(id), out = document.getElementById(id + 'V');
+    if (el && out) out.textContent = el.value;
+  });
+  const rr = document.getElementById('targetRR'), rrOut = document.getElementById('targetRRV');
+  if (rr && rrOut) rrOut.textContent = '1:' + rr.value;
+}
+
+let settingsSaveTimer = null;
+function flagSettingsSaved() {
+  const el = document.getElementById('settingsSavedNote');
+  if (!el) return;
+  el.textContent = 'Settings saved.';
+  el.style.color = '#3ecf8e';
+  clearTimeout(settingsSaveTimer);
+  settingsSaveTimer = setTimeout(() => { el.textContent = ''; }, 2500);
+}
+
+function wireSettingsPersistence() {
+  SETTINGS_IDS.forEach(id => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    const handler = () => { if (saveSettings()) flagSettingsSaved(); };
+    el.addEventListener('change', handler);
+    // Sliders and number spinners fire `input` continuously; `change` alone
+    // would miss a drag that never blurs.
+    if (el.type === 'range' || el.type === 'number') el.addEventListener('input', handler);
+  });
+}
+
+// ============================================================
+// IS THIS TAB STILL RUNNING THE CURRENT CODE?
+// ------------------------------------------------------------
+// This app is built to be left open for days doing unattended analysis, which
+// means a tab can go on running the modules it loaded at open time long after a
+// fix has shipped. That is not hypothetical: the macro engine ran on 1976-2006
+// FRED data, the fix deployed, and an open tab would have carried on producing
+// confident, wrong numbers with nothing on screen to say so.
+//
+// The check compares the ETag of app.js now against the one seen at startup, so
+// it needs no version constant to keep in sync and no build step. `no-store`
+// forces the request past the browser cache; the server already sends
+// must-revalidate, so this is cheap.
+const UPDATE_CHECK_MS = 30 * 60 * 1000;
+let loadedBuildTag = null;
+let updateWatchHandle = null;
+
+async function currentBuildTag() {
+  try {
+    const r = await fetch('app.js', { method: 'HEAD', cache: 'no-store' });
+    return r.headers.get('etag') || r.headers.get('last-modified') || null;
+  } catch (e) {
+    return null; // offline, or the check is blocked — try again next time
+  }
+}
+
+async function checkForNewBuild() {
+  const tag = await currentBuildTag();
+  if (!tag) return;
+  if (loadedBuildTag == null) { loadedBuildTag = tag; return; }
+  if (tag === loadedBuildTag) return;
+  const banner = document.getElementById('updateBanner');
+  if (banner) banner.classList.remove('hidden');
+}
+
+function startUpdateWatch() {
+  const reload = document.getElementById('updateReload');
+  if (reload) reload.addEventListener('click', () => window.location.reload());
+  checkForNewBuild();
+  if (updateWatchHandle) clearInterval(updateWatchHandle);
+  updateWatchHandle = setInterval(checkForNewBuild, UPDATE_CHECK_MS);
+}
+
+async function bootstrap() {
+  // Before anything reads a control: the weights, risk settings and thresholds
+  // have to be the saved ones by the time the first analysis runs.
+  loadSettings();
+  wireSettingsPersistence();
+  await loadLearningState();
+  await loadSignalLog();
+  await loadShadowLog();
+  applyKnowledgeBaseWeights();
+  await loadPaper();
+  await loadKnowledge();
+  await loadCalendarCache();
+  loadAutonomyState();
+  loadQuota();
+  // Every store the merge touches is loaded by this point — the log it merges
+  // into, the paper account it books positions in, the learning state it
+  // updates. Replay anything the worker sent while that was still loading.
+  flushPendingIngest();
+  renderSignalLog();   // first render happened before the paper account loaded
+  startLivenessTicker();
+  startUpdateWatch();
+  startNewsWatch();
+  renderQuota();
+  renderAutonomyStats();
+  renderAnalysisQuality();
+  renderPaper();
+  renderDataInventory();
+  renderCalendar();
+  renderReasoning();
+  renderKnowledge();
+  runAudit();
+  renderAudit();
+  refreshWorkerTotals().then(renderDataInventory);
+  refreshAll();
+
+  const saved = await loadSavedKeys();
+  if (!saved) {
+    document.getElementById('autoBacktestStatus').textContent = 'Connect a data provider to enable auto-backtesting.';
+  } else {
+    document.getElementById('rememberKeysCheckbox').checked = true;
+    if (saved.provider) providerSelect.value = saved.provider;
+    if (saved.fredKey) document.getElementById('fredKeyInput').value = saved.fredKey;
+    if (saved.newsKey) document.getElementById('newsKeyInput').value = saved.newsKey;
+    if (typeof saved.autoBacktest === 'boolean') document.getElementById('autoBacktestCheckbox').checked = saved.autoBacktest;
+    if (saved.apiKey) {
+      document.getElementById('apiKeyInput').value = saved.apiKey;
+      connStatus.textContent = 'Restoring saved connection...';
+      await connectProvider(); // also re-fetches correlation/fundamentals/news with the restored keys
+    } else if (saved.fredKey || saved.newsKey) {
+      // No price provider was connected, but FRED/news keys were saved independently — restore those engines too.
+      await refreshCorrelation(activeProvider, apiKey, saved.fredKey || '');
+      await refreshFundamentals(saved.fredKey || '');
+      await refreshNewsSentiment(saved.newsKey || '');
+      refreshAll();
+      document.getElementById('autoBacktestStatus').textContent = 'Connect a data provider to enable auto-backtesting.';
+    } else {
+      document.getElementById('autoBacktestStatus').textContent = 'Connect a data provider to enable auto-backtesting.';
+    }
+  }
+
+  // The calendar gates trading, so it must be loaded before autonomy's first pass.
+  await refreshCalendar(false);
+  renderCalendar();
+  renderReasoning();
+
+  // Recover anything that resolved while the app was closed, then pick the loop back up.
+  if (autonomy.enabled) {
+    await autonomyCatchUp();
+    startAutonomy();
+  } else {
+    setAutonomyStatus('Off — check the box above to start.', 'idle', '');
+  }
+}
+bootstrap();
+ + fmt(p.entryFill) + ' · SL 
+  }
+
+  const closed = paper.positions.filter(p => p.status === 'closed' && inEra(p)).slice(0, 8);
+  if (closed.length) {
+    html += '<div style="font-size:10px;color:#454a56;margin:10px 0 6px;">Recent closed</div>';
+    html += closed.map(p =>
+      '<div class="zone-item"><span><span class="dirtag ' + p.dir + '">' + p.dir + '</span> ' + (p.outcome === 'won' ? (p.partial ? '◐' : '✓') : p.outcome === 'lost' ? '✗' : '–')
+      + ' <span style="color:#454a56;">' + lotLabel(p) + ' · exit $' + fmt(p.exitPrice) + '</span></span>'
+      + '<span class="mono ' + pnlCls(p.pnl) + '">' + money(p.pnl) + (p.rMultiple != null ? ' <span style="color:#454a56;">' + (p.rMultiple >= 0 ? '+' : '') + fmt(p.rMultiple) + 'R</span>' : '') + '</span></div>'
+    ).join('');
+  }
+
+  if (!resting.length && !open.length && !closed.length) {
+    html += '<div class="zone-empty">' + (a.archivedCount
+      ? 'Account reset — no trades in this era yet. The record above is intact.'
+      : 'No paper trades yet. Positions open automatically as the engine logs signals.') + '</div>';
+  }
+  root.innerHTML = html;
+}
+
+function renderPaperStatusNote() {
+  const note = document.getElementById('paperStatus');
+  if (!note) return;
+  if (!paper.enabled) { note.textContent = 'Off — no positions will be opened.'; return; }
+  note.textContent = paper.manual
+    ? 'On — new signals will open simulated positions. No real orders are placed.'
+    : 'On for the engine\'s own signals. Signals you generate by hand are excluded (signal panel).';
+}
+
+document.getElementById('paperEnabled').addEventListener('change', function () {
+  paper.enabled = this.checked;
+  savePaper();
+  renderPaper();
+  renderPaperStatusNote();
+  renderPaperManualHint();
+});
+
+const paperManualCb = document.getElementById('paperManual');
+if (paperManualCb) paperManualCb.addEventListener('change', function () {
+  paper.manual = this.checked;
+  // Ticking it with the account off is a request to paper-trade, so honour it
+  // rather than silently doing nothing.
+  if (paper.manual && !paper.enabled) {
+    paper.enabled = true;
+    const master = document.getElementById('paperEnabled');
+    if (master) master.checked = true;
+  }
+  savePaper();
+  renderPaper();
+  renderPaperStatusNote();
+  renderPaperManualHint();
+});
+document.getElementById('paperAdvancedToggle').addEventListener('click', () => {
+  document.getElementById('paperAdvanced').classList.toggle('hidden');
+});
+['pStartBalance', 'pRiskPct', 'pSpread', 'pSlippage', 'pMaxPos', 'pPartialPct', 'pHoldMeta', 'pPartialEnabled'].forEach(id => {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener('change', () => { paper.startingBalance = paperConfig().startingBalance; savePaper(); renderPaper(); });
+});
+document.getElementById('paperReset').addEventListener('click', async () => {
+  const price = currentMarkPrice();
+  const live = paper.positions.filter(p => p.status === 'open' || p.status === 'pending').length;
+  const keeping = paper.positions.filter(p => p.status === 'closed').length;
+  const msg = 'Reset the paper account back to $' + fmt(paperConfig().startingBalance) + '?\n\n'
+    + (live ? live + ' live position(s) will be closed at the current price first.\n' : '')
+    + keeping + ' completed trade(s) stay on record — they are what the system learns from, '
+    + 'and they keep counting towards the lifetime win rate. They just stop counting towards the balance.';
+  if (!window.confirm(msg)) return;
+  const out = resetPaperAccount(paper.positions, isFinite(price) ? price : undefined, Date.now());
+  paper.positions = out.positions;
+  paper.epoch = out.epoch;
+  await savePaper();
+  renderPaper();
+  renderDataInventory();
+});
+
+// ============================================================
+// ANALYSIS QUALITY PANEL
+// ------------------------------------------------------------
+// Renders the three self-audits. Every number here is deliberately allowed to
+// say "not enough data yet" rather than show a confident-looking figure built
+// on four trades — a reassuring number from a tiny sample is worse than no
+// number, because it gets believed.
+// ============================================================
+function fmtR(v) { return v == null ? '—' : (v >= 0 ? '+' : '') + v.toFixed(2) + 'R'; }
+function fmtPct(v) { return v == null ? '—' : (v * 100).toFixed(0) + '%'; }
+function rClass(v) { return v == null ? 'fneu' : v > 0.05 ? 'fpos' : v < -0.05 ? 'fneg' : 'fneu'; }
+
+function renderAnalysisQuality() {
+  const root = document.getElementById('qualityContent');
+  if (!root) return;
+
+  const cal = computeCalibration(signalLog);
+  const bd = computeConditionBreakdown(signalLog);
+  const audit = computeGateAudit(signalLog, shadowLog);
+
+  const rows = (list, label) => {
+    const usable = list.filter(r => r.n >= 3);
+    if (!usable.length) return '<div class="zone-empty">' + label + ': not enough resolved trades yet (need 3+ per group).</div>';
+    return usable.map(r =>
+      '<div class="zone-item"><span>' + r.key + ' <span style="color:#454a56;">(' + r.n + ')</span></span>' +
+      '<span class="mono ' + rClass(r.expectancyR) + '">' + fmtR(r.expectancyR) + ' · ' + fmtPct(r.winRate) + '</span></div>'
+    ).join('');
+  };
+
+  const o = bd.overall;
+  let html = '';
+
+  html += '<div class="data-source-note" style="margin-bottom:8px;">Expectancy is shown in R — average profit per unit risked. At a 1:4 target a 30% win rate is already profitable, so win rate alone is a poor scorecard and R is the honest one.</div>';
+
+  html += '<div class="metrics" style="margin-bottom:10px;">'
+    + '<div class="card"><div class="label">Resolved</div><div class="value mono">' + o.n + '</div></div>'
+    + '<div class="card"><div class="label">Win Rate</div><div class="value mono">' + fmtPct(o.winRate) + '</div></div>'
+    + '<div class="card"><div class="label">Expectancy</div><div class="value mono ' + rClass(o.expectancyR) + '">' + fmtR(o.expectancyR) + '</div></div>'
+    + '<div class="card"><div class="label">Total</div><div class="value mono ' + rClass(o.totalR) + '">' + fmtR(o.totalR) + '</div></div>'
+    + '</div>';
+
+  // 1. Is the confidence number worth anything?
+  html += '<div class="panel-title" style="font-size:11px;margin-top:12px;">Is the confidence score meaningful?</div>';
+  html += '<div class="event-line" style="border-left-color:#e8c37a;">' + cal.verdict + '</div>';
+  if (cal.discrimination != null) {
+    html += '<div class="zone-item"><span>High-confidence half vs low-confidence half</span><span class="mono ' + rClass(cal.discrimination) + '">'
+      + (cal.discrimination >= 0 ? '+' : '') + (cal.discrimination * 100).toFixed(0) + ' pp win rate</span></div>';
+  }
+  if (cal.buckets.length) {
+    html += '<table class="factor-table"><tr><th style="text-align:left;color:#5c6270;font-weight:500;">Confidence band</th><th style="color:#5c6270;font-weight:500;">Win rate</th><th style="color:#5c6270;font-weight:500;">Expectancy</th></tr>';
+    html += cal.buckets.map(b =>
+      '<tr><td>' + b.lo + '–' + b.hi + '% <span style="color:#454a56;">(' + b.n + ')</span></td>'
+      + '<td>' + fmtPct(b.winRate) + '</td>'
+      + '<td class="' + rClass(b.expectancyR) + '">' + fmtR(b.expectancyR) + '</td></tr>').join('');
+    html += '</table>';
+  }
+
+  // 2. Where does the edge actually live?
+  html += '<div class="panel-title" style="font-size:11px;margin-top:14px;">Where the edge actually lives</div>';
+  html += '<div style="font-size:10px;color:#454a56;margin-bottom:6px;">By session</div>' + rows(bd.bySession, 'Session');
+  html += '<div style="font-size:10px;color:#454a56;margin:8px 0 6px;">By market regime</div>' + rows(bd.byRegime, 'Regime');
+  html += '<div style="font-size:10px;color:#454a56;margin:8px 0 6px;">By grade</div>' + rows(bd.byGrade, 'Grade');
+  html += '<div style="font-size:10px;color:#454a56;margin:8px 0 6px;">By direction</div>' + rows(bd.byDirection, 'Direction');
+
+  // 3. The roads not taken.
+  html += '<div class="panel-title" style="font-size:11px;margin-top:14px;">The setups it turned down</div>';
+  html += '<div class="data-source-note" style="margin-bottom:6px;">Every setup the filter rejected is tracked and resolved against real price anyway. This is the comparison a human journal can never make, because nobody records their non-trades.</div>';
+  html += '<div class="zone-item"><span>Taken</span><span class="mono ' + rClass(audit.taken.expectancyR) + '">'
+    + fmtR(audit.taken.expectancyR) + ' <span style="color:#454a56;">(' + audit.taken.n + ')</span></span></div>';
+  html += '<div class="zone-item"><span>Declined</span><span class="mono ' + rClass(audit.declined.expectancyR) + '">'
+    + fmtR(audit.declined.expectancyR) + ' <span style="color:#454a56;">(' + audit.declined.n + ')</span></span></div>';
+  const pending = shadowLog.filter(s => s.status === 'pending' || s.status === 'open').length;
+  if (pending) html += '<div class="zone-item"><span>Declined, still running</span><span class="mono">' + pending + '</span></div>';
+  html += '<div class="event-line" style="border-left-color:#c99bff;margin-top:6px;">' + audit.verdict + '</div>';
+
+  root.innerHTML = html;
+}
+document.getElementById('resetQuality').addEventListener('click', async () => {
+  shadowLog = [];
+  await saveShadowLog();
+  renderAnalysisQuality();
+});
+
+// ============================================================
+// AUTONOMOUS MODE
+// ------------------------------------------------------------
+// The unattended operator. Once the user ticks the box, a single heartbeat
+// drives everything: fetch fresh candles, grade any signal that has since hit
+// its stop or target, re-analyse, commit a new signal if the gate clears, and
+// periodically re-backtest and retrain on the record it has built.
+//
+// Three things make this survive real-world conditions rather than only a tab
+// left open on a desk:
+//   * One 60s heartbeat with due-time checks, not a pile of setIntervals. A
+//     laptop that sleeps for six hours wakes up, sees every task is overdue,
+//     and runs them once — rather than firing a backlog of missed timers.
+//   * Losing the connection is expected, not exceptional. Offline is a quiet
+//     pause; repeated failures back off exponentially instead of hammering a
+//     rate-limited provider until the key is blocked.
+//   * Time with the tab closed is recovered, not lost. catchUp() replays the
+//     gap from real candle history on the next load, so signals that resolved
+//     while nobody was watching still become training data.
+// ============================================================
+
+const AUTONOMY_KEY = 'smc-autonomy-v1';
+const AUTONOMY_HEARTBEAT_MS = 60 * 1000;
+
+let autonomyHandle = null;
+let autonomyBusy = false;
+
+function autonomyConfig() {
+  const num = (id, fallback) => {
+    const el = document.getElementById(id);
+    const v = el ? parseFloat(el.value) : NaN;
+    return isFinite(v) ? v : fallback;
+  };
+  return Object.assign({}, AUTONOMY_DEFAULTS, {
+    minConfidence: num('aMinConf', AUTONOMY_DEFAULTS.minConfidence),
+    cooldownMinutes: num('aCooldown', AUTONOMY_DEFAULTS.cooldownMinutes),
+    maxOpenSignals: num('aMaxOpen', AUTONOMY_DEFAULTS.maxOpenSignals),
+    analysisIntervalMinutes: num('aInterval', AUTONOMY_DEFAULTS.analysisIntervalMinutes),
+    backtestIntervalHours: num('aBtHours', AUTONOMY_DEFAULTS.backtestIntervalHours),
+    minMetaScore: num('aMinMeta', AUTONOMY_DEFAULTS.minMetaScore),
+    // Kill switch. 0 in any field disables that arm rather than expiring
+    // everything instantly, which is what a 0 limit would otherwise mean.
+    maxHoursToFill: num('aKillFill', AUTONOMY_DEFAULTS.maxHoursToFill),
+    maxHoursOpen: num('aKillOpen', AUTONOMY_DEFAULTS.maxHoursOpen),
+    maxDriftRToFill: num('aKillDrift', AUTONOMY_DEFAULTS.maxDriftRToFill),
+    partialTP: partialTPConfig(),
+    newsState: currentNewsState(),
+    gradeFloor: (document.getElementById('aMinGrade') || {}).value || AUTONOMY_DEFAULTS.gradeFloor
+  });
+}
+
+function saveAutonomyState() {
+  try {
+    localStorage.setItem(AUTONOMY_KEY, JSON.stringify({
+      enabled: autonomy.enabled,
+      cycles: autonomy.cycles,
+      gateTally: autonomy.gateTally,
+      signalsTaken: autonomy.signalsTaken,
+      autoResolved: autonomy.autoResolved,
+      lastAnalysisAt: autonomy.lastAnalysisAt,
+      lastBacktestAt: autonomy.lastBacktestAt,
+      lastSignalAt: autonomy.lastSignalAt,
+      cfg: {
+        aMinConf: document.getElementById('aMinConf').value,
+        aCooldown: document.getElementById('aCooldown').value,
+        aKillFill: document.getElementById('aKillFill').value,
+        aKillOpen: document.getElementById('aKillOpen').value,
+        aKillDrift: document.getElementById('aKillDrift').value,
+        aMaxOpen: document.getElementById('aMaxOpen').value,
+        aInterval: document.getElementById('aInterval').value,
+        aBtHours: document.getElementById('aBtHours').value,
+        aMinMeta: document.getElementById('aMinMeta').value,
+        aDailyCap: document.getElementById('aDailyCap').value,
+        aMinGrade: document.getElementById('aMinGrade').value
+      }
+    }));
+  } catch (e) { /* storage unavailable — autonomy still works, it just won't remember across reloads */ }
+}
+
+function loadAutonomyState() {
+  try {
+    const raw = localStorage.getItem(AUTONOMY_KEY);
+    if (!raw) return;
+    const saved = JSON.parse(raw);
+    Object.assign(autonomy, {
+      enabled: !!saved.enabled,
+      cycles: saved.cycles || 0,
+      gateTally: saved.gateTally || {},
+      signalsTaken: saved.signalsTaken || 0,
+      autoResolved: saved.autoResolved || 0,
+      lastAnalysisAt: saved.lastAnalysisAt || null,
+      lastBacktestAt: saved.lastBacktestAt || null,
+      lastSignalAt: saved.lastSignalAt || null
+    });
+    if (saved.cfg) {
+      Object.keys(saved.cfg).forEach(id => {
+        const el = document.getElementById(id);
+        if (el && saved.cfg[id] != null) el.value = saved.cfg[id];
+      });
+    }
+    document.getElementById('autonomyEnabled').checked = autonomy.enabled;
+  } catch (e) { /* nothing saved yet */ }
+}
+
+function setAutonomyStatus(text, tone, reason) {
+  const dot = document.getElementById('autonomyDot');
+  const status = document.getElementById('autonomyStatus');
+  const reasonEl = document.getElementById('autonomyReason');
+  if (!status) return;
+  status.textContent = text;
+  const colours = { live: '#3ecf8e', warn: '#ffa726', error: '#ef4d5f', idle: '#454a56' };
+  const c = colours[tone] || colours.idle;
+  dot.style.background = c;
+  dot.style.boxShadow = tone === 'live' ? '0 0 7px ' + c : 'none';
+  status.style.color = tone === 'idle' ? '#9298a5' : c;
+  if (reason !== undefined) reasonEl.textContent = reason || '';
+}
+
+function renderAutonomyStats() {
+  const live = signalLog.filter(s => s.status === 'pending' || s.status === 'open');
+  document.getElementById('aCycles').textContent = autonomy.cycles;
+  document.getElementById('aSignals').textContent = autonomy.signalsTaken;
+  document.getElementById('aResolved').textContent = autonomy.autoResolved;
+  document.getElementById('aOpen').textContent = live.length;
+
+  const killedEl = document.getElementById('aKilled');
+  if (killedEl) killedEl.textContent = signalLog.filter(s => s.status === 'expired').length;
+
+  // How long the oldest live trade has been sitting. This is the number that
+  // was invisible before: an order resting for a day looked identical to one
+  // placed a minute ago.
+  const oldestEl = document.getElementById('aOldest');
+  if (oldestEl) {
+    const cfg = autonomyConfig();
+    // Each trade is aged against the limit that actually applies to it: a
+    // resting order against the fill limit, a filled one against the hold
+    // limit. Using the larger of the two would leave an order 2.5x past its own
+    // deadline showing no warning at all.
+    const ages = live.map(s => {
+      const filled = s.status === 'open';
+      const t = Date.parse(filled ? (s.filledAt || s.time) : s.time);
+      if (!isFinite(t)) return null;
+      const hours = (Date.now() - t) / 3600000;
+      const limit = filled ? cfg.maxHoursOpen : cfg.maxHoursToFill;
+      return { hours, ratio: limit > 0 ? hours / limit : 0 };
+    }).filter(v => v != null);
+    if (!ages.length) {
+      oldestEl.textContent = '—';
+      oldestEl.style.color = '';
+    } else {
+      const worst = ages.reduce((a, b) => b.hours > a.hours ? b : a, ages[0]);
+      const closest = ages.reduce((a, b) => b.ratio > a.ratio ? b : a, ages[0]);
+      oldestEl.textContent = worst.hours < 1 ? Math.round(worst.hours * 60) + 'm' : worst.hours.toFixed(1) + 'h';
+      // Amber as a trade approaches its own kill limit, red once past it, so
+      // one about to be culled is visible before it disappears.
+      oldestEl.style.color = closest.ratio >= 1 ? '#ef4d5f' : closest.ratio >= 0.75 ? '#ffa726' : '';
+    }
+  }
+
+  const el = document.getElementById('gateTally');
+  if (!el) return;
+  const entries = Object.keys(autonomy.gateTally || {})
+    .map(k => ({ code: k, n: autonomy.gateTally[k] }))
+    .sort((a, b) => b.n - a.n);
+  if (!entries.length) { el.innerHTML = ''; return; }
+  el.innerHTML = '<div style="font-size:10px;color:#454a56;margin:8px 0 4px;">Why cycles ended this way</div>'
+    + entries.map(e => '<div class="zone-item" style="padding:3px 0;"><span style="font-size:11px;">'
+        + (GATE_LABELS[e.code] || e.code) + '</span><span class="mono" style="font-size:11px;color:'
+        + (e.code === 'taken' ? '#3ecf8e' : '#5c6270') + ';">' + e.n + '</span></div>').join('');
+}
+
+// Grade every unresolved signal against `candles`. Used both by the heartbeat
+// (fresh candles each cycle) and by catchUp() (deep history after downtime).
+// Returns how many signals reached a win/loss verdict.
+function resolveOpenSignals(candles, cfg) {
+  if (!candles || candles.length < 2) return 0;
+  let resolved = 0, killed = 0, changed = false;
+
+  // The auditor decides which live trades are past saving, not the engine.
+  // Letting the engine judge whether its own trade has gone bad is the thing
+  // the auditor exists to avoid — and it re-derives fill state from raw candles
+  // rather than trusting the signal's own status, so a "pending" order price
+  // actually traded through is caught rather than aged as if it never filled.
+  const tradeAudit = auditOpenTrades(signalLog, candles, {
+    maxHoursToFill: cfg.maxHoursToFill,
+    maxHoursOpen: cfg.maxHoursOpen,
+    maxDriftRToFill: cfg.maxDriftRToFill
+  });
+  lastTradeAudit = tradeAudit;
+  const killedBy = new Map(tradeAudit.kills.map(k => [k.id, k]));
+
+  signalLog.forEach(sig => {
+    if (sig.status !== 'pending' && sig.status !== 'open') return;
+    // An auditor kill outranks whatever the resolver would have said, EXCEPT
+    // when price has already settled the trade: a stop or target that has
+    // genuinely been hit is a real outcome and real evidence, and discarding it
+    // to enforce a time limit would throw away the data the limit exists to
+    // protect.
+    const verdict = resolveSignal(sig, candles, cfg);
+    const kill = killedBy.get(sig.id);
+    if (kill && verdict.status !== 'won' && verdict.status !== 'lost') {
+      sig.status = 'expired';
+      sig.expiryReason = 'auditor: ' + kill.reason;
+      sig.killSwitch = kill.code;
+      sig.resolvedAt = new Date().toISOString();
+      sig.resolvedBy = 'auditor';
+      paperCloseForSignal(sig.id, 'expired');
+      killed++; changed = true;
+      return;
+    }
+    if (verdict.status === 'won' || verdict.status === 'lost') {
+      if (applySignalOutcome(sig, verdict.status === 'won', {
+        auto: true, exitPrice: verdict.exitPrice, ambiguousBar: verdict.ambiguousBar, partial: verdict.partial
+      })) { resolved++; changed = true; }
+    } else if (verdict.status === 'expired') {
+      sig.status = 'expired';
+      sig.expiryReason = verdict.reason || null;
+      sig.killSwitch = verdict.killSwitch || null;
+      sig.resolvedAt = new Date().toISOString();
+      sig.resolvedBy = 'auto';
+      paperCloseForSignal(sig.id, 'expired');
+      if (verdict.killSwitch) killed++;
+      changed = true; // expired signals never become training data — no outcome to learn from
+    } else if (verdict.status === 'open' && sig.status === 'pending') {
+      sig.status = 'open'; // limit entry got tagged; it's a live position now
+      sig.filledAt = new Date().toISOString();
+      paperFillForSignal(sig.id, sig.filledAt);
+      changed = true;
+    }
+  });
+  if (changed) { saveSignalLog(); renderSignalLog(); }
+  if (resolved) autonomy.autoResolved += resolved;
+  if (killed) autonomy.killed = (autonomy.killed || 0) + killed;
+  resolveShadowSignals(candles, cfg);
+  return resolved;
+}
+
+// Shadows get the same treatment, minus the learning updates — a setup the
+// engine declined should inform the audit, not train the weights as though it
+// had been traded.
+function resolveShadowSignals(candles, cfg) {
+  if (!candles || candles.length < 2 || !shadowLog.length) return;
+  let changed = false;
+  shadowLog.forEach(sig => {
+    if (sig.status !== 'pending' && sig.status !== 'open') return;
+    const verdict = resolveSignal(sig, candles, cfg);
+    if (verdict.status === 'won' || verdict.status === 'lost') {
+      sig.status = verdict.status;
+      sig.resolvedAt = new Date().toISOString();
+      changed = true;
+    } else if (verdict.status === 'expired') {
+      sig.status = 'expired'; sig.expiryReason = verdict.reason || null; changed = true;
+    } else if (verdict.status === 'open' && sig.status === 'pending') {
+      sig.status = 'open'; changed = true;
+    }
+  });
+  if (changed) { saveShadowLog(); renderAnalysisQuality(); }
+}
+
+// One unattended pass. Everything that can fail is inside the caller's try.
+async function autonomyCycle() {
+  const cfg = autonomyConfig();
+  const now = Date.now();
+
+  // 0. Calendar first. It gates whether a signal may be taken at all, so it has
+  // to be current BEFORE the gate reads it — refreshing at the end of the cycle
+  // meant the first pass after a reconnect ran against an empty calendar and
+  // could take a position straight into a release window.
+  await refreshCalendar(false);
+
+  // 1. Fresh candles. resyncCandles() already refreshes liveData from the provider.
+  await resyncCandles();
+
+  // 2. Grade what the market has already decided since the last pass.
+  const graded = resolveOpenSignals(liveData, cfg);
+
+  // 3. Re-analyse on the new data.
+  refreshAll();
+  autonomy.lastAnalysisAt = now;
+
+  // 4. Commit a signal only if the gate clears.
+  let reason;
+  if (lastComposite) {
+    const plan = buildTradePlan(lastComposite, getTargetRR());
+    // The auditor is advisory everywhere except here. A critical finding means
+    // the analysis contradicts itself or the data it was built on — that is not
+    // a risk preference, and no confidence score should be able to override it.
+    const audit = runAudit();
+    renderAudit();
+    let gate;
+    if (audit && audit.blocking) {
+      gate = { take: false, code: 'audit',
+        reason: 'independent audit found ' + audit.critical + ' critical issue(s): ' + audit.findings[0].title };
+    } else {
+      gate = autonomyGate(lastComposite, plan, signalLog, autonomy.lastSignalAt, cfg);
+    }
+    // Tally why each cycle ended as it did. One latest-reason line cannot show
+    // whether 13 quiet cycles mean "no setup existed" or "the filter blocked
+    // every one" — and those need opposite responses.
+    const code = gate.code || 'unknown';
+    autonomy.gateTally[code] = (autonomy.gateTally[code] || 0) + 1;
+    if (gate.take) {
+      updateSignalUI(lastComposite, plan, true, 'auto'); // logIt = true -> addSignalToLog
+      autonomy.signalsTaken++;
+      autonomy.lastSignalAt = now;
+      reason = 'Took a ' + lastComposite.direction + ' at $' + fmt(plan.entry) +
+               ' (' + lastComposite.confidence + '% confidence' + (gate.grade ? ', grade ' + gate.grade : '') + ').';
+    } else {
+      updateSignalUI(lastComposite, plan, false); // keep the panel current without logging
+      // Track what was passed on, so the filter can be audited later rather
+      // than trusted forever.
+      addShadowSignal(lastComposite, plan, gate.reason);
+      reason = 'No signal taken — ' + gate.reason + '.';
+    }
+  } else {
+    reason = 'Analysis produced no result this cycle.';
+  }
+  if (graded) reason = 'Self-graded ' + graded + ' signal' + (graded === 1 ? '' : 's') + '. ' + reason;
+  autonomy.lastReason = reason;
+
+  // 5. Periodic re-backtest / retrain on the accumulated record.
+  const btDue = !autonomy.lastBacktestAt || (now - autonomy.lastBacktestAt) >= cfg.backtestIntervalHours * 3600 * 1000;
+  if (btDue) {
+    autonomy.lastBacktestAt = now;
+    await runBacktestCycle(true);
+  }
+
+  renderAnalysisQuality();
+  renderDataInventory();
+  renderCalendar();
+  renderReasoning();
+  runAudit();
+  renderAudit();
+  autonomy.cycles++;
+  autonomy.consecutiveErrors = 0;
+  autonomy.lastError = null;
+  saveAutonomyState();
+  renderAutonomyStats();
+  if (candlesStaleForBudget) {
+    setAutonomyStatus('Running on cached candles — daily API budget spent, resumes 00:00 UTC.', 'warn',
+      'Still grading open signals and re-analysing, but on the last candles fetched rather than fresh ones. ' + reason);
+  } else {
+    setAutonomyStatus('Running autonomously — last pass ' + new Date(now).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) + '.', 'live', reason);
+  }
+}
+
+// The heartbeat: decides whether a cycle is due, and handles every reason it
+// might not be. Deliberately does no analysis itself.
+async function autonomyHeartbeat() {
+  if (!autonomy.enabled || autonomyBusy) return;
+
+  if (!navigator.onLine) {
+    setAutonomyStatus('Paused — no internet connection. Resumes automatically.', 'warn',
+      'Nothing is lost while offline; the gap gets replayed from candle history once the connection is back.');
+    return;
+  }
+  if (dataMode !== 'live') {
+    setAutonomyStatus('Waiting for a live data provider — connect an API key above.', 'warn',
+      'Autonomous mode needs real candles; it will not run on the simulated feed.');
+    return;
+  }
+  // Gold is shut from Friday ~21:00 UTC to Sunday ~22:00 UTC. Analysing a frozen
+  // feed produces confident-looking signals off Friday's last bar, and every one
+  // of them enters the learning record as a real read of a market that was not
+  // trading. Nothing to analyse, so nothing runs.
+  if (!isMarketOpen(Date.now())) {
+    const clock = marketClock(Date.now());
+    const h = clock.hoursUntilOpen;
+    setAutonomyStatus('Market closed — resumes when gold reopens in ' +
+      (h < 1 ? Math.round(h * 60) + 'm' : h.toFixed(1) + 'h') + '.', 'warn',
+      'The feed is frozen at Friday\u2019s close. Analysing it would generate signals from a market that is not trading.');
+    return;
+  }
+  if (autonomy.skipCycles > 0) {
+    autonomy.skipCycles--;
+    setAutonomyStatus('Backing off after an error — retrying in ' + (autonomy.skipCycles + 1) + ' min.', 'warn', autonomy.lastError);
+    return;
+  }
+
+  const cfg = autonomyConfig();
+  const dueAt = (autonomy.lastAnalysisAt || 0) + cfg.analysisIntervalMinutes * 60 * 1000;
+  if (Date.now() < dueAt) {
+    const mins = Math.ceil((dueAt - Date.now()) / 60000);
+    setAutonomyStatus('Running autonomously — next pass in ' + mins + ' min.', 'live', autonomy.lastReason);
+    return;
+  }
+
+  autonomyBusy = true;
+  try {
+    await autonomyCycle();
+  } catch (e) {
+    autonomy.consecutiveErrors++;
+    autonomy.lastError = (e && e.message) || String(e);
+    // Exponential backoff, capped at ~30 min. A rate-limited or expired key
+    // should not turn into a request every minute for the rest of the day.
+    autonomy.skipCycles = Math.min(Math.pow(2, autonomy.consecutiveErrors), 30);
+    setAutonomyStatus('Cycle failed (' + autonomy.consecutiveErrors + ' in a row) — backing off ' + autonomy.skipCycles + ' min.', 'error', autonomy.lastError);
+    saveAutonomyState();
+  } finally {
+    autonomyBusy = false;
+  }
+}
+
+// Replay the time the app was closed or disconnected. Pulls the deepest history
+// the provider allows and grades every still-open signal against it, so a signal
+// that hit its target overnight is training data by the time the user looks.
+async function autonomyCatchUp() {
+  if (dataMode !== 'live' || !navigator.onLine) return;
+  const stillOpen = signalLog.filter(s => s.status === 'pending' || s.status === 'open');
+  if (!stillOpen.length) return;
+  setAutonomyStatus('Catching up — replaying ' + stillOpen.length + ' unresolved signal(s) against real history…', 'warn', '');
+  try {
+    const history = await PROVIDERS[activeProvider].timeSeries(apiKey, LIVE_INTERVAL, 5000);
+    const n = resolveOpenSignals(history, autonomyConfig());
+    renderAutonomyStats();
+    saveAutonomyState();
+    setAutonomyStatus('Catch-up complete.', autonomy.enabled ? 'live' : 'idle',
+      n ? 'Graded ' + n + ' signal(s) that resolved while the app was closed.'
+        : 'No signals had resolved while the app was closed.');
+  } catch (e) {
+    // Not fatal — the regular heartbeat will keep trying against live candles.
+    setAutonomyStatus('Catch-up could not fetch history — continuing on live candles.', 'warn', (e && e.message) || String(e));
+  }
+}
+
+function startAutonomy() {
+  if (autonomyHandle) clearInterval(autonomyHandle);
+  autonomyHandle = setInterval(autonomyHeartbeat, AUTONOMY_HEARTBEAT_MS);
+  autonomy.skipCycles = 0;
+  autonomy.consecutiveErrors = 0;
+  setAutonomyStatus('Autonomous mode on — first pass starting…', 'live', '');
+  autonomy.lastAnalysisAt = null; // force an immediate first pass
+  autonomyHeartbeat();
+}
+
+function stopAutonomy() {
+  if (autonomyHandle) { clearInterval(autonomyHandle); autonomyHandle = null; }
+  setAutonomyStatus('Off — check the box above to start.', 'idle', '');
+}
+
+document.getElementById('autonomyEnabled').addEventListener('change', function () {
+  autonomy.enabled = this.checked;
+  saveAutonomyState();
+  if (autonomy.enabled) startAutonomy(); else stopAutonomy();
+});
+providerSelect.addEventListener('change', renderQuota);
+const umm = document.getElementById('useMacroModel');
+if (umm) umm.addEventListener('change', () => { renderKnowledge(); renderReasoning(); });
+
+// A posture for building up a record rather than protecting capital. The engine
+// learns from resolved trades, and at the default B floor a ranging market
+// simply never qualifies — so a cautious setup collects nothing and the
+// knowledge base never starts.
+document.getElementById('aPresetCollect').addEventListener('click', () => {
+  // D, not C: even a perfect five-timeframe alignment only scores ~49%, so a C
+  // floor (>=30%) still rejects ordinary conditions and collects almost nothing.
+  document.getElementById('aMinGrade').value = 'D';
+  document.getElementById('aMinConf').value = 15;
+  document.getElementById('aCooldown').value = 30;
+  document.getElementById('aMaxOpen').value = 5;
+  document.getElementById('aMinMeta').value = -0.5;
+  saveAutonomyState();
+  autonomy.lastAnalysisAt = null; // re-evaluate immediately under the new thresholds
+  setAutonomyStatus('Data-collection thresholds applied — re-evaluating now.', 'live', '');
+  autonomyHeartbeat();
+});
+document.getElementById('autonomyAdvancedToggle').addEventListener('click', () => {
+  document.getElementById('autonomyAdvanced').classList.toggle('hidden');
+});
+['aMinConf', 'aCooldown', 'aMaxOpen', 'aInterval', 'aBtHours', 'aMinMeta', 'aDailyCap', 'aMinGrade',
+ 'aKillFill', 'aKillOpen', 'aKillDrift'].forEach(id => {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener('change', () => { saveAutonomyState(); renderQuota(); });
+});
+
+// React to connectivity changes straight away rather than waiting out a heartbeat.
+window.addEventListener('online', () => {
+  if (!autonomy.enabled) return;
+  autonomy.skipCycles = 0;
+  autonomy.consecutiveErrors = 0;
+  setAutonomyStatus('Back online — catching up…', 'warn', '');
+  autonomyCatchUp().then(autonomyHeartbeat);
+});
+window.addEventListener('offline', () => {
+  if (autonomy.enabled) setAutonomyStatus('Paused — no internet connection. Resumes automatically.', 'warn', '');
+});
+// Coming back to a backgrounded tab is a good moment to check for missed work:
+// mobile browsers in particular throttle timers hard once a tab is hidden.
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && autonomy.enabled) autonomyHeartbeat();
+});
+
+// ============================================================
+// BOOTSTRAP
+// ------------------------------------------------------------
+// Ordering matters here, which is why it is one explicit sequence rather than
+// scattered top-level calls: persisted learning state has to be restored (and
+// its weights applied) before the first analysis, and every DOM const further
+// up this file has to exist before anything reads it.
+// ============================================================
+// ============================================================
+// SETTINGS THAT SURVIVE A RELOAD
+// ------------------------------------------------------------
+// Only the paper account's balance and the autonomy thresholds were ever
+// persisted. Everything else a person could change — risk per trade, spread,
+// slippage, max concurrent, the partial-take-profit rules, all fourteen factor
+// weights, the target R:R, every backtest parameter, the news-window settings —
+// was read straight off the DOM and lost the moment the page reloaded. Tuning
+// the system was therefore something you had to redo from memory each session,
+// and an autonomous run would quietly revert to defaults after any refresh.
+//
+// One store, one list, restored before the first analysis so the weights are in
+// force when it runs. Ids that already have an owner are deliberately absent —
+// autonomy keeps its own (AUTONOMY_KEY), the paper on/off switches live with the
+// account, and the API keys are opt-in through "remember keys" rather than
+// swept up here.
+const SETTINGS_KEY = 'smc-settings-v1';
+const SETTINGS_IDS = [
+  // paper account
+  'pStartBalance', 'pRiskPct', 'pSpread', 'pSlippage', 'pMaxPos',
+  'pSizingMode', 'pFixedLots', 'pContractSize', 'pLotStep', 'pMinLots',
+  'pPartialPct', 'pHoldMeta', 'pPartialEnabled',
+  // factor weights
+  'wWeekly', 'wDaily', 'wHtf', 'wMtf', 'wLtf', 'wOb', 'wFvg', 'wLiq',
+  'wPd', 'wPriceAction', 'wClassic', 'wCorrelation', 'wFundamental', 'wNews',
+  // signal + backtest
+  'targetRR', 'pBars', 'pCapital', 'pRisk', 'pCostPips', 'pMinConf', 'pTargetRR',
+  // news window and macro model
+  'newsBeforeMin', 'newsAfterMin', 'newsBlockEnabled', 'newsBlockMedium',
+  'newsFlattenEnabled', 'newsFlattenMin', 'newsAlertMin', 'useMacroModel',
+  'weekendFlattenEnabled', 'weekendFlattenMin'
+];
+
+function saveSettings() {
+  const out = {};
+  SETTINGS_IDS.forEach(id => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    out[id] = el.type === 'checkbox' ? !!el.checked : el.value;
+  });
+  try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(out)); }
+  catch (e) { return false; }
+  return true;
+}
+
+function loadSettings() {
+  let saved;
+  try { saved = JSON.parse(localStorage.getItem(SETTINGS_KEY) || 'null'); }
+  catch (e) { return; }
+  if (!saved || typeof saved !== 'object') return;
+  SETTINGS_IDS.forEach(id => {
+    if (!(id in saved)) return;
+    const el = document.getElementById(id);
+    if (!el) return;
+    if (el.type === 'checkbox') el.checked = !!saved[id];
+    else if (saved[id] != null) el.value = saved[id];
+  });
+  // Sliders carry a printed value beside them that does not follow a
+  // programmatic change, so a restored weight would show the old number.
+  syncSliderLabels();
+}
+
+function syncSliderLabels() {
+  weightIds.forEach(id => {
+    const el = document.getElementById(id), out = document.getElementById(id + 'V');
+    if (el && out) out.textContent = el.value;
+  });
+  const rr = document.getElementById('targetRR'), rrOut = document.getElementById('targetRRV');
+  if (rr && rrOut) rrOut.textContent = '1:' + rr.value;
+}
+
+let settingsSaveTimer = null;
+function flagSettingsSaved() {
+  const el = document.getElementById('settingsSavedNote');
+  if (!el) return;
+  el.textContent = 'Settings saved.';
+  el.style.color = '#3ecf8e';
+  clearTimeout(settingsSaveTimer);
+  settingsSaveTimer = setTimeout(() => { el.textContent = ''; }, 2500);
+}
+
+function wireSettingsPersistence() {
+  SETTINGS_IDS.forEach(id => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    const handler = () => { if (saveSettings()) flagSettingsSaved(); };
+    el.addEventListener('change', handler);
+    // Sliders and number spinners fire `input` continuously; `change` alone
+    // would miss a drag that never blurs.
+    if (el.type === 'range' || el.type === 'number') el.addEventListener('input', handler);
+  });
+}
+
+// ============================================================
+// IS THIS TAB STILL RUNNING THE CURRENT CODE?
+// ------------------------------------------------------------
+// This app is built to be left open for days doing unattended analysis, which
+// means a tab can go on running the modules it loaded at open time long after a
+// fix has shipped. That is not hypothetical: the macro engine ran on 1976-2006
+// FRED data, the fix deployed, and an open tab would have carried on producing
+// confident, wrong numbers with nothing on screen to say so.
+//
+// The check compares the ETag of app.js now against the one seen at startup, so
+// it needs no version constant to keep in sync and no build step. `no-store`
+// forces the request past the browser cache; the server already sends
+// must-revalidate, so this is cheap.
+const UPDATE_CHECK_MS = 30 * 60 * 1000;
+let loadedBuildTag = null;
+let updateWatchHandle = null;
+
+async function currentBuildTag() {
+  try {
+    const r = await fetch('app.js', { method: 'HEAD', cache: 'no-store' });
+    return r.headers.get('etag') || r.headers.get('last-modified') || null;
+  } catch (e) {
+    return null; // offline, or the check is blocked — try again next time
+  }
+}
+
+async function checkForNewBuild() {
+  const tag = await currentBuildTag();
+  if (!tag) return;
+  if (loadedBuildTag == null) { loadedBuildTag = tag; return; }
+  if (tag === loadedBuildTag) return;
+  const banner = document.getElementById('updateBanner');
+  if (banner) banner.classList.remove('hidden');
+}
+
+function startUpdateWatch() {
+  const reload = document.getElementById('updateReload');
+  if (reload) reload.addEventListener('click', () => window.location.reload());
+  checkForNewBuild();
+  if (updateWatchHandle) clearInterval(updateWatchHandle);
+  updateWatchHandle = setInterval(checkForNewBuild, UPDATE_CHECK_MS);
+}
+
+async function bootstrap() {
+  // Before anything reads a control: the weights, risk settings and thresholds
+  // have to be the saved ones by the time the first analysis runs.
+  loadSettings();
+  wireSettingsPersistence();
+  await loadLearningState();
+  await loadSignalLog();
+  await loadShadowLog();
+  applyKnowledgeBaseWeights();
+  await loadPaper();
+  await loadKnowledge();
+  await loadCalendarCache();
+  loadAutonomyState();
+  loadQuota();
+  // Every store the merge touches is loaded by this point — the log it merges
+  // into, the paper account it books positions in, the learning state it
+  // updates. Replay anything the worker sent while that was still loading.
+  flushPendingIngest();
+  renderSignalLog();   // first render happened before the paper account loaded
+  startLivenessTicker();
+  startUpdateWatch();
+  startNewsWatch();
+  renderQuota();
+  renderAutonomyStats();
+  renderAnalysisQuality();
+  renderPaper();
+  renderDataInventory();
+  renderCalendar();
+  renderReasoning();
+  renderKnowledge();
+  runAudit();
+  renderAudit();
+  refreshWorkerTotals().then(renderDataInventory);
+  refreshAll();
+
+  const saved = await loadSavedKeys();
+  if (!saved) {
+    document.getElementById('autoBacktestStatus').textContent = 'Connect a data provider to enable auto-backtesting.';
+  } else {
+    document.getElementById('rememberKeysCheckbox').checked = true;
+    if (saved.provider) providerSelect.value = saved.provider;
+    if (saved.fredKey) document.getElementById('fredKeyInput').value = saved.fredKey;
+    if (saved.newsKey) document.getElementById('newsKeyInput').value = saved.newsKey;
+    if (typeof saved.autoBacktest === 'boolean') document.getElementById('autoBacktestCheckbox').checked = saved.autoBacktest;
+    if (saved.apiKey) {
+      document.getElementById('apiKeyInput').value = saved.apiKey;
+      connStatus.textContent = 'Restoring saved connection...';
+      await connectProvider(); // also re-fetches correlation/fundamentals/news with the restored keys
+    } else if (saved.fredKey || saved.newsKey) {
+      // No price provider was connected, but FRED/news keys were saved independently — restore those engines too.
+      await refreshCorrelation(activeProvider, apiKey, saved.fredKey || '');
+      await refreshFundamentals(saved.fredKey || '');
+      await refreshNewsSentiment(saved.newsKey || '');
+      refreshAll();
+      document.getElementById('autoBacktestStatus').textContent = 'Connect a data provider to enable auto-backtesting.';
+    } else {
+      document.getElementById('autoBacktestStatus').textContent = 'Connect a data provider to enable auto-backtesting.';
+    }
+  }
+
+  // The calendar gates trading, so it must be loaded before autonomy's first pass.
+  await refreshCalendar(false);
+  renderCalendar();
+  renderReasoning();
+
+  // Recover anything that resolved while the app was closed, then pick the loop back up.
+  if (autonomy.enabled) {
+    await autonomyCatchUp();
+    startAutonomy();
+  } else {
+    setAutonomyStatus('Off — check the box above to start.', 'idle', '');
+  }
+}
+bootstrap();
+ + fmt(p.sl) + ' · TP 
+  }
+
+  const closed = paper.positions.filter(p => p.status === 'closed' && inEra(p)).slice(0, 8);
+  if (closed.length) {
+    html += '<div style="font-size:10px;color:#454a56;margin:10px 0 6px;">Recent closed</div>';
+    html += closed.map(p =>
+      '<div class="zone-item"><span><span class="dirtag ' + p.dir + '">' + p.dir + '</span> ' + (p.outcome === 'won' ? (p.partial ? '◐' : '✓') : p.outcome === 'lost' ? '✗' : '–')
+      + ' <span style="color:#454a56;">' + lotLabel(p) + ' · exit $' + fmt(p.exitPrice) + '</span></span>'
+      + '<span class="mono ' + pnlCls(p.pnl) + '">' + money(p.pnl) + (p.rMultiple != null ? ' <span style="color:#454a56;">' + (p.rMultiple >= 0 ? '+' : '') + fmt(p.rMultiple) + 'R</span>' : '') + '</span></div>'
+    ).join('');
+  }
+
+  if (!resting.length && !open.length && !closed.length) {
+    html += '<div class="zone-empty">' + (a.archivedCount
+      ? 'Account reset — no trades in this era yet. The record above is intact.'
+      : 'No paper trades yet. Positions open automatically as the engine logs signals.') + '</div>';
+  }
+  root.innerHTML = html;
+}
+
+function renderPaperStatusNote() {
+  const note = document.getElementById('paperStatus');
+  if (!note) return;
+  if (!paper.enabled) { note.textContent = 'Off — no positions will be opened.'; return; }
+  note.textContent = paper.manual
+    ? 'On — new signals will open simulated positions. No real orders are placed.'
+    : 'On for the engine\'s own signals. Signals you generate by hand are excluded (signal panel).';
+}
+
+document.getElementById('paperEnabled').addEventListener('change', function () {
+  paper.enabled = this.checked;
+  savePaper();
+  renderPaper();
+  renderPaperStatusNote();
+  renderPaperManualHint();
+});
+
+const paperManualCb = document.getElementById('paperManual');
+if (paperManualCb) paperManualCb.addEventListener('change', function () {
+  paper.manual = this.checked;
+  // Ticking it with the account off is a request to paper-trade, so honour it
+  // rather than silently doing nothing.
+  if (paper.manual && !paper.enabled) {
+    paper.enabled = true;
+    const master = document.getElementById('paperEnabled');
+    if (master) master.checked = true;
+  }
+  savePaper();
+  renderPaper();
+  renderPaperStatusNote();
+  renderPaperManualHint();
+});
+document.getElementById('paperAdvancedToggle').addEventListener('click', () => {
+  document.getElementById('paperAdvanced').classList.toggle('hidden');
+});
+['pStartBalance', 'pRiskPct', 'pSpread', 'pSlippage', 'pMaxPos', 'pPartialPct', 'pHoldMeta', 'pPartialEnabled'].forEach(id => {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener('change', () => { paper.startingBalance = paperConfig().startingBalance; savePaper(); renderPaper(); });
+});
+document.getElementById('paperReset').addEventListener('click', async () => {
+  const price = currentMarkPrice();
+  const live = paper.positions.filter(p => p.status === 'open' || p.status === 'pending').length;
+  const keeping = paper.positions.filter(p => p.status === 'closed').length;
+  const msg = 'Reset the paper account back to $' + fmt(paperConfig().startingBalance) + '?\n\n'
+    + (live ? live + ' live position(s) will be closed at the current price first.\n' : '')
+    + keeping + ' completed trade(s) stay on record — they are what the system learns from, '
+    + 'and they keep counting towards the lifetime win rate. They just stop counting towards the balance.';
+  if (!window.confirm(msg)) return;
+  const out = resetPaperAccount(paper.positions, isFinite(price) ? price : undefined, Date.now());
+  paper.positions = out.positions;
+  paper.epoch = out.epoch;
+  await savePaper();
+  renderPaper();
+  renderDataInventory();
+});
+
+// ============================================================
+// ANALYSIS QUALITY PANEL
+// ------------------------------------------------------------
+// Renders the three self-audits. Every number here is deliberately allowed to
+// say "not enough data yet" rather than show a confident-looking figure built
+// on four trades — a reassuring number from a tiny sample is worse than no
+// number, because it gets believed.
+// ============================================================
+function fmtR(v) { return v == null ? '—' : (v >= 0 ? '+' : '') + v.toFixed(2) + 'R'; }
+function fmtPct(v) { return v == null ? '—' : (v * 100).toFixed(0) + '%'; }
+function rClass(v) { return v == null ? 'fneu' : v > 0.05 ? 'fpos' : v < -0.05 ? 'fneg' : 'fneu'; }
+
+function renderAnalysisQuality() {
+  const root = document.getElementById('qualityContent');
+  if (!root) return;
+
+  const cal = computeCalibration(signalLog);
+  const bd = computeConditionBreakdown(signalLog);
+  const audit = computeGateAudit(signalLog, shadowLog);
+
+  const rows = (list, label) => {
+    const usable = list.filter(r => r.n >= 3);
+    if (!usable.length) return '<div class="zone-empty">' + label + ': not enough resolved trades yet (need 3+ per group).</div>';
+    return usable.map(r =>
+      '<div class="zone-item"><span>' + r.key + ' <span style="color:#454a56;">(' + r.n + ')</span></span>' +
+      '<span class="mono ' + rClass(r.expectancyR) + '">' + fmtR(r.expectancyR) + ' · ' + fmtPct(r.winRate) + '</span></div>'
+    ).join('');
+  };
+
+  const o = bd.overall;
+  let html = '';
+
+  html += '<div class="data-source-note" style="margin-bottom:8px;">Expectancy is shown in R — average profit per unit risked. At a 1:4 target a 30% win rate is already profitable, so win rate alone is a poor scorecard and R is the honest one.</div>';
+
+  html += '<div class="metrics" style="margin-bottom:10px;">'
+    + '<div class="card"><div class="label">Resolved</div><div class="value mono">' + o.n + '</div></div>'
+    + '<div class="card"><div class="label">Win Rate</div><div class="value mono">' + fmtPct(o.winRate) + '</div></div>'
+    + '<div class="card"><div class="label">Expectancy</div><div class="value mono ' + rClass(o.expectancyR) + '">' + fmtR(o.expectancyR) + '</div></div>'
+    + '<div class="card"><div class="label">Total</div><div class="value mono ' + rClass(o.totalR) + '">' + fmtR(o.totalR) + '</div></div>'
+    + '</div>';
+
+  // 1. Is the confidence number worth anything?
+  html += '<div class="panel-title" style="font-size:11px;margin-top:12px;">Is the confidence score meaningful?</div>';
+  html += '<div class="event-line" style="border-left-color:#e8c37a;">' + cal.verdict + '</div>';
+  if (cal.discrimination != null) {
+    html += '<div class="zone-item"><span>High-confidence half vs low-confidence half</span><span class="mono ' + rClass(cal.discrimination) + '">'
+      + (cal.discrimination >= 0 ? '+' : '') + (cal.discrimination * 100).toFixed(0) + ' pp win rate</span></div>';
+  }
+  if (cal.buckets.length) {
+    html += '<table class="factor-table"><tr><th style="text-align:left;color:#5c6270;font-weight:500;">Confidence band</th><th style="color:#5c6270;font-weight:500;">Win rate</th><th style="color:#5c6270;font-weight:500;">Expectancy</th></tr>';
+    html += cal.buckets.map(b =>
+      '<tr><td>' + b.lo + '–' + b.hi + '% <span style="color:#454a56;">(' + b.n + ')</span></td>'
+      + '<td>' + fmtPct(b.winRate) + '</td>'
+      + '<td class="' + rClass(b.expectancyR) + '">' + fmtR(b.expectancyR) + '</td></tr>').join('');
+    html += '</table>';
+  }
+
+  // 2. Where does the edge actually live?
+  html += '<div class="panel-title" style="font-size:11px;margin-top:14px;">Where the edge actually lives</div>';
+  html += '<div style="font-size:10px;color:#454a56;margin-bottom:6px;">By session</div>' + rows(bd.bySession, 'Session');
+  html += '<div style="font-size:10px;color:#454a56;margin:8px 0 6px;">By market regime</div>' + rows(bd.byRegime, 'Regime');
+  html += '<div style="font-size:10px;color:#454a56;margin:8px 0 6px;">By grade</div>' + rows(bd.byGrade, 'Grade');
+  html += '<div style="font-size:10px;color:#454a56;margin:8px 0 6px;">By direction</div>' + rows(bd.byDirection, 'Direction');
+
+  // 3. The roads not taken.
+  html += '<div class="panel-title" style="font-size:11px;margin-top:14px;">The setups it turned down</div>';
+  html += '<div class="data-source-note" style="margin-bottom:6px;">Every setup the filter rejected is tracked and resolved against real price anyway. This is the comparison a human journal can never make, because nobody records their non-trades.</div>';
+  html += '<div class="zone-item"><span>Taken</span><span class="mono ' + rClass(audit.taken.expectancyR) + '">'
+    + fmtR(audit.taken.expectancyR) + ' <span style="color:#454a56;">(' + audit.taken.n + ')</span></span></div>';
+  html += '<div class="zone-item"><span>Declined</span><span class="mono ' + rClass(audit.declined.expectancyR) + '">'
+    + fmtR(audit.declined.expectancyR) + ' <span style="color:#454a56;">(' + audit.declined.n + ')</span></span></div>';
+  const pending = shadowLog.filter(s => s.status === 'pending' || s.status === 'open').length;
+  if (pending) html += '<div class="zone-item"><span>Declined, still running</span><span class="mono">' + pending + '</span></div>';
+  html += '<div class="event-line" style="border-left-color:#c99bff;margin-top:6px;">' + audit.verdict + '</div>';
+
+  root.innerHTML = html;
+}
+document.getElementById('resetQuality').addEventListener('click', async () => {
+  shadowLog = [];
+  await saveShadowLog();
+  renderAnalysisQuality();
+});
+
+// ============================================================
+// AUTONOMOUS MODE
+// ------------------------------------------------------------
+// The unattended operator. Once the user ticks the box, a single heartbeat
+// drives everything: fetch fresh candles, grade any signal that has since hit
+// its stop or target, re-analyse, commit a new signal if the gate clears, and
+// periodically re-backtest and retrain on the record it has built.
+//
+// Three things make this survive real-world conditions rather than only a tab
+// left open on a desk:
+//   * One 60s heartbeat with due-time checks, not a pile of setIntervals. A
+//     laptop that sleeps for six hours wakes up, sees every task is overdue,
+//     and runs them once — rather than firing a backlog of missed timers.
+//   * Losing the connection is expected, not exceptional. Offline is a quiet
+//     pause; repeated failures back off exponentially instead of hammering a
+//     rate-limited provider until the key is blocked.
+//   * Time with the tab closed is recovered, not lost. catchUp() replays the
+//     gap from real candle history on the next load, so signals that resolved
+//     while nobody was watching still become training data.
+// ============================================================
+
+const AUTONOMY_KEY = 'smc-autonomy-v1';
+const AUTONOMY_HEARTBEAT_MS = 60 * 1000;
+
+let autonomyHandle = null;
+let autonomyBusy = false;
+
+function autonomyConfig() {
+  const num = (id, fallback) => {
+    const el = document.getElementById(id);
+    const v = el ? parseFloat(el.value) : NaN;
+    return isFinite(v) ? v : fallback;
+  };
+  return Object.assign({}, AUTONOMY_DEFAULTS, {
+    minConfidence: num('aMinConf', AUTONOMY_DEFAULTS.minConfidence),
+    cooldownMinutes: num('aCooldown', AUTONOMY_DEFAULTS.cooldownMinutes),
+    maxOpenSignals: num('aMaxOpen', AUTONOMY_DEFAULTS.maxOpenSignals),
+    analysisIntervalMinutes: num('aInterval', AUTONOMY_DEFAULTS.analysisIntervalMinutes),
+    backtestIntervalHours: num('aBtHours', AUTONOMY_DEFAULTS.backtestIntervalHours),
+    minMetaScore: num('aMinMeta', AUTONOMY_DEFAULTS.minMetaScore),
+    // Kill switch. 0 in any field disables that arm rather than expiring
+    // everything instantly, which is what a 0 limit would otherwise mean.
+    maxHoursToFill: num('aKillFill', AUTONOMY_DEFAULTS.maxHoursToFill),
+    maxHoursOpen: num('aKillOpen', AUTONOMY_DEFAULTS.maxHoursOpen),
+    maxDriftRToFill: num('aKillDrift', AUTONOMY_DEFAULTS.maxDriftRToFill),
+    partialTP: partialTPConfig(),
+    newsState: currentNewsState(),
+    gradeFloor: (document.getElementById('aMinGrade') || {}).value || AUTONOMY_DEFAULTS.gradeFloor
+  });
+}
+
+function saveAutonomyState() {
+  try {
+    localStorage.setItem(AUTONOMY_KEY, JSON.stringify({
+      enabled: autonomy.enabled,
+      cycles: autonomy.cycles,
+      gateTally: autonomy.gateTally,
+      signalsTaken: autonomy.signalsTaken,
+      autoResolved: autonomy.autoResolved,
+      lastAnalysisAt: autonomy.lastAnalysisAt,
+      lastBacktestAt: autonomy.lastBacktestAt,
+      lastSignalAt: autonomy.lastSignalAt,
+      cfg: {
+        aMinConf: document.getElementById('aMinConf').value,
+        aCooldown: document.getElementById('aCooldown').value,
+        aKillFill: document.getElementById('aKillFill').value,
+        aKillOpen: document.getElementById('aKillOpen').value,
+        aKillDrift: document.getElementById('aKillDrift').value,
+        aMaxOpen: document.getElementById('aMaxOpen').value,
+        aInterval: document.getElementById('aInterval').value,
+        aBtHours: document.getElementById('aBtHours').value,
+        aMinMeta: document.getElementById('aMinMeta').value,
+        aDailyCap: document.getElementById('aDailyCap').value,
+        aMinGrade: document.getElementById('aMinGrade').value
+      }
+    }));
+  } catch (e) { /* storage unavailable — autonomy still works, it just won't remember across reloads */ }
+}
+
+function loadAutonomyState() {
+  try {
+    const raw = localStorage.getItem(AUTONOMY_KEY);
+    if (!raw) return;
+    const saved = JSON.parse(raw);
+    Object.assign(autonomy, {
+      enabled: !!saved.enabled,
+      cycles: saved.cycles || 0,
+      gateTally: saved.gateTally || {},
+      signalsTaken: saved.signalsTaken || 0,
+      autoResolved: saved.autoResolved || 0,
+      lastAnalysisAt: saved.lastAnalysisAt || null,
+      lastBacktestAt: saved.lastBacktestAt || null,
+      lastSignalAt: saved.lastSignalAt || null
+    });
+    if (saved.cfg) {
+      Object.keys(saved.cfg).forEach(id => {
+        const el = document.getElementById(id);
+        if (el && saved.cfg[id] != null) el.value = saved.cfg[id];
+      });
+    }
+    document.getElementById('autonomyEnabled').checked = autonomy.enabled;
+  } catch (e) { /* nothing saved yet */ }
+}
+
+function setAutonomyStatus(text, tone, reason) {
+  const dot = document.getElementById('autonomyDot');
+  const status = document.getElementById('autonomyStatus');
+  const reasonEl = document.getElementById('autonomyReason');
+  if (!status) return;
+  status.textContent = text;
+  const colours = { live: '#3ecf8e', warn: '#ffa726', error: '#ef4d5f', idle: '#454a56' };
+  const c = colours[tone] || colours.idle;
+  dot.style.background = c;
+  dot.style.boxShadow = tone === 'live' ? '0 0 7px ' + c : 'none';
+  status.style.color = tone === 'idle' ? '#9298a5' : c;
+  if (reason !== undefined) reasonEl.textContent = reason || '';
+}
+
+function renderAutonomyStats() {
+  const live = signalLog.filter(s => s.status === 'pending' || s.status === 'open');
+  document.getElementById('aCycles').textContent = autonomy.cycles;
+  document.getElementById('aSignals').textContent = autonomy.signalsTaken;
+  document.getElementById('aResolved').textContent = autonomy.autoResolved;
+  document.getElementById('aOpen').textContent = live.length;
+
+  const killedEl = document.getElementById('aKilled');
+  if (killedEl) killedEl.textContent = signalLog.filter(s => s.status === 'expired').length;
+
+  // How long the oldest live trade has been sitting. This is the number that
+  // was invisible before: an order resting for a day looked identical to one
+  // placed a minute ago.
+  const oldestEl = document.getElementById('aOldest');
+  if (oldestEl) {
+    const cfg = autonomyConfig();
+    // Each trade is aged against the limit that actually applies to it: a
+    // resting order against the fill limit, a filled one against the hold
+    // limit. Using the larger of the two would leave an order 2.5x past its own
+    // deadline showing no warning at all.
+    const ages = live.map(s => {
+      const filled = s.status === 'open';
+      const t = Date.parse(filled ? (s.filledAt || s.time) : s.time);
+      if (!isFinite(t)) return null;
+      const hours = (Date.now() - t) / 3600000;
+      const limit = filled ? cfg.maxHoursOpen : cfg.maxHoursToFill;
+      return { hours, ratio: limit > 0 ? hours / limit : 0 };
+    }).filter(v => v != null);
+    if (!ages.length) {
+      oldestEl.textContent = '—';
+      oldestEl.style.color = '';
+    } else {
+      const worst = ages.reduce((a, b) => b.hours > a.hours ? b : a, ages[0]);
+      const closest = ages.reduce((a, b) => b.ratio > a.ratio ? b : a, ages[0]);
+      oldestEl.textContent = worst.hours < 1 ? Math.round(worst.hours * 60) + 'm' : worst.hours.toFixed(1) + 'h';
+      // Amber as a trade approaches its own kill limit, red once past it, so
+      // one about to be culled is visible before it disappears.
+      oldestEl.style.color = closest.ratio >= 1 ? '#ef4d5f' : closest.ratio >= 0.75 ? '#ffa726' : '';
+    }
+  }
+
+  const el = document.getElementById('gateTally');
+  if (!el) return;
+  const entries = Object.keys(autonomy.gateTally || {})
+    .map(k => ({ code: k, n: autonomy.gateTally[k] }))
+    .sort((a, b) => b.n - a.n);
+  if (!entries.length) { el.innerHTML = ''; return; }
+  el.innerHTML = '<div style="font-size:10px;color:#454a56;margin:8px 0 4px;">Why cycles ended this way</div>'
+    + entries.map(e => '<div class="zone-item" style="padding:3px 0;"><span style="font-size:11px;">'
+        + (GATE_LABELS[e.code] || e.code) + '</span><span class="mono" style="font-size:11px;color:'
+        + (e.code === 'taken' ? '#3ecf8e' : '#5c6270') + ';">' + e.n + '</span></div>').join('');
+}
+
+// Grade every unresolved signal against `candles`. Used both by the heartbeat
+// (fresh candles each cycle) and by catchUp() (deep history after downtime).
+// Returns how many signals reached a win/loss verdict.
+function resolveOpenSignals(candles, cfg) {
+  if (!candles || candles.length < 2) return 0;
+  let resolved = 0, killed = 0, changed = false;
+
+  // The auditor decides which live trades are past saving, not the engine.
+  // Letting the engine judge whether its own trade has gone bad is the thing
+  // the auditor exists to avoid — and it re-derives fill state from raw candles
+  // rather than trusting the signal's own status, so a "pending" order price
+  // actually traded through is caught rather than aged as if it never filled.
+  const tradeAudit = auditOpenTrades(signalLog, candles, {
+    maxHoursToFill: cfg.maxHoursToFill,
+    maxHoursOpen: cfg.maxHoursOpen,
+    maxDriftRToFill: cfg.maxDriftRToFill
+  });
+  lastTradeAudit = tradeAudit;
+  const killedBy = new Map(tradeAudit.kills.map(k => [k.id, k]));
+
+  signalLog.forEach(sig => {
+    if (sig.status !== 'pending' && sig.status !== 'open') return;
+    // An auditor kill outranks whatever the resolver would have said, EXCEPT
+    // when price has already settled the trade: a stop or target that has
+    // genuinely been hit is a real outcome and real evidence, and discarding it
+    // to enforce a time limit would throw away the data the limit exists to
+    // protect.
+    const verdict = resolveSignal(sig, candles, cfg);
+    const kill = killedBy.get(sig.id);
+    if (kill && verdict.status !== 'won' && verdict.status !== 'lost') {
+      sig.status = 'expired';
+      sig.expiryReason = 'auditor: ' + kill.reason;
+      sig.killSwitch = kill.code;
+      sig.resolvedAt = new Date().toISOString();
+      sig.resolvedBy = 'auditor';
+      paperCloseForSignal(sig.id, 'expired');
+      killed++; changed = true;
+      return;
+    }
+    if (verdict.status === 'won' || verdict.status === 'lost') {
+      if (applySignalOutcome(sig, verdict.status === 'won', {
+        auto: true, exitPrice: verdict.exitPrice, ambiguousBar: verdict.ambiguousBar, partial: verdict.partial
+      })) { resolved++; changed = true; }
+    } else if (verdict.status === 'expired') {
+      sig.status = 'expired';
+      sig.expiryReason = verdict.reason || null;
+      sig.killSwitch = verdict.killSwitch || null;
+      sig.resolvedAt = new Date().toISOString();
+      sig.resolvedBy = 'auto';
+      paperCloseForSignal(sig.id, 'expired');
+      if (verdict.killSwitch) killed++;
+      changed = true; // expired signals never become training data — no outcome to learn from
+    } else if (verdict.status === 'open' && sig.status === 'pending') {
+      sig.status = 'open'; // limit entry got tagged; it's a live position now
+      sig.filledAt = new Date().toISOString();
+      paperFillForSignal(sig.id, sig.filledAt);
+      changed = true;
+    }
+  });
+  if (changed) { saveSignalLog(); renderSignalLog(); }
+  if (resolved) autonomy.autoResolved += resolved;
+  if (killed) autonomy.killed = (autonomy.killed || 0) + killed;
+  resolveShadowSignals(candles, cfg);
+  return resolved;
+}
+
+// Shadows get the same treatment, minus the learning updates — a setup the
+// engine declined should inform the audit, not train the weights as though it
+// had been traded.
+function resolveShadowSignals(candles, cfg) {
+  if (!candles || candles.length < 2 || !shadowLog.length) return;
+  let changed = false;
+  shadowLog.forEach(sig => {
+    if (sig.status !== 'pending' && sig.status !== 'open') return;
+    const verdict = resolveSignal(sig, candles, cfg);
+    if (verdict.status === 'won' || verdict.status === 'lost') {
+      sig.status = verdict.status;
+      sig.resolvedAt = new Date().toISOString();
+      changed = true;
+    } else if (verdict.status === 'expired') {
+      sig.status = 'expired'; sig.expiryReason = verdict.reason || null; changed = true;
+    } else if (verdict.status === 'open' && sig.status === 'pending') {
+      sig.status = 'open'; changed = true;
+    }
+  });
+  if (changed) { saveShadowLog(); renderAnalysisQuality(); }
+}
+
+// One unattended pass. Everything that can fail is inside the caller's try.
+async function autonomyCycle() {
+  const cfg = autonomyConfig();
+  const now = Date.now();
+
+  // 0. Calendar first. It gates whether a signal may be taken at all, so it has
+  // to be current BEFORE the gate reads it — refreshing at the end of the cycle
+  // meant the first pass after a reconnect ran against an empty calendar and
+  // could take a position straight into a release window.
+  await refreshCalendar(false);
+
+  // 1. Fresh candles. resyncCandles() already refreshes liveData from the provider.
+  await resyncCandles();
+
+  // 2. Grade what the market has already decided since the last pass.
+  const graded = resolveOpenSignals(liveData, cfg);
+
+  // 3. Re-analyse on the new data.
+  refreshAll();
+  autonomy.lastAnalysisAt = now;
+
+  // 4. Commit a signal only if the gate clears.
+  let reason;
+  if (lastComposite) {
+    const plan = buildTradePlan(lastComposite, getTargetRR());
+    // The auditor is advisory everywhere except here. A critical finding means
+    // the analysis contradicts itself or the data it was built on — that is not
+    // a risk preference, and no confidence score should be able to override it.
+    const audit = runAudit();
+    renderAudit();
+    let gate;
+    if (audit && audit.blocking) {
+      gate = { take: false, code: 'audit',
+        reason: 'independent audit found ' + audit.critical + ' critical issue(s): ' + audit.findings[0].title };
+    } else {
+      gate = autonomyGate(lastComposite, plan, signalLog, autonomy.lastSignalAt, cfg);
+    }
+    // Tally why each cycle ended as it did. One latest-reason line cannot show
+    // whether 13 quiet cycles mean "no setup existed" or "the filter blocked
+    // every one" — and those need opposite responses.
+    const code = gate.code || 'unknown';
+    autonomy.gateTally[code] = (autonomy.gateTally[code] || 0) + 1;
+    if (gate.take) {
+      updateSignalUI(lastComposite, plan, true, 'auto'); // logIt = true -> addSignalToLog
+      autonomy.signalsTaken++;
+      autonomy.lastSignalAt = now;
+      reason = 'Took a ' + lastComposite.direction + ' at $' + fmt(plan.entry) +
+               ' (' + lastComposite.confidence + '% confidence' + (gate.grade ? ', grade ' + gate.grade : '') + ').';
+    } else {
+      updateSignalUI(lastComposite, plan, false); // keep the panel current without logging
+      // Track what was passed on, so the filter can be audited later rather
+      // than trusted forever.
+      addShadowSignal(lastComposite, plan, gate.reason);
+      reason = 'No signal taken — ' + gate.reason + '.';
+    }
+  } else {
+    reason = 'Analysis produced no result this cycle.';
+  }
+  if (graded) reason = 'Self-graded ' + graded + ' signal' + (graded === 1 ? '' : 's') + '. ' + reason;
+  autonomy.lastReason = reason;
+
+  // 5. Periodic re-backtest / retrain on the accumulated record.
+  const btDue = !autonomy.lastBacktestAt || (now - autonomy.lastBacktestAt) >= cfg.backtestIntervalHours * 3600 * 1000;
+  if (btDue) {
+    autonomy.lastBacktestAt = now;
+    await runBacktestCycle(true);
+  }
+
+  renderAnalysisQuality();
+  renderDataInventory();
+  renderCalendar();
+  renderReasoning();
+  runAudit();
+  renderAudit();
+  autonomy.cycles++;
+  autonomy.consecutiveErrors = 0;
+  autonomy.lastError = null;
+  saveAutonomyState();
+  renderAutonomyStats();
+  if (candlesStaleForBudget) {
+    setAutonomyStatus('Running on cached candles — daily API budget spent, resumes 00:00 UTC.', 'warn',
+      'Still grading open signals and re-analysing, but on the last candles fetched rather than fresh ones. ' + reason);
+  } else {
+    setAutonomyStatus('Running autonomously — last pass ' + new Date(now).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) + '.', 'live', reason);
+  }
+}
+
+// The heartbeat: decides whether a cycle is due, and handles every reason it
+// might not be. Deliberately does no analysis itself.
+async function autonomyHeartbeat() {
+  if (!autonomy.enabled || autonomyBusy) return;
+
+  if (!navigator.onLine) {
+    setAutonomyStatus('Paused — no internet connection. Resumes automatically.', 'warn',
+      'Nothing is lost while offline; the gap gets replayed from candle history once the connection is back.');
+    return;
+  }
+  if (dataMode !== 'live') {
+    setAutonomyStatus('Waiting for a live data provider — connect an API key above.', 'warn',
+      'Autonomous mode needs real candles; it will not run on the simulated feed.');
+    return;
+  }
+  // Gold is shut from Friday ~21:00 UTC to Sunday ~22:00 UTC. Analysing a frozen
+  // feed produces confident-looking signals off Friday's last bar, and every one
+  // of them enters the learning record as a real read of a market that was not
+  // trading. Nothing to analyse, so nothing runs.
+  if (!isMarketOpen(Date.now())) {
+    const clock = marketClock(Date.now());
+    const h = clock.hoursUntilOpen;
+    setAutonomyStatus('Market closed — resumes when gold reopens in ' +
+      (h < 1 ? Math.round(h * 60) + 'm' : h.toFixed(1) + 'h') + '.', 'warn',
+      'The feed is frozen at Friday\u2019s close. Analysing it would generate signals from a market that is not trading.');
+    return;
+  }
+  if (autonomy.skipCycles > 0) {
+    autonomy.skipCycles--;
+    setAutonomyStatus('Backing off after an error — retrying in ' + (autonomy.skipCycles + 1) + ' min.', 'warn', autonomy.lastError);
+    return;
+  }
+
+  const cfg = autonomyConfig();
+  const dueAt = (autonomy.lastAnalysisAt || 0) + cfg.analysisIntervalMinutes * 60 * 1000;
+  if (Date.now() < dueAt) {
+    const mins = Math.ceil((dueAt - Date.now()) / 60000);
+    setAutonomyStatus('Running autonomously — next pass in ' + mins + ' min.', 'live', autonomy.lastReason);
+    return;
+  }
+
+  autonomyBusy = true;
+  try {
+    await autonomyCycle();
+  } catch (e) {
+    autonomy.consecutiveErrors++;
+    autonomy.lastError = (e && e.message) || String(e);
+    // Exponential backoff, capped at ~30 min. A rate-limited or expired key
+    // should not turn into a request every minute for the rest of the day.
+    autonomy.skipCycles = Math.min(Math.pow(2, autonomy.consecutiveErrors), 30);
+    setAutonomyStatus('Cycle failed (' + autonomy.consecutiveErrors + ' in a row) — backing off ' + autonomy.skipCycles + ' min.', 'error', autonomy.lastError);
+    saveAutonomyState();
+  } finally {
+    autonomyBusy = false;
+  }
+}
+
+// Replay the time the app was closed or disconnected. Pulls the deepest history
+// the provider allows and grades every still-open signal against it, so a signal
+// that hit its target overnight is training data by the time the user looks.
+async function autonomyCatchUp() {
+  if (dataMode !== 'live' || !navigator.onLine) return;
+  const stillOpen = signalLog.filter(s => s.status === 'pending' || s.status === 'open');
+  if (!stillOpen.length) return;
+  setAutonomyStatus('Catching up — replaying ' + stillOpen.length + ' unresolved signal(s) against real history…', 'warn', '');
+  try {
+    const history = await PROVIDERS[activeProvider].timeSeries(apiKey, LIVE_INTERVAL, 5000);
+    const n = resolveOpenSignals(history, autonomyConfig());
+    renderAutonomyStats();
+    saveAutonomyState();
+    setAutonomyStatus('Catch-up complete.', autonomy.enabled ? 'live' : 'idle',
+      n ? 'Graded ' + n + ' signal(s) that resolved while the app was closed.'
+        : 'No signals had resolved while the app was closed.');
+  } catch (e) {
+    // Not fatal — the regular heartbeat will keep trying against live candles.
+    setAutonomyStatus('Catch-up could not fetch history — continuing on live candles.', 'warn', (e && e.message) || String(e));
+  }
+}
+
+function startAutonomy() {
+  if (autonomyHandle) clearInterval(autonomyHandle);
+  autonomyHandle = setInterval(autonomyHeartbeat, AUTONOMY_HEARTBEAT_MS);
+  autonomy.skipCycles = 0;
+  autonomy.consecutiveErrors = 0;
+  setAutonomyStatus('Autonomous mode on — first pass starting…', 'live', '');
+  autonomy.lastAnalysisAt = null; // force an immediate first pass
+  autonomyHeartbeat();
+}
+
+function stopAutonomy() {
+  if (autonomyHandle) { clearInterval(autonomyHandle); autonomyHandle = null; }
+  setAutonomyStatus('Off — check the box above to start.', 'idle', '');
+}
+
+document.getElementById('autonomyEnabled').addEventListener('change', function () {
+  autonomy.enabled = this.checked;
+  saveAutonomyState();
+  if (autonomy.enabled) startAutonomy(); else stopAutonomy();
+});
+providerSelect.addEventListener('change', renderQuota);
+const umm = document.getElementById('useMacroModel');
+if (umm) umm.addEventListener('change', () => { renderKnowledge(); renderReasoning(); });
+
+// A posture for building up a record rather than protecting capital. The engine
+// learns from resolved trades, and at the default B floor a ranging market
+// simply never qualifies — so a cautious setup collects nothing and the
+// knowledge base never starts.
+document.getElementById('aPresetCollect').addEventListener('click', () => {
+  // D, not C: even a perfect five-timeframe alignment only scores ~49%, so a C
+  // floor (>=30%) still rejects ordinary conditions and collects almost nothing.
+  document.getElementById('aMinGrade').value = 'D';
+  document.getElementById('aMinConf').value = 15;
+  document.getElementById('aCooldown').value = 30;
+  document.getElementById('aMaxOpen').value = 5;
+  document.getElementById('aMinMeta').value = -0.5;
+  saveAutonomyState();
+  autonomy.lastAnalysisAt = null; // re-evaluate immediately under the new thresholds
+  setAutonomyStatus('Data-collection thresholds applied — re-evaluating now.', 'live', '');
+  autonomyHeartbeat();
+});
+document.getElementById('autonomyAdvancedToggle').addEventListener('click', () => {
+  document.getElementById('autonomyAdvanced').classList.toggle('hidden');
+});
+['aMinConf', 'aCooldown', 'aMaxOpen', 'aInterval', 'aBtHours', 'aMinMeta', 'aDailyCap', 'aMinGrade',
+ 'aKillFill', 'aKillOpen', 'aKillDrift'].forEach(id => {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener('change', () => { saveAutonomyState(); renderQuota(); });
+});
+
+// React to connectivity changes straight away rather than waiting out a heartbeat.
+window.addEventListener('online', () => {
+  if (!autonomy.enabled) return;
+  autonomy.skipCycles = 0;
+  autonomy.consecutiveErrors = 0;
+  setAutonomyStatus('Back online — catching up…', 'warn', '');
+  autonomyCatchUp().then(autonomyHeartbeat);
+});
+window.addEventListener('offline', () => {
+  if (autonomy.enabled) setAutonomyStatus('Paused — no internet connection. Resumes automatically.', 'warn', '');
+});
+// Coming back to a backgrounded tab is a good moment to check for missed work:
+// mobile browsers in particular throttle timers hard once a tab is hidden.
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && autonomy.enabled) autonomyHeartbeat();
+});
+
+// ============================================================
+// BOOTSTRAP
+// ------------------------------------------------------------
+// Ordering matters here, which is why it is one explicit sequence rather than
+// scattered top-level calls: persisted learning state has to be restored (and
+// its weights applied) before the first analysis, and every DOM const further
+// up this file has to exist before anything reads it.
+// ============================================================
+// ============================================================
+// SETTINGS THAT SURVIVE A RELOAD
+// ------------------------------------------------------------
+// Only the paper account's balance and the autonomy thresholds were ever
+// persisted. Everything else a person could change — risk per trade, spread,
+// slippage, max concurrent, the partial-take-profit rules, all fourteen factor
+// weights, the target R:R, every backtest parameter, the news-window settings —
+// was read straight off the DOM and lost the moment the page reloaded. Tuning
+// the system was therefore something you had to redo from memory each session,
+// and an autonomous run would quietly revert to defaults after any refresh.
+//
+// One store, one list, restored before the first analysis so the weights are in
+// force when it runs. Ids that already have an owner are deliberately absent —
+// autonomy keeps its own (AUTONOMY_KEY), the paper on/off switches live with the
+// account, and the API keys are opt-in through "remember keys" rather than
+// swept up here.
+const SETTINGS_KEY = 'smc-settings-v1';
+const SETTINGS_IDS = [
+  // paper account
+  'pStartBalance', 'pRiskPct', 'pSpread', 'pSlippage', 'pMaxPos',
+  'pSizingMode', 'pFixedLots', 'pContractSize', 'pLotStep', 'pMinLots',
+  'pPartialPct', 'pHoldMeta', 'pPartialEnabled',
+  // factor weights
+  'wWeekly', 'wDaily', 'wHtf', 'wMtf', 'wLtf', 'wOb', 'wFvg', 'wLiq',
+  'wPd', 'wPriceAction', 'wClassic', 'wCorrelation', 'wFundamental', 'wNews',
+  // signal + backtest
+  'targetRR', 'pBars', 'pCapital', 'pRisk', 'pCostPips', 'pMinConf', 'pTargetRR',
+  // news window and macro model
+  'newsBeforeMin', 'newsAfterMin', 'newsBlockEnabled', 'newsBlockMedium',
+  'newsFlattenEnabled', 'newsFlattenMin', 'newsAlertMin', 'useMacroModel',
+  'weekendFlattenEnabled', 'weekendFlattenMin'
+];
+
+function saveSettings() {
+  const out = {};
+  SETTINGS_IDS.forEach(id => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    out[id] = el.type === 'checkbox' ? !!el.checked : el.value;
+  });
+  try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(out)); }
+  catch (e) { return false; }
+  return true;
+}
+
+function loadSettings() {
+  let saved;
+  try { saved = JSON.parse(localStorage.getItem(SETTINGS_KEY) || 'null'); }
+  catch (e) { return; }
+  if (!saved || typeof saved !== 'object') return;
+  SETTINGS_IDS.forEach(id => {
+    if (!(id in saved)) return;
+    const el = document.getElementById(id);
+    if (!el) return;
+    if (el.type === 'checkbox') el.checked = !!saved[id];
+    else if (saved[id] != null) el.value = saved[id];
+  });
+  // Sliders carry a printed value beside them that does not follow a
+  // programmatic change, so a restored weight would show the old number.
+  syncSliderLabels();
+}
+
+function syncSliderLabels() {
+  weightIds.forEach(id => {
+    const el = document.getElementById(id), out = document.getElementById(id + 'V');
+    if (el && out) out.textContent = el.value;
+  });
+  const rr = document.getElementById('targetRR'), rrOut = document.getElementById('targetRRV');
+  if (rr && rrOut) rrOut.textContent = '1:' + rr.value;
+}
+
+let settingsSaveTimer = null;
+function flagSettingsSaved() {
+  const el = document.getElementById('settingsSavedNote');
+  if (!el) return;
+  el.textContent = 'Settings saved.';
+  el.style.color = '#3ecf8e';
+  clearTimeout(settingsSaveTimer);
+  settingsSaveTimer = setTimeout(() => { el.textContent = ''; }, 2500);
+}
+
+function wireSettingsPersistence() {
+  SETTINGS_IDS.forEach(id => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    const handler = () => { if (saveSettings()) flagSettingsSaved(); };
+    el.addEventListener('change', handler);
+    // Sliders and number spinners fire `input` continuously; `change` alone
+    // would miss a drag that never blurs.
+    if (el.type === 'range' || el.type === 'number') el.addEventListener('input', handler);
+  });
+}
+
+// ============================================================
+// IS THIS TAB STILL RUNNING THE CURRENT CODE?
+// ------------------------------------------------------------
+// This app is built to be left open for days doing unattended analysis, which
+// means a tab can go on running the modules it loaded at open time long after a
+// fix has shipped. That is not hypothetical: the macro engine ran on 1976-2006
+// FRED data, the fix deployed, and an open tab would have carried on producing
+// confident, wrong numbers with nothing on screen to say so.
+//
+// The check compares the ETag of app.js now against the one seen at startup, so
+// it needs no version constant to keep in sync and no build step. `no-store`
+// forces the request past the browser cache; the server already sends
+// must-revalidate, so this is cheap.
+const UPDATE_CHECK_MS = 30 * 60 * 1000;
+let loadedBuildTag = null;
+let updateWatchHandle = null;
+
+async function currentBuildTag() {
+  try {
+    const r = await fetch('app.js', { method: 'HEAD', cache: 'no-store' });
+    return r.headers.get('etag') || r.headers.get('last-modified') || null;
+  } catch (e) {
+    return null; // offline, or the check is blocked — try again next time
+  }
+}
+
+async function checkForNewBuild() {
+  const tag = await currentBuildTag();
+  if (!tag) return;
+  if (loadedBuildTag == null) { loadedBuildTag = tag; return; }
+  if (tag === loadedBuildTag) return;
+  const banner = document.getElementById('updateBanner');
+  if (banner) banner.classList.remove('hidden');
+}
+
+function startUpdateWatch() {
+  const reload = document.getElementById('updateReload');
+  if (reload) reload.addEventListener('click', () => window.location.reload());
+  checkForNewBuild();
+  if (updateWatchHandle) clearInterval(updateWatchHandle);
+  updateWatchHandle = setInterval(checkForNewBuild, UPDATE_CHECK_MS);
+}
+
+async function bootstrap() {
+  // Before anything reads a control: the weights, risk settings and thresholds
+  // have to be the saved ones by the time the first analysis runs.
+  loadSettings();
+  wireSettingsPersistence();
+  await loadLearningState();
+  await loadSignalLog();
+  await loadShadowLog();
+  applyKnowledgeBaseWeights();
+  await loadPaper();
+  await loadKnowledge();
+  await loadCalendarCache();
+  loadAutonomyState();
+  loadQuota();
+  // Every store the merge touches is loaded by this point — the log it merges
+  // into, the paper account it books positions in, the learning state it
+  // updates. Replay anything the worker sent while that was still loading.
+  flushPendingIngest();
+  renderSignalLog();   // first render happened before the paper account loaded
+  startLivenessTicker();
+  startUpdateWatch();
+  startNewsWatch();
+  renderQuota();
+  renderAutonomyStats();
+  renderAnalysisQuality();
+  renderPaper();
+  renderDataInventory();
+  renderCalendar();
+  renderReasoning();
+  renderKnowledge();
+  runAudit();
+  renderAudit();
+  refreshWorkerTotals().then(renderDataInventory);
+  refreshAll();
+
+  const saved = await loadSavedKeys();
+  if (!saved) {
+    document.getElementById('autoBacktestStatus').textContent = 'Connect a data provider to enable auto-backtesting.';
+  } else {
+    document.getElementById('rememberKeysCheckbox').checked = true;
+    if (saved.provider) providerSelect.value = saved.provider;
+    if (saved.fredKey) document.getElementById('fredKeyInput').value = saved.fredKey;
+    if (saved.newsKey) document.getElementById('newsKeyInput').value = saved.newsKey;
+    if (typeof saved.autoBacktest === 'boolean') document.getElementById('autoBacktestCheckbox').checked = saved.autoBacktest;
+    if (saved.apiKey) {
+      document.getElementById('apiKeyInput').value = saved.apiKey;
+      connStatus.textContent = 'Restoring saved connection...';
+      await connectProvider(); // also re-fetches correlation/fundamentals/news with the restored keys
+    } else if (saved.fredKey || saved.newsKey) {
+      // No price provider was connected, but FRED/news keys were saved independently — restore those engines too.
+      await refreshCorrelation(activeProvider, apiKey, saved.fredKey || '');
+      await refreshFundamentals(saved.fredKey || '');
+      await refreshNewsSentiment(saved.newsKey || '');
+      refreshAll();
+      document.getElementById('autoBacktestStatus').textContent = 'Connect a data provider to enable auto-backtesting.';
+    } else {
+      document.getElementById('autoBacktestStatus').textContent = 'Connect a data provider to enable auto-backtesting.';
+    }
+  }
+
+  // The calendar gates trading, so it must be loaded before autonomy's first pass.
+  await refreshCalendar(false);
+  renderCalendar();
+  renderReasoning();
+
+  // Recover anything that resolved while the app was closed, then pick the loop back up.
+  if (autonomy.enabled) {
+    await autonomyCatchUp();
+    startAutonomy();
+  } else {
+    setAutonomyStatus('Off — check the box above to start.', 'idle', '');
+  }
+}
+bootstrap();
+ + fmt(p.tp)
+        + '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:5px;">'
+        + '<button class="btn" data-paper-action="edit-sl" data-paper-id="' + p.id + '" style="padding:3px 7px;font-size:10px;">Edit SL</button>'
+        + '<button class="btn" data-paper-action="close" data-paper-id="' + p.id + '" style="padding:3px 7px;font-size:10px;border-color:#ef4d5f;color:#ef4d5f;">Close at market</button>'
+        + '</div></span><span class="mono ' + pnlCls(u) + '">' + money(u) + '</span></div>';
     }).join('');
   }
 
