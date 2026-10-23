@@ -40,6 +40,13 @@ ok('and lets it through once the cooldown has passed',
   autonomyGate(R('BUY',70,'A'),P,[],CLOCK_NOW - 90*60000,{now:CLOCK_NOW}).take, true);
 ok('gate respects dup direction', autonomyGate(R('BUY',70,'A'),P,[{dir:'BUY',status:'open'}],null).take, false);
 ok('gate blocks opposite dir to avoid hedging', autonomyGate(R('BUY',70,'A'),P,[{dir:'SELL',status:'open'}],null).take, false);
+const strongerOpposite = autonomyGate(
+  {...R('BUY',70,'A'), factors:{ltf:1, mtf:1, htf:1}},
+  P,
+  [{id:'weak-sell',dir:'SELL',status:'open',factors:{ltf:1,mtf:-1,htf:1}}],
+  null
+);
+ok('stronger confluence may replace the weaker opposite signal', strongerOpposite.replaceSignalIds, ['weak-sell']);
 ok('gate respects max open', autonomyGate(R('BUY',70,'A'),P,[{dir:'SELL',status:'open'},{dir:'SELL',status:'open'},{dir:'SELL',status:'pending'}],null).take, false);
 ok('gate rejects bad plan', autonomyGate(R('BUY',70,'A'),{entry:NaN,sl:1,tp:2,rr:1},[],null).take, false);
 
