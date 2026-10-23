@@ -3722,7 +3722,7 @@ function resolveOpenSignals(candles, cfg) {
       changed = true;
     }
   });
-  if (changed) { saveSignalLog(); renderSignalLog(); }
+  if (changed) { saveSignalLog(); renderSignalLog(); maybeAutoTuneFilter(); }
   if (resolved) autonomy.autoResolved += resolved;
   if (killed) autonomy.killed = (autonomy.killed || 0) + killed;
   resolveShadowSignals(candles, cfg);
