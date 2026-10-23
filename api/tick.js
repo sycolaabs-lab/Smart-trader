@@ -715,6 +715,24 @@ export async function runTick({ db, tdKey, fredKey, avKey, now }) {
     // The public snapshot the dashboard subscribes to. Field names here are the
     // contract with the Background System panel in index.html — changing one
     // means changing both.
+    const inspectCandles = (name, candles, intervalMs, maxAgeMs) => {
+      const source = Array.isArray(candles) ? candles : [];
+      const valid = source.filter(c => c && Number.isFinite(c.time) &&
+        Number.isFinite(c.open) && Number.isFinite(c.high) && Number.isFinite(c.low) && Number.isFinite(c.close) &&
+        c.high >= Math.max(c.open, c.close, c.low) && c.low <= Math.min(c.open, c.close, c.high));
+      let gaps = 0, largeJumps = 0;
+      for (let i = 1; i < valid.length; i++) {
+        if (valid[i].time - valid[i - 1].time > intervalMs * 1.8) gaps++;
+        const previous = valid[i - 1].close;
+        if (previous > 0 && Math.abs(valid[i].close - previous) / previous > 0.025) largeJumps++;
+      }
+      const last = valid.length ? valid[valid.length - 1] : null;
+      const ageMinutes = last ? Math.max(0, Math.round((clockNow - last.time) / 60000)) : null;
+      return { candleAt: last ? last.time : null, ageMinutes, count: valid.length,
+        source: 'Twelve Data', stale: ageMinutes == null || ageMinutes * 60000 > maxAgeMs,
+        invalidCandles: source.length - valid.length, gapCount: gaps, largeJumps,
+        lastCandleAt: last ? new Date(last.time).toISOString() : null };
+    };
     const tick = {
       time: Date.now(),
       price: result.price,
@@ -726,15 +744,16 @@ export async function runTick({ db, tdKey, fredKey, avKey, now }) {
       factors: Object.assign({}, result.factors),
       totalWeight: result.totalWeight,
       dataHealth: {
-        '5m': { candleAt: fiveR.value.length ? fiveR.value[fiveR.value.length - 1].time : null, ageMinutes: fiveR.value.length ? Math.round((clockNow - fiveR.value[fiveR.value.length - 1].time) / 60000) : null, count: fiveR.value.length },
-        '15m': { candleAt: ltf.length ? ltf[ltf.length - 1].time : null, ageMinutes: ltf.length ? Math.round((clockNow - ltf[ltf.length - 1].time) / 60000) : null, count: ltf.length },
-        '30m': { candleAt: thirtyR.value.length ? thirtyR.value[thirtyR.value.length - 1].time : null, ageMinutes: thirtyR.value.length ? Math.round((clockNow - thirtyR.value[thirtyR.value.length - 1].time) / 60000) : null, count: thirtyR.value.length },
-        '1H': { candleAt: mtfR.value.length ? mtfR.value[mtfR.value.length - 1].time : null, ageMinutes: mtfR.value.length ? Math.round((clockNow - mtfR.value[mtfR.value.length - 1].time) / 60000) : null, count: mtfR.value.length },
-        '8H': { candleAt: eightHour.length ? eightHour[eightHour.length - 1].time : null, ageMinutes: eightHour.length ? Math.round((clockNow - eightHour[eightHour.length - 1].time) / 60000) : null, count: eightHour.length, derived: true },
-        '4H': { candleAt: htfR.value.length ? htfR.value[htfR.value.length - 1].time : null, ageMinutes: htfR.value.length ? Math.round((clockNow - htfR.value[htfR.value.length - 1].time) / 60000) : null, count: htfR.value.length },
-        'Daily': { candleAt: dayR.value.length ? dayR.value[dayR.value.length - 1].time : null, ageMinutes: dayR.value.length ? Math.round((clockNow - dayR.value[dayR.value.length - 1].time) / 60000) : null, count: dayR.value.length },
-        'Weekly': { candleAt: wkR.value.length ? wkR.value[wkR.value.length - 1].time : null, ageMinutes: wkR.value.length ? Math.round((clockNow - wkR.value[wkR.value.length - 1].time) / 60000) : null, count: wkR.value.length }
+        '5m': inspectCandles('5m', fiveR.value, 5 * 60000, 12 * 60000),
+        '15m': inspectCandles('15m', ltf, 15 * 60000, 35 * 60000),
+        '30m': inspectCandles('30m', thirtyR.value, 30 * 60000, 70 * 60000),
+        '1H': inspectCandles('1H', mtfR.value, 60 * 60000, 130 * 60000),
+        '4H': inspectCandles('4H', htfR.value, 4 * 60 * 60000, 9 * 60 * 60000),
+        '8H': inspectCandles('8H', eightHour, 8 * 60 * 60000, 17 * 60 * 60000),
+        'Daily': inspectCandles('Daily', dayR.value, 24 * 60 * 60000, 48 * 60 * 60000),
+        'Weekly': inspectCandles('Weekly', wkR.value, 7 * 24 * 60 * 60000, 15 * 24 * 60 * 60000)
       },
+      backtest: state.lastBacktestSummary || null,
       entry: plan.entry, sl: plan.sl, tp: plan.tp,
       metaScore: plan.metaScore || 0,
       metaTrained: !!(state.learningState.metaModel && state.learningState.metaModel.length),
