@@ -4,7 +4,7 @@ import { newsAlertText, signalsToFlatten, buildMetaTrainingSet, META_LIMITS, thi
   genData, correlateByDay, alignedLatestChange, pearsonCorrelation,
   resolveSignal, autonomyGate, mergeSignalLogs, newlyResolvedSignals,
   newlyArrivedOpenSignals, newlyExpiredSignals, signalResolutionRank, signalLiveness, shouldPaperTrade, paperRejectReason, interpretConfidence, confidenceBand,
-  confidenceBands, breakevenWinRate, CONFIDENCE_PRACTICAL_MAX, CONFIDENCE_EVIDENCE } from '../lib/engine.js';
+  confidenceBands, breakevenWinRate, CONFIDENCE_PRACTICAL_MAX, CONFIDENCE_EVIDENCE, paperPositionSize } from '../lib/engine.js';
 const C=(t,o,h,l,c)=>({time:t,open:o,high:h,low:l,close:c});
 let pass=0,fail=0;
 const ok=(n,a,e)=>{ const g=JSON.stringify(a)===JSON.stringify(e); console.log((g?'PASS':'FAIL')+' '+n+(g?'':'  got='+JSON.stringify(a)+' want='+JSON.stringify(e))); g?pass++:fail++; };
@@ -50,6 +50,13 @@ ok('stronger confluence may replace the weaker opposite signal', strongerOpposit
 ok('gate respects max open', autonomyGate(R('BUY',70,'A'),P,[{dir:'SELL',status:'open'},{dir:'SELL',status:'open'},{dir:'SELL',status:'pending'}],null).take, false);
 ok('gate rejects bad plan', autonomyGate(R('BUY',70,'A'),{entry:NaN,sl:1,tp:2,rr:1},[],null).take, false);
 
+
+// Risk sizing must stay at or below the configured capital risk after lot-step rounding.
+const sizedWithinBudget = paperPositionSize(100, 1, 2000, 1992.4, {
+  sizingMode:'risk', contractSize:100, lotStep:0.01, minLots:0.01
+});
+ok('risk sizing does not round up beyond capital budget',
+  sizedWithinBudget ? sizedWithinBudget.riskAmount <= sizedWithinBudget.requestedRisk + 1e-8 : true, true);
 
 // ---------------- analysis quality ----------------
 import { computeCalibration, computeConditionBreakdown, computeGateAudit, signalRMultiple } from '../lib/engine.js';
