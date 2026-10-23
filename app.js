@@ -3080,7 +3080,8 @@ function renderPaper() {
     html += '<div style="font-size:10px;color:#454a56;margin:10px 0 6px;">Awaiting entry (no exposure yet)</div>';
     html += resting.map(p =>
       '<div class="zone-item"><span><span class="dirtag ' + p.dir + '">' + p.dir + '</span> ' + lotLabel(p) + ' limit @ $' + fmt(p.requestedEntry)
-      + '</span><span class="mono" style="color:#5c6270;">not filled</span></div>').join('');
+      + '</span><span class="mono" style="color:#5c6270;">not filled</span> '
+      + '<button class="btn" data-paper-action="close" data-paper-id="' + p.id + '" style="padding:3px 7px;font-size:10px;">Cancel</button></div>').join('');
   }
 
   const open = paper.positions.filter(p => p.status === 'open' && inEra(p));
@@ -3088,8 +3089,12 @@ function renderPaper() {
     html += '<div style="font-size:10px;color:#454a56;margin:10px 0 6px;">Open positions</div>';
     html += open.map(p => {
       const u = unrealisedPnl(p, price);
-      return '<div class="zone-item"><span><span class="dirtag ' + p.dir + '">' + p.dir + '</span> ' + lotLabel(p) + ' @ $' + fmt(p.entryFill) + '</span>'
-        + '<span class="mono ' + pnlCls(u) + '">' + money(u) + '</span></div>';
+      return '<div class="zone-item" style="align-items:flex-start;"><span><span class="dirtag ' + p.dir + '">' + p.dir + '</span> ' + lotLabel(p)
+        + ' · entry $' + fmt(p.entryFill) + ' · SL $' + fmt(p.sl) + ' · TP $' + fmt(p.tp)
+        + '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:5px;">'
+        + '<button class="btn" data-paper-action="edit-sl" data-paper-id="' + p.id + '" style="padding:3px 7px;font-size:10px;">Edit SL</button>'
+        + '<button class="btn" data-paper-action="close" data-paper-id="' + p.id + '" style="padding:3px 7px;font-size:10px;border-color:#ef4d5f;color:#ef4d5f;">Close at market</button>'
+        + '</div></span><span class="mono ' + pnlCls(u) + '">' + money(u) + '</span></div>';
     }).join('');
   }
 
