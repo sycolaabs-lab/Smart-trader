@@ -3102,8 +3102,8 @@ function renderPaper() {
   if (closed.length) {
     html += '<div style="font-size:10px;color:#454a56;margin:10px 0 6px;">Recent closed</div>';
     html += closed.map(p =>
-      '<div class="zone-item"><span><span class="dirtag ' + p.dir + '">' + p.dir + '</span> ' + (p.outcome === 'won' ? (p.partial ? '◐' : '✓') : p.outcome === 'lost' ? '✗' : '–')
-      + ' <span style="color:#454a56;">' + lotLabel(p) + ' · exit $' + fmt(p.exitPrice) + '</span></span>'
+      '<div class="zone-item"><span><span class="dirtag ' + p.dir + '">' + p.dir + '</span> ' + (p.outcome === 'won' ? (p.partial ? '◐ TP' : '✓ TP') : p.outcome === 'lost' ? '✗ SL' : '– closed')
+      + ' <span style="color:#454a56;">' + lotLabel(p) + ' · entry $' + fmt(p.entryFill) + ' · SL $' + fmt(p.sl) + ' · TP $' + fmt(p.tp) + ' · exit $' + fmt(p.exitPrice) + '</span></span>'
       + '<span class="mono ' + pnlCls(p.pnl) + '">' + money(p.pnl) + (p.rMultiple != null ? ' <span style="color:#454a56;">' + (p.rMultiple >= 0 ? '+' : '') + fmt(p.rMultiple) + 'R</span>' : '') + '</span></div>'
     ).join('');
   }
