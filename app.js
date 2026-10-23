@@ -1429,10 +1429,8 @@ async function connectProvider() {
     connStatus.textContent = 'Connected to ' + provider.label + '. Live 15-minute candles for ' + SYMBOL + '.';
     connStatus.className = 'conn-status ok';
     btSourceNote.textContent = 'Data source: ' + provider.label + ' — connected.';
-    // Load the requested intraday timeframes immediately on connection, not only
-    // after the first polling interval. 8H is derived from the 1H candles.
-    await resyncTimeframe('5m', '5min', 300, d => { fiveMinData = d; });
-    await resyncTimeframe('30m', '30min', 200, d => { thirtyMinData = d; });
+    // Load each timeframe once on connection. fetchHigherTimeframes includes
+    // 5m and 30m and derives 8H from 1H, preserving the provider's daily quota.
     await fetchHigherTimeframes(provider, key);
     eightHourData = aggregateCandles(mtfData, 8);
     timeframeHealth['8H'] = { ok: eightHourData.length > 0, at: Date.now(), candleTime: eightHourData.length ? eightHourData[eightHourData.length - 1].time : null, count: eightHourData.length, derived: true, source: 'aggregated from 1H candles' };
