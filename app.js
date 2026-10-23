@@ -882,10 +882,10 @@ function getTargetRR() { return +document.getElementById('targetRR').value; }
 // ============================================================
 const SYMBOL = 'XAU/USD';
 const LIVE_INTERVAL = '15min';
-let apiKey = null, dataMode = 'simulated', activeProvider = null;
-let liveData = genData(700, 1928, 900000);
+let apiKey = null, dataMode = 'disconnected', activeProvider = null;
+let liveData = [];
 let mtfData = [], htfData = [], dailyData = [], weeklyData = []; // real 1H/4H/Daily/Weekly candles when the provider supports them; empty = fall back to aggregation
-let prevClose = liveData[liveData.length - 1].close;
+let prevClose = NaN;
 let simTickHandle = null, pollPriceHandle = null, resyncHandle = null, mtfResyncHandle = null, htfResyncHandle = null, corrResyncHandle = null, newsResyncHandle = null, dailyResyncHandle = null, weeklyResyncHandle = null;
 // Mutable state that functions defined further up this file reach into.
 // Declared here, above the first top-level refreshAll(), because `let` bindings
@@ -1625,6 +1625,17 @@ function renderMarketClock() {
 function refreshAll() {
   renderMarketClock();
   if (typeof renderPaper === 'function' && paper && paper.positions.length) renderPaper();
+  if (dataMode !== 'live' || !apiKey || !activeProvider || !liveData.length) {
+    const label = document.getElementById('modeLabel');
+    if (label) label.textContent = 'API disconnected — analysis paused';
+    const price = document.getElementById('livePrice');
+    if (price) price.textContent = '—';
+    const change = document.getElementById('priceChange');
+    if (change) change.textContent = 'No verified market data';
+    const warning = document.getElementById('staleFeedWarning');
+    if (warning) { warning.textContent = 'Connect a market-data API key to enable analysis, paper trading and backtesting. Synthetic prices are disabled.'; warning.classList.remove('hidden'); }
+    return;
+  }
   const weights = getWeights();
   lastComposite = computeComposite(liveData, liveData.length - 1, weights, mtfData, htfData, correlationScore, fundamentalScore, newsSentimentScore, dailyData, weeklyData);
   if (!lastComposite) return;
@@ -1969,16 +1980,11 @@ function setGenOutcome(el, text, tone) {
 }
 
 function liveTick() {
-  if (dataMode !== 'simulated') return;
-  const last = liveData[liveData.length - 1];
-  const drift = (Math.random() - 0.5) * 1.1;
-  const newClose = Math.max(1500, last.close + drift);
-  last.close = +newClose.toFixed(2); last.high = Math.max(last.high, last.close); last.low = Math.min(last.low, last.close);
-  refreshAll();
+  // Synthetic prices are disabled; analysis requires provider-backed candles.
+  return;
 }
 refreshAll();
 window.addEventListener('resize', resizeLiveCanvas);
-simTickHandle = setInterval(liveTick, 2000);
 if (lastComposite) { const plan = buildTradePlan(lastComposite, getTargetRR()); updateSignalUI(lastComposite, plan, false); }
 
 function drawEquityCurve(curve, capital) {
@@ -2018,17 +2024,16 @@ async function runBacktestCycle(isAuto) {
     const costPips = parseFloat(document.getElementById('pCostPips').value) || 0;
 
     let histData;
-    if (dataMode === 'live' && apiKey && activeProvider) {
-      try {
-        histData = await PROVIDERS[activeProvider].timeSeries(apiKey, LIVE_INTERVAL, Math.min(bars, 5000));
-        btSourceNote.textContent = 'Data source: ' + PROVIDERS[activeProvider].label + ' — ' + histData.length + ' × 15min candles for ' + SYMBOL + '.';
-      } catch (e) {
-        btSourceNote.textContent = 'Live history fetch failed (' + e.message + ') — using simulated data instead.';
-        histData = genData(bars, 1850, 900000);
-      }
-    } else {
-      histData = genData(bars, 1850, 900000);
-      btSourceNote.textContent = 'Data source: simulated (connect an API key above to backtest on real 15min history).';
+    if (dataMode !== 'live' || !apiKey || !activeProvider) {
+      throw new Error('Backtesting is disabled until a market-data API key is connected.');
+    }
+    try {
+      histData = await PROVIDERS[activeProvider].timeSeries(apiKey, LIVE_INTERVAL, Math.min(bars, 5000));
+      if (!Array.isArray(histData) || histData.length < 150) throw new Error('Provider returned too few candles for a meaningful backtest.');
+      btSourceNote.textContent = 'Data source: ' + PROVIDERS[activeProvider].label + ' — ' + histData.length + ' × 15min candles for ' + SYMBOL + '.';
+    } catch (e) {
+      btSourceNote.textContent = 'Live history fetch failed (' + e.message + '). No simulated fallback was used.';
+      throw e;
     }
 
     // Pass 1: run with base weights to gather in-sample (train) trades for tuning
@@ -2095,7 +2100,7 @@ async function runBacktestCycle(isAuto) {
       tbody.appendChild(tr);
     });
     if (isAuto && autoStatus) {
-      autoStatus.textContent = 'Last auto-backtest: ' + new Date().toLocaleTimeString() + '. Next run in ~4 hours while this tab stays open and connected.';
+      autoStatus.textContent = 'Last auto-backtest: ' + new Date().toLocaleTimeString() + '. Next browser run in ~1 hour; closed-tab runs require server scheduling.';
     }
   } catch (e) {
     btSourceNote.textContent = 'Backtest failed: ' + e.message;
@@ -2112,11 +2117,11 @@ function startAutoBacktest() {
   const status = document.getElementById('autoBacktestStatus');
   if (!cb.checked) { status.textContent = 'Auto-backtest is off — check the box above to enable self-learning.'; return; }
   if (dataMode !== 'live') { status.textContent = 'Connect a real data provider to enable auto-backtesting.'; return; }
-  status.textContent = 'Self-learning active — first auto-backtest running now, then every ~4 hours while this tab stays open.';
+  status.textContent = 'Browser backtest active — first run now, then hourly while this tab is open. Closed-tab runs require server scheduling.';
   runBacktestCycle(true);
   autoBacktestHandle = setInterval(() => {
-    if (document.getElementById('autoBacktestCheckbox').checked && dataMode === 'live') runBacktestCycle(true);
-  }, 4 * 60 * 60 * 1000);
+    if (document.getElementById('autoBacktestCheckbox').checked && dataMode === 'live' && apiKey) runBacktestCycle(true);
+  }, 60 * 60 * 1000);
 }
 document.getElementById('autoBacktestCheckbox').addEventListener('change', () => {
   if (document.getElementById('autoBacktestCheckbox').checked) startAutoBacktest();
