@@ -36,7 +36,7 @@ function series(n, stepMs, startPrice, drift, seed=3){
   }
   return out.reverse();
 }
-const INTERVAL_MS = { '15min':9e5, '1h':36e5, '4h':144e5, '1day':864e5, '1week':6048e5 };
+const INTERVAL_MS = { '5min':3e5, '15min':9e5, '30min':18e5, '1h':36e5, '4h':144e5, '1day':864e5, '1week':6048e5 };
 
 let tdCalls=0, fredCalls=0, avCalls=0;
 globalThis.fetch = async (url) => {
@@ -85,7 +85,7 @@ ok('latestTick satisfies the dashboard contract', missing.length===0, 'missing: 
 const tdAfterFirst = tdCalls;
 await runTick({ db, tdKey:'TD', fredKey:'FRED', avKey:'AV', now: TICK_NOW });
 const secondTickCalls = tdCalls - tdAfterFirst;
-ok('second tick reuses cached HTF/macro', secondTickCalls === 1, 'made '+secondTickCalls+' TwelveData calls (want 1: just 15min)');
+ok('second tick reuses cached candles and macro', secondTickCalls === 0, 'made '+secondTickCalls+' TwelveData calls (want 0 while all timeframe caches are fresh)');
 
 // --- signal lifecycle: force a signal, then resolve it ---
 const w = JSON.parse(db._docs.worker.signalLog);
