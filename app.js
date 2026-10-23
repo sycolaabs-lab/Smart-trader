@@ -3817,6 +3817,21 @@ async function autonomyCycle() {
     const code = gate.code || 'unknown';
     autonomy.gateTally[code] = (autonomy.gateTally[code] || 0) + 1;
     if (gate.take) {
+      if (gate.replaceSignalId) {
+        const weaker = signalLog.find(x => x.id === gate.replaceSignalId && (x.status === 'pending' || x.status === 'open'));
+        if (weaker) {
+          weaker.status = 'expired';
+          weaker.expiryReason = 'auditor: superseded by opposite setup with stronger confluence';
+          weaker.resolvedAt = new Date().toISOString();
+          weaker.resolvedBy = 'confluence-auditor';
+          const posIndex = paper.positions.findIndex(p => p.signalId === weaker.id && (p.status === 'open' || p.status === 'pending'));
+          if (posIndex >= 0) paper.positions[posIndex] = closePaperPosition(paper.positions[posIndex], 'expired', currentMarkPrice(), paperConfig(), currentMarkPrice());
+          saveSignalLog();
+          await savePaper();
+          renderPaper();
+          renderSignalLog();
+        }
+      }
       updateSignalUI(lastComposite, plan, true, 'auto'); // logIt = true -> addSignalToLog
       autonomy.signalsTaken++;
       autonomy.lastSignalAt = now;
