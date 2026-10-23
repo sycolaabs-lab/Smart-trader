@@ -2205,7 +2205,7 @@ async function runBacktestCycle(isAuto) {
     result.trades.slice().reverse().forEach((t, idx) => {
       const seg = t.entryIndex < splitIdx ? 'train' : 'test';
       const tr = document.createElement('tr');
-      tr.innerHTML = '<td>' + (result.trades.length - idx) + '</td><td>' + seg + '</td><td>' + t.dir + '</td><td class="mono">' + t.confidence + '%</td><td class="mono">' + fmt(t.entry) + '</td><td class="mono">' + fmt(t.exit) + '</td><td class="mono ' + t.result + '">' + (t.pnl >= 0 ? '+' : '') + t.pnl.toFixed(2) + '</td><td class="' + t.result + '">' + t.result.toUpperCase() + '</td>';
+      tr.innerHTML = '<td>' + (result.trades.length - idx) + '</td><td>' + seg + '</td><td>' + t.dir + '</td><td class="mono">' + t.confidence + '%</td><td class="mono">' + fmt(t.entry) + '</td><td class="mono">' + fmt(t.sl) + '</td><td class="mono">' + fmt(t.tp) + '</td><td class="mono">' + fmt(t.exit) + '</td><td class="mono ' + t.result + '">' + (t.pnl >= 0 ? '+' : '') + t.pnl.toFixed(2) + '</td><td class="mono">' + (t.rMultiple == null ? '—' : (t.rMultiple >= 0 ? '+' : '') + t.rMultiple.toFixed(2) + 'R') + '</td><td class="' + t.result + '">' + t.result.toUpperCase() + '</td>';
       tbody.appendChild(tr);
     });
     if (isAuto && autoStatus) {
