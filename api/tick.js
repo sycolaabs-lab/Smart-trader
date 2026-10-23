@@ -641,9 +641,19 @@ export async function runTick({ db, tdKey, fredKey, avKey, now }) {
     // its confidence/meta evidence is materially stronger; otherwise the gate
     // rejects it and avoids a hedge.
     const activeOpposites = state.signalLog.filter(x => (x.status === 'pending' || x.status === 'open') && x.dir && x.dir !== result.direction);
-    const candidateScore = Number(result.confidence || 0) + Number(plan.metaScore || 0) * 10;
-    const canSupersede = activeOpposites.length > 0 && activeOpposites.every(x =>
-      candidateScore > (Number(x.confidence || 0) + Number(x.metaScore || 0) * 10 + 5));
+    const factorConfluence = (factors, dir) => {
+      const sign = dir === 'BUY' ? 1 : -1;
+      let aligned = 0, total = 0;
+      Object.values(factors || {}).forEach(v => {
+        if (!Number.isFinite(v)) return;
+        total += Math.abs(v);
+        if (v * sign > 0) aligned += Math.abs(v);
+      });
+      return total > 0 ? aligned / total : 0;
+    };
+    const candidateScore = factorConfluence(result.factors, result.direction);
+    const canSupersede = activeOpposites.length > 0 && candidateScore > 0 &&
+      activeOpposites.every(x => candidateScore >= factorConfluence(x.factors, x.dir) + 0.15);
     const superseded = canSupersede ? activeOpposites : [];
     const gateBook = superseded.length
       ? state.signalLog.filter(x => !superseded.some(old => old.id === x.id))
