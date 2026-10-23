@@ -3116,6 +3116,52 @@ function renderPaper() {
   root.innerHTML = html;
 }
 
+// Paper controls update the paper ledger and matching signal record together.
+document.getElementById('paperContent').addEventListener('click', async event => {
+  const button = event.target.closest('[data-paper-action]');
+  if (!button) return;
+  const position = paper.positions.find(p => p.id === button.dataset.paperId);
+  if (!position || (position.status !== 'open' && position.status !== 'pending')) return;
+  const price = currentMarkPrice();
+  if (button.dataset.paperAction === 'edit-sl') {
+    const raw = window.prompt('New stop-loss price (current SL ' + fmt(position.sl) + '):', String(position.sl));
+    if (raw == null) return;
+    const next = Number(raw);
+    if (!Number.isFinite(next) || next <= 0) { window.alert('Enter a valid positive price.'); return; }
+    if (position.status !== 'open') { window.alert('Cancel the resting order and create a new setup to change its stop.'); return; }
+    const validSide = position.dir === 'BUY'
+      ? next < position.entryFill && next < price
+      : next > position.entryFill && next > price;
+    if (!validSide) { window.alert('The stop must remain beyond entry and current market price on the loss side.'); return; }
+    position.sl = next;
+    position.riskAmount = Math.abs(position.entryFill - next) * position.units;
+    const sig = signalLog.find(x => x.id === position.signalId);
+    if (sig && (sig.status === 'pending' || sig.status === 'open')) {
+      sig.sl = next;
+      sig.rr = Math.abs(sig.tp - sig.entry) / Math.max(Math.abs(sig.entry - next), 1e-9);
+      saveSignalLog();
+    }
+  } else if (button.dataset.paperAction === 'close') {
+    if (!window.confirm(position.status === 'pending' ? 'Cancel this unfilled paper order?' : 'Close this paper trade at the current market price?')) return;
+    const sig = signalLog.find(x => x.id === position.signalId);
+    if (sig && (sig.status === 'pending' || sig.status === 'open')) {
+      sig.status = 'expired';
+      sig.expiryReason = position.status === 'pending' ? 'manually cancelled' : 'manually closed by user';
+      sig.resolvedAt = new Date().toISOString();
+      sig.resolvedBy = 'manual';
+      if (position.status === 'open' && Number.isFinite(price)) sig.exitPrice = price;
+      saveSignalLog();
+    }
+    const idx = paper.positions.findIndex(p => p.id === position.id);
+    paper.positions[idx] = closePaperPosition(position, 'expired', price, paperConfig(), price);
+  }
+  await savePaper();
+  renderPaper();
+  renderSignalLog();
+  renderAnalysisQuality();
+  renderDataInventory();
+});
+
 function renderPaperStatusNote() {
   const note = document.getElementById('paperStatus');
   if (!note) return;
