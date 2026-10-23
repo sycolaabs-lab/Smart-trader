@@ -137,29 +137,10 @@ document.getElementById('autoTuneBtn').addEventListener('click', () => {
   refreshAll(); renderLearningTable();
 });
 document.getElementById('resetLearning').addEventListener('click', async () => {
-  // Rebuild from retained outcomes; never delete the evidence used for relearning.
-  const rebuilt = { factors: {}, patterns: {}, totalLogged: 0, metaExamples: [], metaBacktestExamples: learningState.metaBacktestExamples || [], metaModel: null };
-  Object.keys(FACTOR_LABELS).forEach(k => { rebuilt.factors[k] = { votes: 0, wins: 0 }; });
-  const seen = new Set();
-  const accumulate = sig => {
-    if (!sig || seen.has(sig.id) || (sig.status !== 'won' && sig.status !== 'lost')) return;
-    seen.add(sig.id);
-    const won = sig.status === 'won', dirSign = sig.dir === 'BUY' ? 1 : -1;
-    Object.keys(FACTOR_LABELS).forEach(k => {
-      const v = sig.factors && sig.factors[k];
-      if (v && Math.sign(v) === dirSign) { rebuilt.factors[k].votes++; if (won) rebuilt.factors[k].wins++; }
-    });
-    const signature = patternSignature(sig.dir, sig.factors || {});
-    if (!rebuilt.patterns[signature]) rebuilt.patterns[signature] = { votes: 0, wins: 0 };
-    rebuilt.patterns[signature].votes++;
-    if (won) rebuilt.patterns[signature].wins++;
-    rebuilt.totalLogged++;
-    if (sig.qualityFeatures) rebuilt.metaExamples.push({ features: sig.qualityFeatures, label: won ? 1 : -1 });
-  };
-  signalLog.forEach(accumulate);
-  shadowLog.forEach(accumulate);
-  rebuilt.metaExamples = thinExamples(rebuilt.metaExamples, META_LIMITS.liveSoftLimit);
-  learningState = rebuilt;
+  // Relearn from all preserved live and backtest examples. This deliberately
+  // does not clear the raw signal ledger, factor history, or prior examples.
+  const beforeLive = (learningState.metaExamples || []).length;
+  const beforeBacktest = (learningState.metaBacktestExamples || []).length;
   retrainMetaLabeler();
   await saveLearningState();
   renderLearningTable();
@@ -167,7 +148,7 @@ document.getElementById('resetLearning').addEventListener('click', async () => {
   applyKnowledgeBaseWeights();
   renderDataInventory();
   const status = document.getElementById('learningStatus');
-  if (status) status.textContent = 'Rebuilt from retained resolved signal and declined-setup history. Raw logs and backtest examples were preserved.';
+  if (status) status.textContent = 'Re-trained from preserved evidence: ' + beforeLive + ' live examples and ' + beforeBacktest + ' backtest examples. No collected data was deleted.';
 });
 // NOTE: startup restore of learning state deliberately does NOT happen here.
 // loadLearningState() calls renderLearningTable() -> getWeights(), which reads the
