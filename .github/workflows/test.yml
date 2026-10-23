@@ -26,5 +26,5 @@ jobs:
         if: failure()
         shell: bash
         run: |
-          node test/engine.test.mjs || true
-          node test/tick.test.mjs || true
+          timeout 30s node test/engine.test.mjs || true
+          timeout 30s node test/tick.test.mjs || true
