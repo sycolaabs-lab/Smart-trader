@@ -3489,9 +3489,13 @@ document.getElementById('autoTuneFilterEnabled').addEventListener('change', () =
   if (document.getElementById('autoTuneFilterEnabled').checked) autoTuneFilterFromEvidence(computeGateAudit(signalLog, shadowLog), false);
 });
 document.getElementById('resetQuality').addEventListener('click', async () => {
-  shadowLog = [];
+  // Declined setups are valuable counterfactual evidence. Keep the raw ledger;
+  // refresh the derived analysis instead of deleting the history.
   await saveShadowLog();
   renderAnalysisQuality();
+  renderDataInventory();
+  const status = document.getElementById('learningStatus');
+  if (status) status.textContent = 'Declined-setup history preserved. Analysis refreshed from retained evidence.';
 });
 
 // ============================================================
