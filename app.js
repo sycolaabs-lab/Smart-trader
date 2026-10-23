@@ -3846,9 +3846,19 @@ async function autonomyCycle() {
       const activeOpposing = signalLog.filter(x =>
         (x.status === 'pending' || x.status === 'open') &&
         (x.dir === 'BUY' || x.dir === 'SELL') && x.dir !== lastComposite.direction);
-      const candidateScore = Number(lastComposite.confidence || 0) + Number(plan.metaScore || 0) * 10;
-      const scoreOf = x => Number(x.confidence || 0) + Number(x.metaScore || 0) * 10;
-      const canReplaceAll = activeOpposing.length > 0 && activeOpposing.every(x => candidateScore >= scoreOf(x) + 10);
+      const factorConfluence = (factors, dir) => {
+        const sign = dir === 'BUY' ? 1 : -1;
+        let aligned = 0, total = 0;
+        Object.values(factors || {}).forEach(v => {
+          if (!Number.isFinite(v)) return;
+          total += Math.abs(v);
+          if (v * sign > 0) aligned += Math.abs(v);
+        });
+        return total > 0 ? aligned / total : 0;
+      };
+      const candidateScore = factorConfluence(lastComposite.factors, lastComposite.direction);
+      const canReplaceAll = activeOpposing.length > 0 && candidateScore > 0 &&
+        activeOpposing.every(x => candidateScore >= factorConfluence(x.factors, x.dir) + 0.15);
       if (canReplaceAll) {
         activeOpposing.forEach(x => {
           x.status = 'expired';
