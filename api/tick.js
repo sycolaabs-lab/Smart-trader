@@ -636,15 +636,34 @@ export async function runTick({ db, tdKey, fredKey, avKey, now }) {
         ? parseFloat(process.env.TICK_MIN_CONFIDENCE)
         : AUTONOMY_DEFAULTS.minConfidence
     });
+    // Compare an opposite-direction candidate with every active setup before
+    // allowing it through. A new signal may replace the opposing book only when
+    // its confidence/meta evidence is materially stronger; otherwise the gate
+    // rejects it and avoids a hedge.
+    const activeOpposites = state.signalLog.filter(x => (x.status === 'pending' || x.status === 'open') && x.dir && x.dir !== result.direction);
+    const candidateScore = Number(result.confidence || 0) + Number(plan.metaScore || 0) * 10;
+    const canSupersede = activeOpposites.length > 0 && activeOpposites.every(x =>
+      candidateScore > (Number(x.confidence || 0) + Number(x.metaScore || 0) * 10 + 5));
+    const superseded = canSupersede ? activeOpposites : [];
+    const gateBook = superseded.length
+      ? state.signalLog.filter(x => !superseded.some(old => old.id === x.id))
+      : state.signalLog;
     let gate;
     if (audit.blocking) {
       gate = { take: false, code: 'audit',
         reason: 'independent audit found ' + audit.critical + ' critical issue(s): ' + audit.findings[0].title };
     } else {
-      gate = autonomyGate(result, plan, state.signalLog, state.lastSignalAt, gateCfg);
+      gate = autonomyGate(result, plan, gateBook, state.lastSignalAt, gateCfg);
     }
     let tookSignal = false;
     if (gate.take) {
+      superseded.forEach(old => {
+        old.status = 'expired';
+        old.expiryReason = 'auditor: replaced by materially stronger opposing ' + result.direction + ' confluence';
+        old.killSwitch = 'conflict-resolution';
+        old.resolvedAt = new Date(clockNow).toISOString();
+        old.resolvedBy = 'auditor';
+      });
       state.signalLog.unshift({
         id: Date.now() + '-' + Math.random().toString(36).slice(2, 7),
         dir: result.direction, entry: plan.entry, sl: plan.sl, tp: plan.tp,
