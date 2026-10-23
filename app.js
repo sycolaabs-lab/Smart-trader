@@ -1717,6 +1717,17 @@ function renderMarketClock() {
     (h < 1 ? Math.round(h * 60) + 'm' : h.toFixed(1) + 'h');
 }
 
+function pauseSignalUI(message) {
+  lastComposite = null;
+  const dir = document.getElementById('dirDisplay');
+  if (dir) { dir.className = 'dir hold'; dir.innerText = '⏸ PAUSED'; }
+  const conf = document.getElementById('confidenceLabel');
+  if (conf) conf.textContent = 'No verified live data';
+  ['sEntry','sSl','sTp','sRr','sSlPips','sTpPips'].forEach(id => { const el = document.getElementById(id); if (el) el.textContent = '—'; });
+  const entryType = document.getElementById('sEntryType'); if (entryType) entryType.textContent = 'Unavailable';
+  const reason = document.getElementById('sReason'); if (reason) reason.textContent = message || 'Analysis paused until fresh provider data is available.';
+  const meta = document.getElementById('metaLabelerBox'); if (meta) meta.classList.add('hidden');
+}
 function refreshAll() {
   renderMarketClock();
   if (typeof renderPaper === 'function' && paper && paper.positions.length) renderPaper();
@@ -1729,6 +1740,7 @@ function refreshAll() {
     if (change) change.textContent = 'No verified market data';
     const warning = document.getElementById('staleFeedWarning');
     if (warning) { warning.textContent = 'Connect a market-data API key to enable analysis, paper trading and backtesting. Synthetic prices are disabled.'; warning.classList.remove('hidden'); }
+    pauseSignalUI('No API connection. Synthetic data and simulated signals are disabled.');
     return;
   }
   const latest = liveData[liveData.length - 1];
@@ -1742,6 +1754,7 @@ function refreshAll() {
     if (label) label.textContent = 'Feed invalid or stale — analysis paused';
     const warning = document.getElementById('staleFeedWarning');
     if (warning) { warning.textContent = 'DATA ANALYZER BLOCK: latest 15m candle is malformed, future-dated, or older than 45 minutes. No new analysis or paper entry will be generated until valid fresh data arrives.'; warning.classList.remove('hidden'); }
+    pauseSignalUI('DATA ANALYZER BLOCK: latest 15m candle is invalid or stale.');
     renderTimeframeHealth();
     return;
   }
