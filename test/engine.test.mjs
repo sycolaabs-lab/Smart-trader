@@ -4,7 +4,9 @@ import { newsAlertText, signalsToFlatten, buildMetaTrainingSet, META_LIMITS, thi
   genData, correlateByDay, alignedLatestChange, pearsonCorrelation,
   resolveSignal, autonomyGate, mergeSignalLogs, newlyResolvedSignals,
   newlyArrivedOpenSignals, newlyExpiredSignals, signalResolutionRank, signalLiveness, shouldPaperTrade, paperRejectReason, interpretConfidence, confidenceBand,
-  confidenceBands, breakevenWinRate, CONFIDENCE_PRACTICAL_MAX, CONFIDENCE_EVIDENCE, paperPositionSize } from '../lib/engine.js';
+  confidenceBands, breakevenWinRate, CONFIDENCE_PRACTICAL_MAX, CONFIDENCE_EVIDENCE,
+  paperPositionSize, roundToLotStep, PAPER_DEFAULTS, worsePrice, openPaperPosition,
+  closePaperPosition, unrealisedPnl, paperAccountSummary } from '../lib/engine.js';
 const C=(t,o,h,l,c)=>({time:t,open:o,high:h,low:l,close:c});
 let pass=0,fail=0;
 const ok=(n,a,e)=>{ const g=JSON.stringify(a)===JSON.stringify(e); console.log((g?'PASS':'FAIL')+' '+n+(g?'':'  got='+JSON.stringify(a)+' want='+JSON.stringify(e))); g?pass++:fail++; };
@@ -176,8 +178,6 @@ ok('summary calm when low', /Within budget/.test(quotaSummary({day:'d',used:50},
 
 
 // ---------------- paper trading ----------------
-import { roundToLotStep, PAPER_DEFAULTS, worsePrice, openPaperPosition,
-         closePaperPosition, unrealisedPnl, paperAccountSummary } from '../lib/engine.js';
 console.log('\n-- paper trading --');
 const PCFG = { startingBalance:10000, riskPercent:1, spreadPips:3, slippagePips:1, maxConcurrent:3 };
 const near = (a,b,eps)=>Math.abs(a-b)<(eps||1e-6);
