@@ -26,7 +26,7 @@ import {
   computeComposite, buildTradePlan, resolveSignal, autonomyGate, setMetaModel,
   trainAdaBoostStumps, buildMetaTrainingSet, META_LIMITS, thinExamples, parseUtcDatetime, pearsonCorrelation, toDailyReturns,
   CORRELATION_INSTRUMENTS, FUNDAMENTAL_INSTRUMENTS, FRED_INSTRUMENTS,
-  runSmcBacktest, computeTunedWeights, META_LIMITS, buildMetaTrainingSet, trainAdaBoostStumps, setMetaModel,
+  runSmcBacktest, computeTunedWeights,
   AUTONOMY_DEFAULTS, macroContribution, aggregateMacroScore, pctChangeOf,
   seriesDeltas, latestChangeOf, correlateByDay, ECONOMIC_RELEASES, buildReleaseCalendar,
   newsWindowState, NEWS_WINDOW_DEFAULTS, signalsToFlatten,
