@@ -750,11 +750,19 @@ export async function runTick({ db, tdKey, fredKey, avKey, now }) {
         Number.isFinite(c.open) && Number.isFinite(c.high) && Number.isFinite(c.low) && Number.isFinite(c.close) &&
         c.high >= Math.max(c.open, c.close, c.low) && c.low <= Math.min(c.open, c.close, c.high));
       let gaps = 0, largeJumps = 0;
+      const moves = [];
       for (let i = 1; i < valid.length; i++) {
         if (valid[i].time - valid[i - 1].time > intervalMs * 1.8) gaps++;
         const previous = valid[i - 1].close;
-        if (previous > 0 && Math.abs(valid[i].close - previous) / previous > 0.025) largeJumps++;
+        if (previous > 0) moves.push(Math.abs(valid[i].close - previous) / previous);
       }
+      const sortedMoves = moves.slice().sort((a, b) => a - b);
+      const medianMove = sortedMoves.length ? sortedMoves[Math.floor(sortedMoves.length / 2)] : 0;
+      // Flag suspicious jumps relative to this series' own typical movement.
+      // This is a warning, not proof of a bad tick; genuine news moves still occur.
+      const absoluteFloor = intervalMs <= 15 * 60000 ? 0.003 : intervalMs <= 60 * 60000 ? 0.008 : intervalMs <= 4 * 60 * 60000 ? 0.015 : 0.025;
+      const jumpThreshold = Math.max(absoluteFloor, medianMove * 8);
+      largeJumps = moves.filter(move => move > jumpThreshold).length;
       const last = valid.length ? valid[valid.length - 1] : null;
       const ageMinutes = last ? Math.max(0, Math.round((clockNow - last.time) / 60000)) : null;
       return { candleAt: last ? last.time : null, ageMinutes, count: valid.length,
