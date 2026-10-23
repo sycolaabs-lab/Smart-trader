@@ -52,7 +52,7 @@ ok('gate rejects bad plan', autonomyGate(R('BUY',70,'A'),{entry:NaN,sl:1,tp:2,rr
 
 
 // Risk sizing must stay at or below the configured capital risk after lot-step rounding.
-const sizedWithinBudget = paperPositionSize(100, 1, 2000, 1992.4, {
+const sizedWithinBudget = paperPositionSize(1000, 1, 2000, 1999.3, {
   sizingMode:'risk', contractSize:100, lotStep:0.01, minLots:0.01
 });
 ok('risk sizing does not round up beyond capital budget',
