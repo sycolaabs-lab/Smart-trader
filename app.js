@@ -3289,6 +3289,10 @@ document.getElementById('paperContent').addEventListener('click', async event =>
       saveSignalLog();
     }
   } else if (button.dataset.paperAction === 'close') {
+    if (position.status === 'open' && !Number.isFinite(price)) {
+      window.alert('Cannot close at market without a verified live price. Reconnect the market-data provider first.');
+      return;
+    }
     if (!window.confirm(position.status === 'pending' ? 'Cancel this unfilled paper order?' : 'Close this paper trade at the current market price?')) return;
     const sig = signalLog.find(x => x.id === position.signalId);
     if (sig && (sig.status === 'pending' || sig.status === 'open')) {
