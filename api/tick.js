@@ -501,7 +501,7 @@ export async function runTick({ db, tdKey, fredKey, avKey, now }) {
         sig.status = 'open';
         // The browser books the paper fill off this timestamp, so it has to be
         // recorded here rather than invented on arrival.
-        sig.filledAt = new Date().toISOString();
+        sig.filledAt = verdict.filledAt || sig.filledAt || null;
       }
     });
 
