@@ -3723,8 +3723,8 @@ function resolveOpenSignals(candles, cfg) {
       changed = true; // expired signals never become training data — no outcome to learn from
     } else if (verdict.status === 'open' && sig.status === 'pending') {
       sig.status = 'open'; // limit entry got tagged; it's a live position now
-      sig.filledAt = new Date().toISOString();
-      paperFillForSignal(sig.id, sig.filledAt);
+      sig.filledAt = verdict.filledAt || sig.filledAt || null;
+      if (sig.filledAt) paperFillForSignal(sig.id, sig.filledAt);
       changed = true;
     }
   });
