@@ -747,7 +747,7 @@ export async function runTick({ db, tdKey, fredKey, avKey, now }) {
     // The public snapshot the dashboard subscribes to. Field names here are the
     // contract with the Background System panel in index.html — changing one
     // means changing both.
-    const inspectCandles = (name, candles, intervalMs, maxAgeMs) => {
+    const inspectCandles = (candles, intervalMs, maxAgeMs) => {
       const source = Array.isArray(candles) ? candles : [];
       const valid = source.filter(c => c && Number.isFinite(c.time) &&
         Number.isFinite(c.open) && Number.isFinite(c.high) && Number.isFinite(c.low) && Number.isFinite(c.close) &&
@@ -772,24 +772,6 @@ export async function runTick({ db, tdKey, fredKey, avKey, now }) {
         source: 'Twelve Data', stale: ageMinutes == null || ageMinutes * 60000 > maxAgeMs,
         invalidCandles: source.length - valid.length, gapCount: gaps, largeJumps,
         lastCandleAt: last ? new Date(last.time).toISOString() : null };
-    };
-    const inspectCandles = (candles, intervalMs, maxAgeMs) => {
-      const source = Array.isArray(candles) ? candles : [];
-      const valid = source.filter(c => c && Number.isFinite(c.time) &&
-        Number.isFinite(c.open) && Number.isFinite(c.high) && Number.isFinite(c.low) && Number.isFinite(c.close) &&
-        c.high >= Math.max(c.open, c.close, c.low) && c.low <= Math.min(c.open, c.close, c.high));
-      let gaps = 0, largeJumps = 0;
-      for (let i = 1; i < valid.length; i++) {
-        if (valid[i].time - valid[i - 1].time > intervalMs * 1.8) gaps++;
-        const previous = valid[i - 1].close;
-        if (previous > 0 && Math.abs(valid[i].close - previous) / previous > 0.025) largeJumps++;
-      }
-      const last = valid.length ? valid[valid.length - 1] : null;
-      const ageMinutes = last ? Math.max(0, Math.round((clockNow - last.time) / 60000)) : null;
-      return { candleAt: last ? last.time : null, ageMinutes, count: valid.length,
-        stale: ageMinutes == null || ageMinutes * 60000 > maxAgeMs,
-        invalidCandles: source.length - valid.length, gapCount: gaps, largeJumps,
-        source: 'Twelve Data' };
     };
     const tick = {
       time: Date.now(),
