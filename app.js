@@ -3786,7 +3786,30 @@ async function autonomyCycle() {
       gate = { take: false, code: 'audit',
         reason: 'independent audit found ' + audit.critical + ' critical issue(s): ' + audit.findings[0].title };
     } else {
-      gate = autonomyGate(lastComposite, plan, signalLog, autonomy.lastSignalAt, cfg);
+      // Avoid hedging: when a new opposite setup is materially stronger, retire
+      // the weaker conflicting signal and its paper position before evaluating
+      // the new setup. If the new setup is not clearly stronger, the engine gate
+      // keeps the existing position and rejects the conflict.
+      const activeOpposing = signalLog.filter(x =>
+        (x.status === 'pending' || x.status === 'open') &&
+        (x.dir === 'BUY' || x.dir === 'SELL') && x.dir !== lastComposite.direction);
+      const candidateScore = Number(lastComposite.confidence || 0) + Number(plan.metaScore || 0) * 10;
+      const scoreOf = x => Number(x.confidence || 0) + Number(x.metaScore || 0) * 10;
+      const canReplaceAll = activeOpposing.length > 0 && activeOpposing.every(x => candidateScore >= scoreOf(x) + 10);
+      if (canReplaceAll) {
+        activeOpposing.forEach(x => {
+          x.status = 'expired';
+          x.expiryReason = 'replaced by opposite setup with materially stronger confluence';
+          x.resolvedAt = new Date().toISOString();
+          x.resolvedBy = 'conflict-auditor';
+          paperCloseForSignal(x.id, 'expired', currentMarkPrice());
+        });
+        saveSignalLog();
+        renderSignalLog();
+        gate = autonomyGate(lastComposite, plan, signalLog, autonomy.lastSignalAt, cfg);
+      } else {
+        gate = autonomyGate(lastComposite, plan, signalLog, autonomy.lastSignalAt, cfg);
+      }
     }
     // Tally why each cycle ended as it did. One latest-reason line cannot show
     // whether 13 quiet cycles mean "no setup existed" or "the filter blocked
