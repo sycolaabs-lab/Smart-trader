@@ -1729,6 +1729,20 @@ function refreshAll() {
     if (warning) { warning.textContent = 'Connect a market-data API key to enable analysis, paper trading and backtesting. Synthetic prices are disabled.'; warning.classList.remove('hidden'); }
     return;
   }
+  const latest = liveData[liveData.length - 1];
+  const candleAge = Number.isFinite(Number(latest.time)) ? Date.now() - Number(latest.time) : Infinity;
+  const candleValid = [latest.open, latest.high, latest.low, latest.close].every(v => Number.isFinite(Number(v)) && Number(v) > 0)
+    && Number(latest.high) >= Math.max(Number(latest.open), Number(latest.close), Number(latest.low))
+    && Number(latest.low) <= Math.min(Number(latest.open), Number(latest.close), Number(latest.high))
+    && candleAge >= -60000 && candleAge <= 45 * 60000;
+  if (!candleValid) {
+    const label = document.getElementById('modeLabel');
+    if (label) label.textContent = 'Feed invalid or stale — analysis paused';
+    const warning = document.getElementById('staleFeedWarning');
+    if (warning) { warning.textContent = 'DATA ANALYZER BLOCK: latest 15m candle is malformed, future-dated, or older than 45 minutes. No new analysis or paper entry will be generated until valid fresh data arrives.'; warning.classList.remove('hidden'); }
+    renderTimeframeHealth();
+    return;
+  }
   const weights = getWeights();
   lastComposite = computeComposite(liveData, liveData.length - 1, weights, mtfData, htfData, correlationScore, fundamentalScore, newsSentimentScore, dailyData, weeklyData);
   if (!lastComposite) return;
@@ -3345,6 +3359,14 @@ if (tuneAutoToggle) tuneAutoToggle.addEventListener('change', () => {
   localStorage.setItem('smc-auto-tune-filter', tuneAutoToggle.checked ? '1' : '0');
 });
 
+function maybeAutoTuneFilter() {
+  const toggle = document.getElementById('autoTuneFilterEnabled');
+  if (!toggle || !toggle.checked) return;
+  const key = 'smc-auto-tune-last-at';
+  const last = Number(localStorage.getItem(key)) || 0;
+  if (Date.now() - last < 60 * 60 * 1000) return;
+  if (tuneFilterFromEvidence()) localStorage.setItem(key, String(Date.now()));
+}
 function renderAnalysisQuality() {
   const root = document.getElementById('qualityContent');
   if (!root) return;
@@ -3712,7 +3734,7 @@ function resolveShadowSignals(candles, cfg) {
       sig.status = 'open'; changed = true;
     }
   });
-  if (changed) { saveShadowLog(); renderAnalysisQuality(); }
+  if (changed) { saveShadowLog(); renderAnalysisQuality(); maybeAutoTuneFilter(); }
 }
 
 // One unattended pass. Everything that can fail is inside the caller's try.
