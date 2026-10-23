@@ -811,7 +811,7 @@ if (fbReady) {
       const healthRows = Object.keys(d.dataHealth || {}).map(k => {
         const h = d.dataHealth[k] || {};
         const age = Number.isFinite(Number(h.ageMinutes)) ? Math.max(0, Number(h.ageMinutes)) + 'm old' : 'age unknown';
-        const stale = Number.isFinite(Number(h.ageMinutes)) && Number(h.ageMinutes) > (k === '15m' ? 45 : k === '1H' ? 180 : k === '4H' ? 600 : k === 'Daily' ? 4320 : 17280);
+        const stale = Number.isFinite(Number(h.ageMinutes)) && Number(h.ageMinutes) > (k === '5m' ? 20 : k === '15m' ? 45 : k === '30m' ? 90 : k === '1H' ? 180 : k === '4H' ? 600 : k === '8H' ? 1200 : k === 'Daily' ? 4320 : 17280);
         return '<div class="zone-item"><span>' + k + ' <span style="color:#454a56;">' + age + ' · ' + (h.count || 0) + ' bars</span></span><span class="mono" style="color:' + (stale ? '#ef4d5f' : '#3ecf8e') + ';">' + (stale ? 'STALE' : 'received') + '</span></div>';
       }).join('');
       detailEl.innerHTML = '<div class="zone-item"><span>' + d.direction + ' <span style="color:#454a56;">(' + d.confidence + '%, full engine — structure + macro + meta-labeler)</span></span><span class="mono ' + dirCls + '">$' + fmt(d.price) + '</span></div>'
@@ -3366,9 +3366,12 @@ function tuneFilterFromEvidence() {
 const tuneButton = document.getElementById('tuneFilterNow');
 if (tuneButton) tuneButton.addEventListener('click', tuneFilterFromEvidence);
 const tuneAutoToggle = document.getElementById('autoTuneFilterEnabled');
-if (tuneAutoToggle) tuneAutoToggle.addEventListener('change', () => {
-  localStorage.setItem('smc-auto-tune-filter', tuneAutoToggle.checked ? '1' : '0');
-});
+if (tuneAutoToggle) {
+  tuneAutoToggle.checked = localStorage.getItem('smc-auto-tune-filter') !== '0';
+  tuneAutoToggle.addEventListener('change', () => {
+    localStorage.setItem('smc-auto-tune-filter', tuneAutoToggle.checked ? '1' : '0');
+  });
+}
 
 function maybeAutoTuneFilter() {
   const toggle = document.getElementById('autoTuneFilterEnabled');
