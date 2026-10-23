@@ -2141,7 +2141,8 @@ async function runBacktestCycle(isAuto) {
     // Pass 1: run with base weights to gather in-sample (train) trades for tuning
     const passA = runSmcBacktest(histData, params, baseWeights, targetRR, costPips);
     const splitIdx = Math.floor(histData.length * 0.7);
-    const trainTrades = passA.trades.filter(t => t.entryIndex < splitIdx);
+    // A trade belongs to training only if it also resolves before the split.
+    const trainTrades = passA.trades.filter(t => t.entryIndex < splitIdx && Number.isInteger(t.exitIndex) && t.exitIndex < splitIdx);
     const { tuned } = computeTunedWeights(trainTrades, baseWeights);
 
     // Pass 2: re-run full data with tuned weights; only trades opened after the split are genuinely out-of-sample
@@ -2156,9 +2157,15 @@ async function runBacktestCycle(isAuto) {
     // Backtest examples are regenerable — the same window can be replayed any
     // time — so a rolling store is enough, and crucially they live apart from
     // the live outcomes and can never evict one.
-    const newExamples = testTrades.filter(t => t.qualityFeatures).map(t => ({ features: t.qualityFeatures, label: t.result === 'win' ? 1 : -1 }));
-    learningState.metaBacktestExamples = (learningState.metaBacktestExamples || [])
-      .concat(newExamples).slice(-META_LIMITS.backtestStore);
+    const windowStart = histData[0] && histData[0].time != null ? histData[0].time : 'start';
+    const windowEnd = histData[histData.length - 1] && histData[histData.length - 1].time != null ? histData[histData.length - 1].time : 'end';
+    const existingExamples = learningState.metaBacktestExamples || [];
+    const existingExampleIds = new Set(existingExamples.map(e => e.id).filter(Boolean));
+    const newExamples = testTrades.filter(t => t.qualityFeatures).map(t => ({
+      id: 'wf:' + windowStart + ':' + windowEnd + ':' + t.entryIndex + ':' + t.dir,
+      features: t.qualityFeatures, label: t.result === 'win' ? 1 : -1
+    })).filter(e => !existingExampleIds.has(e.id));
+    learningState.metaBacktestExamples = existingExamples.concat(newExamples).slice(-META_LIMITS.backtestStore);
     retrainMetaLabeler();
     saveLearningState();
 
