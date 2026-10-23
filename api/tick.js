@@ -747,7 +747,7 @@ export async function runTick({ db, tdKey, fredKey, avKey, now }) {
     // The public snapshot the dashboard subscribes to. Field names here are the
     // contract with the Background System panel in index.html — changing one
     // means changing both.
-    const inspectCandles = (candles, intervalMs, maxAgeMs) => {
+    const inspectCandlesForTick = (candles, intervalMs, maxAgeMs) => {
       const source = Array.isArray(candles) ? candles : [];
       const valid = source.filter(c => c && Number.isFinite(c.time) &&
         Number.isFinite(c.open) && Number.isFinite(c.high) && Number.isFinite(c.low) && Number.isFinite(c.close) &&
@@ -784,14 +784,14 @@ export async function runTick({ db, tdKey, fredKey, avKey, now }) {
       factors: Object.assign({}, result.factors),
       totalWeight: result.totalWeight,
       dataHealth: {
-        '5m': inspectCandles(fiveR.value, 5 * 60000, 12 * 60000),
-        '15m': inspectCandles(ltf, 15 * 60000, 35 * 60000),
-        '30m': inspectCandles(thirtyR.value, 30 * 60000, 70 * 60000),
-        '1H': inspectCandles(mtfR.value, 60 * 60000, 130 * 60000),
-        '4H': inspectCandles(htfR.value, 4 * 60 * 60000, 9 * 60 * 60000),
-        '8H': inspectCandles(eightHour, 8 * 60 * 60000, 17 * 60 * 60000),
-        'Daily': inspectCandles(dayR.value, 24 * 60 * 60000, 48 * 60 * 60000),
-        'Weekly': inspectCandles(wkR.value, 7 * 24 * 60 * 60000, 15 * 24 * 60 * 60000)
+        '5m': inspectCandlesForTick(fiveR.value, 5 * 60000, 12 * 60000),
+        '15m': inspectCandlesForTick(ltf, 15 * 60000, 35 * 60000),
+        '30m': inspectCandlesForTick(thirtyR.value, 30 * 60000, 70 * 60000),
+        '1H': inspectCandlesForTick(mtfR.value, 60 * 60000, 130 * 60000),
+        '4H': inspectCandlesForTick(htfR.value, 4 * 60 * 60000, 9 * 60 * 60000),
+        '8H': inspectCandlesForTick(eightHour, 8 * 60 * 60000, 17 * 60 * 60000),
+        'Daily': inspectCandlesForTick(dayR.value, 24 * 60 * 60000, 48 * 60 * 60000),
+        'Weekly': inspectCandlesForTick(wkR.value, 7 * 24 * 60 * 60000, 15 * 24 * 60 * 60000)
       },
       backtest: state.lastBacktestSummary || null,
       entry: plan.entry, sl: plan.sl, tp: plan.tp,
