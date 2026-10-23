@@ -669,6 +669,8 @@ export async function runTick({ db, tdKey, fredKey, avKey, now }) {
       // Publish the actual per-factor weights and source freshness so the UI can
       // explain the background decision instead of showing only its final price.
       weights: Object.assign({}, state.weights),
+      factors: Object.assign({}, result.factors),
+      totalWeight: result.totalWeight,
       dataHealth: {
         '15m': { candleAt: ltf.length ? ltf[ltf.length - 1].time : null, ageMinutes: ltf.length ? Math.round((clockNow - ltf[ltf.length - 1].time) / 60000) : null, count: ltf.length },
         '1H': { candleAt: mtfR.value.length ? mtfR.value[mtfR.value.length - 1].time : null, ageMinutes: mtfR.value.length ? Math.round((clockNow - mtfR.value[mtfR.value.length - 1].time) / 60000) : null, count: mtfR.value.length },
