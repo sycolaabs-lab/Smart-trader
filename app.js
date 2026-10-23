@@ -2188,7 +2188,7 @@ async function runBacktestCycle(isAuto) {
 
     const wins = result.trades.filter(t => t.result === 'win'), losses = result.trades.filter(t => t.result === 'loss');
     const winRate = result.trades.length ? (wins.length / result.trades.length * 100) : 0;
-    const totalReturn = ((result.finalEquity - params.capital) / params.capital) * 100;
+    const totalReturn = (((result.markedEquity ?? result.finalEquity) - params.capital) / params.capital) * 100;
     const grossWin = wins.reduce((s, t) => s + t.pnl, 0), grossLoss = Math.abs(losses.reduce((s, t) => s + t.pnl, 0));
     const pf = grossLoss > 0 ? (grossWin / grossLoss) : (grossWin > 0 ? Infinity : 0);
 
@@ -2199,7 +2199,7 @@ async function runBacktestCycle(isAuto) {
     retEl.className = 'v mono ' + (totalReturn >= 0 ? 'pos' : 'neg');
     document.getElementById('btDD').innerText = '-' + result.maxDD.toFixed(1) + '%';
     document.getElementById('btPF').innerText = isFinite(pf) ? pf.toFixed(2) : '∞';
-    document.getElementById('btFinal').innerText = '$' + result.finalEquity.toFixed(0);
+    document.getElementById('btFinal').innerText = '$' + (result.markedEquity ?? result.finalEquity).toFixed(0);
 
     const tbody = document.getElementById('btTradeBody'); tbody.innerHTML = '';
     result.trades.slice().reverse().forEach((t, idx) => {
