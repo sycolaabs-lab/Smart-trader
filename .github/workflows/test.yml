@@ -22,3 +22,9 @@ jobs:
         run: npm install
       - name: Run unit tests
         run: npm test
+      - name: Diagnose failing suites
+        if: failure()
+        shell: bash
+        run: |
+          node test/engine.test.mjs || true
+          node test/tick.test.mjs || true
