@@ -726,8 +726,11 @@ export async function runTick({ db, tdKey, fredKey, avKey, now }) {
       factors: Object.assign({}, result.factors),
       totalWeight: result.totalWeight,
       dataHealth: {
+        '5m': { candleAt: fiveR.value.length ? fiveR.value[fiveR.value.length - 1].time : null, ageMinutes: fiveR.value.length ? Math.round((clockNow - fiveR.value[fiveR.value.length - 1].time) / 60000) : null, count: fiveR.value.length },
         '15m': { candleAt: ltf.length ? ltf[ltf.length - 1].time : null, ageMinutes: ltf.length ? Math.round((clockNow - ltf[ltf.length - 1].time) / 60000) : null, count: ltf.length },
+        '30m': { candleAt: thirtyR.value.length ? thirtyR.value[thirtyR.value.length - 1].time : null, ageMinutes: thirtyR.value.length ? Math.round((clockNow - thirtyR.value[thirtyR.value.length - 1].time) / 60000) : null, count: thirtyR.value.length },
         '1H': { candleAt: mtfR.value.length ? mtfR.value[mtfR.value.length - 1].time : null, ageMinutes: mtfR.value.length ? Math.round((clockNow - mtfR.value[mtfR.value.length - 1].time) / 60000) : null, count: mtfR.value.length },
+        '8H': { candleAt: eightHour.length ? eightHour[eightHour.length - 1].time : null, ageMinutes: eightHour.length ? Math.round((clockNow - eightHour[eightHour.length - 1].time) / 60000) : null, count: eightHour.length, derived: true },
         '4H': { candleAt: htfR.value.length ? htfR.value[htfR.value.length - 1].time : null, ageMinutes: htfR.value.length ? Math.round((clockNow - htfR.value[htfR.value.length - 1].time) / 60000) : null, count: htfR.value.length },
         'Daily': { candleAt: dayR.value.length ? dayR.value[dayR.value.length - 1].time : null, ageMinutes: dayR.value.length ? Math.round((clockNow - dayR.value[dayR.value.length - 1].time) / 60000) : null, count: dayR.value.length },
         'Weekly': { candleAt: wkR.value.length ? wkR.value[wkR.value.length - 1].time : null, ageMinutes: wkR.value.length ? Math.round((clockNow - wkR.value[wkR.value.length - 1].time) / 60000) : null, count: wkR.value.length }
