@@ -3185,18 +3185,27 @@ function renderPaper() {
   if (!root) return;
   const cfg = paperConfig();
   const price = currentMarkPrice();
-  const a = paperAccountSummary(paper.positions, cfg.startingBalance, price, paper.epoch);
+  const hasLiveMark = Number.isFinite(price);
+  const a = Object.assign({}, paperAccountSummary(paper.positions, cfg.startingBalance, hasLiveMark ? price : 0, paper.epoch));
+  if (!hasLiveMark) {
+    // Never display synthetic/NaN floating P&L while disconnected. Show realised
+    // balance only until a verified quote returns.
+    a.floating = 0;
+    a.equity = a.balance;
+    a.returnPct = a.startingBalance > 0 ? (a.balance - a.startingBalance) / a.startingBalance * 100 : 0;
+  }
 
   const pnlCls = v => v > 0 ? 'fpos' : v < 0 ? 'fneg' : 'fneu';
   let html = '<div class="metrics" style="margin-bottom:10px;">'
-    + '<div class="card"><div class="label">Equity</div><div class="value mono ' + pnlCls(a.equity - a.startingBalance) + '">' + money(a.equity) + '</div></div>'
+    + '<div class="card"><div class="label">' + (hasLiveMark ? 'Equity' : 'Equity · realised only') + '</div><div class="value mono ' + pnlCls(a.equity - a.startingBalance) + '">' + money(a.equity) + '</div></div>'
     + '<div class="card"><div class="label">Return</div><div class="value mono ' + pnlCls(a.returnPct) + '">' + (a.returnPct >= 0 ? '+' : '') + a.returnPct.toFixed(2) + '%</div></div>'
     + '<div class="card"><div class="label">Max DD</div><div class="value mono">' + (a.maxDrawdown * 100).toFixed(1) + '%</div></div>'
     + '<div class="card"><div class="label">Open</div><div class="value mono">' + a.openCount + (a.pendingCount ? ' <span style="font-size:10px;color:#5c6270;">+' + a.pendingCount + ' resting</span>' : '') + '</div></div>'
     + '</div>';
 
   html += '<div class="zone-item"><span>Balance (realised)</span><span class="mono ' + pnlCls(a.realised) + '">' + money(a.balance) + ' <span style="color:#454a56;">(' + (a.realised >= 0 ? '+' : '') + money(a.realised).replace('$','$') + ')</span></span></div>';
-  if (a.openCount) html += '<div class="zone-item"><span>Floating P&amp;L</span><span class="mono ' + pnlCls(a.floating) + '">' + money(a.floating) + '</span></div>';
+  if (a.openCount && hasLiveMark) html += '<div class="zone-item"><span>Floating P&amp;L</span><span class="mono ' + pnlCls(a.floating) + '">' + money(a.floating) + '</span></div>';
+  if (a.openCount && !hasLiveMark) html += '<div class="data-source-note">Live quote unavailable — floating P&amp;L is hidden until the provider reconnects.</div>';
   html += '<div class="zone-item"><span>Closed trades</span><span class="mono">' + a.closedCount + (a.winRate != null ? ' · ' + (a.winRate * 100).toFixed(0) + '% won' : '') + '</span></div>';
   if (a.profitFactor != null) html += '<div class="zone-item"><span>Profit factor</span><span class="mono ' + pnlCls(a.profitFactor - 1) + '">' + (a.profitFactor === Infinity ? '∞' : a.profitFactor.toFixed(2)) + '</span></div>';
   if (a.avgR != null) html += '<div class="zone-item"><span>Average R per trade</span><span class="mono ' + pnlCls(a.avgR) + '">' + (a.avgR >= 0 ? '+' : '') + a.avgR.toFixed(2) + 'R</span></div>';
@@ -3241,7 +3250,7 @@ function renderPaper() {
         + '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:5px;">'
         + '<button class="btn" data-paper-action="edit-sl" data-paper-id="' + p.id + '" style="padding:3px 7px;font-size:10px;">Edit SL</button>'
         + '<button class="btn" data-paper-action="close" data-paper-id="' + p.id + '" style="padding:3px 7px;font-size:10px;border-color:#ef4d5f;color:#ef4d5f;">Close at market</button>'
-        + '</div></span><span class="mono ' + pnlCls(u) + '">' + money(u) + '</span></div>';
+        + '</div></span>' + (hasLiveMark ? '<span class="mono ' + pnlCls(u) + '">' + money(u) + '</span>' : '<span class="mono" style="color:#ffa726;">mark unavailable</span>') + '</div>';
     }).join('');
   }
 
