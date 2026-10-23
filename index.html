@@ -769,7 +769,7 @@ canvas { width:100%; background:#12151c; border-radius:12px; border:1px solid #1
       Auto-backtest while connected (self-learning)
     </label>
     <div class="data-source-note" id="autoBacktestStatus" style="margin-bottom:0;">Runs hourly in this browser while open; server-side runs require a configured scheduler.</div>
-    <div style="font-size:10px;color:#454a56;margin-top:8px;line-height:1.4;">Runs the walk-forward backtest hourly using real provider history and feeds out-of-sample results into learning. Browser runs stop when this tab closes; unattended backtests still require a server-side backtest job, not just the autonomous signal scheduler. The system prioritizes honest risk-reward and validation over a high win rate.</div>
+    <div style="font-size:10px;color:#454a56;margin-top:8px;line-height:1.4;">Runs the walk-forward backtest hourly using real provider history and feeds out-of-sample results into learning. Browser runs stop when this tab closes; the server worker also runs walk-forward backtests hourly whenever the external scheduler invokes /api/tick. For restricted Vercel plans, keep the external scheduler active. The system prioritizes honest risk-reward and validation over a high win rate.</div>
   </div>
 
   <div id="btResults" class="hidden">
