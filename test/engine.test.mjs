@@ -176,7 +176,7 @@ ok('summary calm when low', /Within budget/.test(quotaSummary({day:'d',used:50},
 
 
 // ---------------- paper trading ----------------
-import { roundToLotStep, PAPER_DEFAULTS, worsePrice, paperPositionSize, openPaperPosition,
+import { roundToLotStep, PAPER_DEFAULTS, worsePrice, openPaperPosition,
          closePaperPosition, unrealisedPnl, paperAccountSummary } from '../lib/engine.js';
 console.log('\n-- paper trading --');
 const PCFG = { startingBalance:10000, riskPercent:1, spreadPips:3, slippagePips:1, maxConcurrent:3 };
