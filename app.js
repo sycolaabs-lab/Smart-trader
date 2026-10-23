@@ -3294,7 +3294,47 @@ function renderAnalysisQuality() {
   html += '<div class="event-line" style="border-left-color:#c99bff;margin-top:6px;">' + audit.verdict + '</div>';
 
   root.innerHTML = html;
+  autoTuneFilterFromEvidence(audit, false);
 }
+
+const FILTER_TUNE_KEY = 'smc-filter-autotune-v1';
+function autoTuneFilterFromEvidence(audit, force) {
+  const status = document.getElementById('filterTuneStatus');
+  const enabled = document.getElementById('autoTuneFilterEnabled');
+  if (!force && (!enabled || !enabled.checked)) return;
+  if (!audit || audit.taken.n < 10 || audit.declined.n < 10 ||
+      !Number.isFinite(audit.taken.expectancyR) || !Number.isFinite(audit.declined.expectancyR)) {
+    if (status) status.textContent = 'Filter tuning is waiting for at least 10 resolved taken setups and 10 resolved declined setups.';
+    return;
+  }
+  let lastAt = 0;
+  try { lastAt = Number(localStorage.getItem(FILTER_TUNE_KEY)) || 0; } catch (e) {}
+  if (!force && Date.now() - lastAt < 24 * 60 * 60 * 1000) {
+    if (status) status.textContent = 'Evidence ready. Automatic filter adjustment is limited to once per 24 hours to reduce overfitting.';
+    return;
+  }
+  const edge = audit.edgeFromFiltering;
+  const input = document.getElementById('aMinConf');
+  if (!input || !Number.isFinite(edge) || Math.abs(edge) < 0.15) {
+    if (status) status.textContent = 'No filter change: taken and declined expectancy are too close (difference below 0.15R).';
+    return;
+  }
+  const before = Number(input.value) || AUTONOMY_DEFAULTS.minConfidence;
+  // A small bounded step only; never jump the filter based on one noisy sample.
+  const after = Math.max(0, Math.min(100, before + (edge > 0 ? 2 : -2)));
+  input.value = String(after);
+  saveAutonomyState();
+  try { localStorage.setItem(FILTER_TUNE_KEY, String(Date.now())); } catch (e) {}
+  if (status) status.textContent = 'Filter adjusted from resolved evidence: taken expectancy ' + audit.taken.expectancyR.toFixed(2)
+    + 'R vs declined ' + audit.declined.expectancyR.toFixed(2) + 'R. Minimum confidence ' + before + '% → ' + after
+    + '% (' + (edge > 0 ? 'tightened' : 'loosened') + '). This is a small experiment, not proof of an edge.';
+}
+document.getElementById('tuneFilterNow').addEventListener('click', () => {
+  autoTuneFilterFromEvidence(computeGateAudit(signalLog, shadowLog), true);
+});
+document.getElementById('autoTuneFilterEnabled').addEventListener('change', () => {
+  if (document.getElementById('autoTuneFilterEnabled').checked) autoTuneFilterFromEvidence(computeGateAudit(signalLog, shadowLog), false);
+});
 document.getElementById('resetQuality').addEventListener('click', async () => {
   shadowLog = [];
   await saveShadowLog();
