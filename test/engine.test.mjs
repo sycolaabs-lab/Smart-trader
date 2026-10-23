@@ -1159,18 +1159,16 @@ ok('naming the stop and the balance as the cause',
 ok('a lower minimum and finer step let it through',
   paperPositionSize(1000, 1, 4400, 4380, { minLots: 0.001, lotStep: 0.001 }).lots, 0.005);
 
-// fixed sizing: the lot count is constant and the risk moves instead
+// Fixed-lot mode is a preference, but the account risk budget is a hard cap.
 const fixedCfg = { sizingMode: 'fixed', fixedLots: 0.25 };
-ok('fixed sizing places the stated lots', paperPositionSize(10000, 1, 2000, 1990, fixedCfg).lots, 0.25);
-ok('regardless of the stop', paperPositionSize(10000, 1, 2000, 1950, fixedCfg).lots, 0.25);
-ok('and regardless of the balance', paperPositionSize(500, 1, 2000, 1990, fixedCfg).lots, 0.25);
-// A five-times-wider stop on the same lot size risks five times as much — which
-// is precisely the trade-off fixed sizing makes.
-ok('so a five-times-wider stop risks five times as much',
-   paperPositionSize(10000, 1, 2000, 1950, fixedCfg).riskAmount,
-   paperPositionSize(10000, 1, 2000, 1990, fixedCfg).riskAmount * 5);
-ok('fixed lots are still rounded to the step',
-  paperPositionSize(10000, 1, 2000, 1990, { sizingMode: 'fixed', fixedLots: 0.257 }).lots, 0.25);
+ok('fixed sizing is capped by the 1% capital budget', paperPositionSize(10000, 1, 2000, 1990, fixedCfg).lots, 0.1);
+ok('a wider structural stop reduces fixed-lot size', paperPositionSize(10000, 1, 2000, 1950, fixedCfg).lots, 0.02);
+ok('too little capital refuses an unplaceable risk-capped size',
+  paperPositionSize(500, 1, 2000, 1990, fixedCfg), null);
+ok('fixed sizing never exceeds requested risk',
+  paperPositionSize(10000, 1, 2000, 1950, fixedCfg).riskAmount <= paperPositionSize(10000, 1, 2000, 1950, fixedCfg).requestedRisk, true);
+ok('fixed lots are capped before lot-step rounding',
+  paperPositionSize(10000, 1, 2000, 1990, { sizingMode: 'fixed', fixedLots: 0.257 }).lots, 0.1);
 ok('and still refused below the minimum',
   paperPositionSize(10000, 1, 2000, 1990, { sizingMode: 'fixed', fixedLots: 0.004 }), null);
 
