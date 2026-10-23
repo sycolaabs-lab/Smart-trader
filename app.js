@@ -1154,7 +1154,7 @@ async function fetchHigherTimeframes(provider, key) {
       const d = await provider.timeSeries(key, interval, bars);
       if (!Array.isArray(d) || !d.length) throw new Error('provider returned no candles');
       assign(d);
-      timeframeHealth[label] = { ok: true, at: Date.now() };
+      timeframeHealth[label] = { ok: true, at: Date.now(), candleTime: d[d.length - 1].time, count: d.length, source: 'provider' };
     } catch (e) {
       assign([]);
       timeframeHealth[label] = {
@@ -1397,6 +1397,7 @@ async function connectProvider() {
     apiKey = key; activeProvider = providerId;
     liveData = candles;
     lastPriceUpdateTime = Date.now();
+    timeframeHealth['15m'] = { ok: true, at: lastPriceUpdateTime, candleTime: candles[candles.length - 1].time, count: candles.length, source: 'provider' };
     prevClose = liveData.length > 1 ? liveData[liveData.length - 2].close : liveData[liveData.length - 1].close;
     dataMode = 'live';
     if (simTickHandle) clearInterval(simTickHandle);
@@ -1513,18 +1514,26 @@ async function resyncTimeframe(label, interval, bars, assign) {
 function renderTimeframeHealth() {
   const el = document.getElementById('timeframeHealth');
   if (!el) return;
-  const bad = Object.keys(timeframeHealth).filter(k => !timeframeHealth[k].ok);
-  if (!bad.length) { el.textContent = ''; el.classList.add('hidden'); return; }
+  const rows = ['5m','15m','30m','1H','4H','8H','Daily','Weekly'].map(label => {
+    let info = timeframeHealth[label] || null;
+    if (label === '15m' && liveData.length) info = {
+      ok: true, candleTime: liveData[liveData.length - 1].time,
+      at: lastPriceUpdateTime || Date.now(), count: liveData.length, source: 'provider'
+    };
+    if (!info) return '<div class="zone-item"><span>' + label + '</span><span class="mono" style="color:#ef4d5f;">not loaded</span></div>';
+    const candleTime = Number(info.candleTime);
+    const ageMs = Number.isFinite(candleTime) ? Date.now() - candleTime : (Number(info.at) ? Date.now() - Number(info.at) : null);
+    const ageText = ageMs == null ? 'age unknown' : ageMs < -60000 ? 'future timestamp — invalid' : Math.max(0, Math.round(ageMs / 60000)) + 'm old';
+    const stale = ageMs != null && (ageMs < -60000 || ageMs > (label === '5m' ? 20 : label === '15m' ? 45 : label === '30m' ? 90 : label === '1H' ? 180 : label === '4H' ? 600 : label === '8H' ? 1200 : 2880) * 60000);
+    const ok = !!info.ok && !stale;
+    const source = info.derived ? 'derived' : info.source || 'provider';
+    const detail = info.reason ? escapeAttr(info.reason) : source + (info.count ? ' · ' + info.count + ' bars' : '');
+    return '<div class="zone-item"><span>' + label + ' <span style="color:#454a56;">' + ageText + '</span></span>'
+      + '<span class="mono" style="color:' + (ok ? '#3ecf8e' : '#ef4d5f') + ';">' + (ok ? 'OK' : stale ? 'STALE' : 'UNAVAILABLE')
+      + ' <span style="color:#5c6270;">' + detail + '</span></span></div>';
+  }).join('');
   el.classList.remove('hidden');
-  const aggregated = bad.filter(k => timeframeHealth[k].aggregated);
-  el.innerHTML = '⚠️ <strong>Higher-timeframe data is not loading.</strong> '
-    + bad.map(k => k + ' — ' + escapeAttr(timeframeHealth[k].reason)
-        + (timeframeHealth[k].failures > 1 ? ' (' + timeframeHealth[k].failures + ' attempts)' : '')).join('; ')
-    + '. '
-    + (aggregated.length
-        ? escapeAttr(aggregated.join(' and ')) + ' structure is being AGGREGATED from 15-minute candles rather than read from real bars, '
-          + 'and still carries its full weight in the score.'
-        : 'Structure on those timeframes is frozen and still carries its full weight in the score.');
+  el.innerHTML = '<strong>Data freshness analyzer</strong><div style="font-size:10px;color:#5c6270;margin:4px 0 6px;">Shows candle age, source and fallback state. A successful HTTP response is not proof that the data is current or correct.</div>' + rows;
 }
 
 let lastPriceUpdateTime = null;
@@ -1556,6 +1565,7 @@ async function resyncCandles() {
   try {
     liveData = await PROVIDERS[activeProvider].timeSeries(apiKey, LIVE_INTERVAL, 500);
     lastPriceUpdateTime = Date.now();
+    timeframeHealth['15m'] = { ok: true, at: lastPriceUpdateTime, candleTime: liveData[liveData.length - 1].time, count: liveData.length, source: 'provider' };
     refreshAll();
   } catch (e) { /* keep last good data */ }
 }
