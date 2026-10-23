@@ -808,6 +808,15 @@ if (fbReady) {
         return '<div class="zone-item"><span>' + (FACTOR_LABELS[k] || k) + ' <span style="color:#454a56;">value ' + value.toFixed(2) + ' × weight ' + weight + '</span></span>'
           + '<span class="mono">' + (contribution >= 0 ? '+' : '') + (contribution * 100).toFixed(1) + ' pp</span></div>';
       }).join('');
+      const backtest = d.backtest || d.lastBacktestSummary || null;
+      const backtestHtml = backtest
+        ? '<div class="panel-title" style="font-size:11px;margin-top:10px;">Hourly background backtest</div>'
+          + '<div class="zone-item"><span>Last run</span><span class="mono">' + (backtest.at || '—') + '</span></div>'
+          + (backtest.error ? '<div class="event-line" style="border-left-color:#ef4d5f;">Backtest error: ' + escapeAttr(backtest.error) + '</div>'
+            : '<div class="zone-item"><span>Training / test trades</span><span class="mono">' + (backtest.trainingTrades || 0) + ' / ' + (backtest.testTrades || 0) + '</span></div>'
+              + '<div class="zone-item"><span>Out-of-sample expectancy</span><span class="mono">' + (Number.isFinite(backtest.testExpectancyR) ? ((backtest.testExpectancyR >= 0 ? '+' : '') + backtest.testExpectancyR.toFixed(2) + 'R') : 'not enough resolved trades') + '</span></div>'
+              + '<div class="zone-item"><span>Weight update</span><span class="mono">' + (backtest.weightsUpdated ? 'applied from training sample' : 'waiting for 10 training trades') + '</span></div>')
+        : '<div class="zone-empty">No server-side backtest has completed yet.</div>';
       const healthRows = Object.keys(d.dataHealth || {}).map(k => {
         const h = d.dataHealth[k] || {};
         const age = Number.isFinite(Number(h.ageMinutes)) ? Math.max(0, Number(h.ageMinutes)) + 'm old' : 'age unknown';
@@ -821,6 +830,7 @@ if (fbReady) {
         + (d.direction !== 'HOLD' ? '<div class="zone-item"><span>Meta-labeler score</span><span class="mono">' + (d.metaTrained ? ((d.metaScore >= 0 ? '+' : '') + fmt(d.metaScore)) : 'not trained yet') + ' <span style="color:#454a56;font-size:9px;">(' + d.metaExampleCount + ' examples)</span></span></div>' : '')
         + '<div class="zone-item"><span>Macro reads</span><span style="font-size:10px;">' + macroTag('Corr', m.correlationAvailable, m.correlationScore || 0) + ' · ' + macroTag('Fund', m.fundamentalAvailable, m.fundamentalScore || 0) + ' · ' + macroTag('News', m.newsAvailable, m.newsScore || 0) + '</span></div>'
         + '<div class="zone-item"><span>Session / Regime</span><span class="mono" style="font-size:10px;">' + (d.session || '—') + ' · ' + (d.regime || '—') + '</span></div>'
+        + backtestHtml
         + '<div class="panel-title" style="font-size:11px;margin-top:10px;">Background data freshness</div>' + (healthRows || '<div class="zone-empty">No candle health data published yet.</div>')
         + '<div class="panel-title" style="font-size:11px;margin-top:10px;">Factor weight in final score</div>' + (factorRows || '<div class="zone-empty">No factor breakdown published yet.</div>')
         + (d.lastBacktestSummary ? '<div class="panel-title" style="font-size:11px;margin-top:10px;">Hourly background walk-forward backtest</div><div class="zone-item"><span>Last run</span><span class="mono">' + (d.lastBacktestSummary.at || '—') + '</span></div>' + (d.lastBacktestSummary.error ? '<div class="event-line" style="border-left-color:#ef4d5f;">Backtest error: ' + d.lastBacktestSummary.error + '</div>' : '<div class="zone-item"><span>Training / OOS trades</span><span class="mono">' + (d.lastBacktestSummary.trainingTrades || 0) + ' / ' + (d.lastBacktestSummary.testTrades || 0) + '</span></div><div class="zone-item"><span>OOS expectancy</span><span class="mono">' + (d.lastBacktestSummary.testExpectancyR == null ? '—' : (d.lastBacktestSummary.testExpectancyR >= 0 ? '+' : '') + Number(d.lastBacktestSummary.testExpectancyR).toFixed(2) + 'R') + '</span></div><div class="zone-item"><span>Weights updated</span><span class="mono">' + (d.lastBacktestSummary.weightsUpdated ? 'yes' : 'no — insufficient training sample') + '</span></div>') : '<div class="zone-empty">Hourly server-side backtest has not completed yet.</div>')
