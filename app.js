@@ -910,7 +910,7 @@ let apiKey = null, dataMode = 'disconnected', activeProvider = null;
 let liveData = [];
 let fiveMinData = [], mtfData = [], thirtyMinData = [], htfData = [], eightHourData = [], dailyData = [], weeklyData = []; // real provider bars where supported; 8H is aggregated from 1H
 let prevClose = NaN;
-let simTickHandle = null, pollPriceHandle = null, resyncHandle = null, mtfResyncHandle = null, htfResyncHandle = null, corrResyncHandle = null, newsResyncHandle = null, dailyResyncHandle = null, weeklyResyncHandle = null;
+let simTickHandle = null, pollPriceHandle = null, resyncHandle = null, fiveMinResyncHandle = null, thirtyMinResyncHandle = null, mtfResyncHandle = null, htfResyncHandle = null, corrResyncHandle = null, newsResyncHandle = null, dailyResyncHandle = null, weeklyResyncHandle = null;
 // Mutable state that functions defined further up this file reach into.
 // Declared here, above the first top-level refreshAll(), because `let` bindings
 // are in their temporal dead zone until evaluated — declaring them beside their
@@ -1173,7 +1173,7 @@ async function fetchHigherTimeframes(provider, key) {
   await one('30m', '30min', 200, d => { thirtyMinData = d; });
   eightHourData = aggregateCandles(mtfData, 8);
   timeframeHealth['8H'] = eightHourData.length
-    ? { ok: true, at: Date.now(), derived: true, source: 'aggregated from 1H candles' }
+    ? { ok: true, at: Date.now(), candleTime: eightHourData[eightHourData.length - 1].time, count: eightHourData.length, derived: true, source: 'aggregated from 1H candles' }
     : { ok: false, aggregated: true, reason: 'waiting for usable 1H candles', at: Date.now() };
   renderTimeframeHealth();
 }
@@ -1436,6 +1436,8 @@ connectBtn.addEventListener('click', () => { connectProvider(); });
 function startLivePolling() {
   if (pollPriceHandle) clearInterval(pollPriceHandle);
   if (resyncHandle) clearInterval(resyncHandle);
+  if (fiveMinResyncHandle) clearInterval(fiveMinResyncHandle);
+  if (thirtyMinResyncHandle) clearInterval(thirtyMinResyncHandle);
   if (mtfResyncHandle) clearInterval(mtfResyncHandle);
   if (htfResyncHandle) clearInterval(htfResyncHandle);
   if (dailyResyncHandle) clearInterval(dailyResyncHandle);
@@ -1447,7 +1449,10 @@ function startLivePolling() {
   resyncHandle = setInterval(() => { if (!autonomy.enabled) resyncCandles(); }, provider.resyncMinutes * 60 * 1000);
   // Higher timeframes resync on their own natural cadence — no point re-fetching a 4H
   // candle that hasn't closed yet, and it's cheaper on the API quota than constant polling.
-  if (provider.mtfInterval) mtfResyncHandle = setInterval(() => resyncTimeframe('1H', provider.mtfInterval, 300, d => { mtfData = d; }), 60 * 60 * 1000);
+  // Keep intraday diagnostic timeframes fresh without polling on every tick.
+  fiveMinResyncHandle = setInterval(() => resyncTimeframe('5m', '5min', 300, d => { fiveMinData = d; }), 15 * 60 * 1000);
+  thirtyMinResyncHandle = setInterval(() => resyncTimeframe('30m', '30min', 200, d => { thirtyMinData = d; }), 30 * 60 * 1000);
+  if (provider.mtfInterval) mtfResyncHandle = setInterval(() => resyncTimeframe('1H', provider.mtfInterval, 300, d => { mtfData = d; eightHourData = aggregateCandles(d, 8); timeframeHealth['8H'] = { ok: eightHourData.length > 0, at: Date.now(), candleTime: eightHourData.length ? eightHourData[eightHourData.length - 1].time : null, count: eightHourData.length, derived: true, source: 'aggregated from 1H candles' }; renderTimeframeHealth(); }), 60 * 60 * 1000);
   if (provider.htfInterval) htfResyncHandle = setInterval(() => resyncTimeframe('4H', provider.htfInterval, 200, d => { htfData = d; }), 4 * 60 * 60 * 1000);
   // Daily/weekly candles barely move intraday — resyncing a few times a day (daily) or once a day
   // (weekly) is plenty and keeps this well clear of any provider's rate limit.
