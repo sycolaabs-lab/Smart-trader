@@ -1015,6 +1015,28 @@ function renderQuota() {
 // plus mtfInterval/htfInterval — the native interval strings for that provider's real 1H/4H data
 // (null if the provider doesn't support that granularity, in which case the app falls back to
 // aggregating from the 15min feed automatically). Adding a new provider means adding one entry here.
+function validateCandleSeries(candles, interval, label) {
+  if (!Array.isArray(candles) || candles.length < 2) throw new Error((label || 'Provider') + ' returned too few candles');
+  const stepMs = ({ '1min': 60000, '5min': 300000, '15min': 900000, '30min': 1800000, '45min': 2700000,
+    '60min': 3600000, '1h': 3600000, '2h': 7200000, '4h': 14400000, '8h': 28800000,
+    '1day': 86400000, '1week': 604800000 })[interval] || 900000;
+  let previous = -Infinity;
+  for (const c of candles) {
+    if (!Number.isFinite(c.time) || ![c.open, c.high, c.low, c.close].every(Number.isFinite) ||
+        c.open <= 0 || c.high <= 0 || c.low <= 0 || c.close <= 0 ||
+        c.high < c.low || c.open < c.low || c.open > c.high || c.close < c.low || c.close > c.high) {
+      throw new Error((label || 'Provider') + ' returned malformed OHLC candle data');
+    }
+    if (c.time <= previous) throw new Error((label || 'Provider') + ' returned duplicate or out-of-order candle timestamps');
+    if (c.time > Date.now() + 5 * 60 * 1000) throw new Error((label || 'Provider') + ' returned a future candle timestamp');
+    previous = c.time;
+  }
+  const age = Date.now() - candles[candles.length - 1].time;
+  const allowedAge = Math.max(stepMs * 4, interval === '1day' ? 72 * 3600000 : interval === '1week' ? 12 * 86400000 : 0);
+  if (age > allowedAge) throw new Error((label || 'Provider') + ' latest candle is stale (' + Math.round(age / 60000) + ' minutes old)');
+  return candles;
+}
+
 const PROVIDERS = {
   twelvedata: {
     // pollSeconds is the dedicated /price cadence. At 60s it cost 1,440 credits/day
@@ -1033,7 +1055,7 @@ const PROVIDERS = {
       const j = await r.json();
       if (j.status === 'error' || j.code) throw new Error(j.message || 'Twelve Data error');
       if (!j.values || !j.values.length) throw new Error('No data returned for ' + sym);
-      return j.values.slice().reverse().map(v => ({ time: parseUtcDatetime(v.datetime), open: +v.open, high: +v.high, low: +v.low, close: +v.close }));
+      return validateCandleSeries(j.values.slice().reverse().map(v => ({ time: parseUtcDatetime(v.datetime), open: +v.open, high: +v.high, low: +v.low, close: +v.close })), interval, sym);
     },
     async price(key) {
       const qs = new URLSearchParams({ symbol: SYMBOL, apikey: key });
@@ -1065,7 +1087,7 @@ const PROVIDERS = {
         time: new Date(ts.replace(' ', 'T') + 'Z').getTime(),
         open: +series[ts]['1. open'], high: +series[ts]['2. high'], low: +series[ts]['3. low'], close: +series[ts]['4. close']
       }));
-      return rows.slice(-outputsize);
+      return validateCandleSeries(rows.slice(-outputsize), interval, 'Alpha Vantage');
     },
     async price(key) {
       const qs = new URLSearchParams({ function: 'CURRENCY_EXCHANGE_RATE', from_currency: 'XAU', to_currency: 'USD', apikey: key });
