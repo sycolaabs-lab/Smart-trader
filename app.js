@@ -2184,9 +2184,12 @@ async function runBacktestCycle(isAuto) {
     const trainTrades = passA.trades.filter(t => t.entryIndex < splitIdx && Number.isInteger(t.exitIndex) && t.exitIndex < splitIdx);
     const { tuned } = computeTunedWeights(trainTrades, baseWeights);
 
-    // Pass 2: re-run full data with tuned weights; only trades opened after the split are genuinely out-of-sample
-    const passB = runSmcBacktest(histData, params, tuned, targetRR, costPips);
-    const testTrades = passB.trades.filter(t => t.entryIndex >= splitIdx);
+    // Pass 2: preserve pre-split candles for indicator warmup but start with
+    // a clean position book after the boundary. No training-era pending/open
+    // position can consume a slot or leak into the test segment.
+    const testStartIdx = splitIdx + 1;
+    const passB = runSmcBacktest(histData, Object.assign({}, params, { startIndex: testStartIdx }), tuned, targetRR, costPips);
+    const testTrades = passB.trades.filter(t => t.entryIndex >= testStartIdx && Number.isInteger(t.exitIndex));
 
     // Only out-of-sample outcomes feed the persisted learning system, to avoid rewarding overfit patterns
     testTrades.forEach(t => recordOutcome(t.dir, t.factors, t.result === 'win'));
