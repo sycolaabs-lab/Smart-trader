@@ -3176,6 +3176,7 @@ function renderPaper() {
       const u = unrealisedPnl(p, price);
       return '<div class="zone-item" style="align-items:flex-start;"><span><span class="dirtag ' + p.dir + '">' + p.dir + '</span> ' + lotLabel(p)
         + ' · entry $' + fmt(p.entryFill) + ' · SL $' + fmt(p.sl) + ' · TP $' + fmt(p.tp)
+        + ' · risk ' + money(p.riskAmount) + ' · R:R ' + (Math.abs(p.tp - p.entryFill) / Math.max(Math.abs(p.entryFill - p.sl), 1e-9)).toFixed(2) + ':1'
         + '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:5px;">'
         + '<button class="btn" data-paper-action="edit-sl" data-paper-id="' + p.id + '" style="padding:3px 7px;font-size:10px;">Edit SL</button>'
         + '<button class="btn" data-paper-action="close" data-paper-id="' + p.id + '" style="padding:3px 7px;font-size:10px;border-color:#ef4d5f;color:#ef4d5f;">Close at market</button>'
