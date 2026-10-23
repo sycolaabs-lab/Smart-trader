@@ -2439,7 +2439,11 @@ function runAudit() {
     // not only the reasoning. Timeframes that disagree about the price are not
     // the same instrument; a macro series that is frozen or months out of date
     // is contributing a number that is no longer true.
-    series: { '15m': liveData, '1H': mtfData, '4H': htfData, Daily: dailyData, Weekly: weeklyData },
+    series: {
+      '5m': fiveMinData, '15m': liveData, '30m': thirtyMinData,
+      '1H': mtfData, '4H': htfData, '8H': eightHourData,
+      Daily: dailyData, Weekly: weeklyData
+    },
     macroSeries: (macroSeries.drivers || []).map(d => ({ key: d.key, label: d.label, series: d.series }))
   });
   return lastAudit;
