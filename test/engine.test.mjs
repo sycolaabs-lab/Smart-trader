@@ -192,6 +192,11 @@ ok('and the risk taken matches that size', near(sz.riskAmount, sz.units * 10), t
 ok('which lands within one lot step of the request',
   Math.abs(sz.riskAmount - sz.requestedRisk) <= 0.01 * 100 * 10 + 1e-9, true);
 ok('zero-width stop refuses to size', paperPositionSize(10000,1,2000,2000), null);
+const fixedCapped = paperPositionSize(10000, 1, 2000, 1900, {
+  sizingMode: 'fixed', fixedLots: 1, contractSize: 100, lotStep: 0.01, minLots: 0.01
+});
+ok('fixed lots are capped by the available risk budget', fixedCapped.lots, 0.01);
+ok('fixed-lot cap does not exceed requested risk', fixedCapped.riskAmount <= fixedCapped.requestedRisk, true);
 
 const sigBuy = { id:'s1', dir:'BUY', entry:2000, sl:1990, tp:2040, entryType:'market', time:'2026-01-01T00:00:00Z' };
 const acct = { balance:10000, positions:[] };
