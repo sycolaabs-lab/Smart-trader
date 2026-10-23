@@ -1743,6 +1743,17 @@ function refreshAll() {
     renderTimeframeHealth();
     return;
   }
+  const latestCandleTime = Number(liveData[liveData.length - 1] && liveData[liveData.length - 1].time);
+  const candleAgeMs = Number.isFinite(latestCandleTime) ? Date.now() - latestCandleTime : Infinity;
+  if (candleAgeMs < -60000 || candleAgeMs > 45 * 60 * 1000) {
+    const label = document.getElementById('modeLabel');
+    if (label) label.textContent = 'Data stale — analysis paused';
+    const warning = document.getElementById('staleFeedWarning');
+    if (warning) { warning.textContent = 'Latest 15-minute candle is ' + (Number.isFinite(candleAgeMs) ? Math.max(0, Math.round(candleAgeMs / 60000)) + ' minutes old' : 'invalid') + '. Signal generation is paused until fresh verified candles arrive.'; warning.classList.remove('hidden'); }
+    const price = document.getElementById('livePrice');
+    if (price) price.textContent = '—';
+    return;
+  }
   const weights = getWeights();
   lastComposite = computeComposite(liveData, liveData.length - 1, weights, mtfData, htfData, correlationScore, fundamentalScore, newsSentimentScore, dailyData, weeklyData);
   if (!lastComposite) return;
