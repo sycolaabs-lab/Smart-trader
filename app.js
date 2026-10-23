@@ -820,11 +820,27 @@ if (fbReady) {
         ? '<span style="' + (score > 0.1 ? 'color:#3ecf8e' : score < -0.1 ? 'color:#ef4d5f' : 'color:#5c6270') + '">' + label + ' ' + (score >= 0 ? '+' : '') + score.toFixed(2) + '</span>'
         : '<span style="color:#454a56;">' + label + ' off</span>';
       const m = d.macro || {};
+      const totalWeight = Number(d.totalWeight) || Object.values(d.weights || {}).reduce((sum, w) => sum + (Number(w) || 0), 0) || 1;
+      const factorRows = Object.keys(d.factors || {}).map(k => {
+        const value = Number(d.factors[k]) || 0, weight = Number((d.weights || {})[k]) || 0;
+        const contribution = value * weight / totalWeight;
+        return '<div class="zone-item"><span>' + (FACTOR_LABELS[k] || k) + ' <span style="color:#454a56;">value ' + value.toFixed(2) + ' × weight ' + weight + '</span></span>'
+          + '<span class="mono">' + (contribution >= 0 ? '+' : '') + (contribution * 100).toFixed(1) + ' pp</span></div>';
+      }).join('');
+      const healthRows = Object.keys(d.dataHealth || {}).map(k => {
+        const h = d.dataHealth[k] || {};
+        const age = Number.isFinite(Number(h.ageMinutes)) ? Math.max(0, Number(h.ageMinutes)) + 'm old' : 'age unknown';
+        const stale = Number.isFinite(Number(h.ageMinutes)) && Number(h.ageMinutes) > (k === '15m' ? 45 : k === '1H' ? 180 : k === '4H' ? 600 : k === 'Daily' ? 4320 : 17280);
+        return '<div class="zone-item"><span>' + k + ' <span style="color:#454a56;">' + age + ' · ' + (h.count || 0) + ' bars</span></span><span class="mono" style="color:' + (stale ? '#ef4d5f' : '#3ecf8e') + ';">' + (stale ? 'STALE' : 'received') + '</span></div>';
+      }).join('');
       detailEl.innerHTML = '<div class="zone-item"><span>' + d.direction + ' <span style="color:#454a56;">(' + d.confidence + '%, full engine — structure + macro + meta-labeler)</span></span><span class="mono ' + dirCls + '">$' + fmt(d.price) + '</span></div>'
         + (d.direction !== 'HOLD' ? '<div class="zone-item"><span>Entry / SL / TP</span><span class="mono">$' + fmt(d.entry) + ' / $' + fmt(d.sl) + ' / $' + fmt(d.tp) + '</span></div>' : '')
         + (d.direction !== 'HOLD' ? '<div class="zone-item"><span>Meta-labeler score</span><span class="mono">' + (d.metaTrained ? ((d.metaScore >= 0 ? '+' : '') + fmt(d.metaScore)) : 'not trained yet') + ' <span style="color:#454a56;font-size:9px;">(' + d.metaExampleCount + ' examples)</span></span></div>' : '')
         + '<div class="zone-item"><span>Macro reads</span><span style="font-size:10px;">' + macroTag('Corr', m.correlationAvailable, m.correlationScore || 0) + ' · ' + macroTag('Fund', m.fundamentalAvailable, m.fundamentalScore || 0) + ' · ' + macroTag('News', m.newsAvailable, m.newsScore || 0) + '</span></div>'
-        + '<div class="zone-item"><span>Session / Regime</span><span class="mono" style="font-size:10px;">' + (d.session || '—') + ' · ' + (d.regime || '—') + '</span></div>';
+        + '<div class="zone-item"><span>Session / Regime</span><span class="mono" style="font-size:10px;">' + (d.session || '—') + ' · ' + (d.regime || '—') + '</span></div>'
+        + '<div class="panel-title" style="font-size:11px;margin-top:10px;">Background data freshness</div>' + (healthRows || '<div class="zone-empty">No candle health data published yet.</div>')
+        + '<div class="panel-title" style="font-size:11px;margin-top:10px;">Factor weight in final score</div>' + (factorRows || '<div class="zone-empty">No factor breakdown published yet.</div>')
+        + ((d.auditDataFaults || []).length ? '<div class="event-line" style="border-left-color:#ef4d5f;">Data audit flags: ' + d.auditDataFaults.join('; ') + '</div>' : '');
     },
     (err) => { document.getElementById('bgTickStatus').textContent = 'Could not read background tick data: ' + err.message + ' (check Firestore rules allow public read on the "system" collection).'; }
   );
