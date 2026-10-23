@@ -666,6 +666,16 @@ export async function runTick({ db, tdKey, fredKey, avKey, now }) {
       price: result.price,
       direction: result.direction,
       confidence: result.confidence,
+      // Publish the actual per-factor weights and source freshness so the UI can
+      // explain the background decision instead of showing only its final price.
+      weights: Object.assign({}, state.weights),
+      dataHealth: {
+        '15m': { candleAt: ltf.length ? ltf[ltf.length - 1].time : null, ageMinutes: ltf.length ? Math.round((clockNow - ltf[ltf.length - 1].time) / 60000) : null, count: ltf.length },
+        '1H': { candleAt: mtfR.value.length ? mtfR.value[mtfR.value.length - 1].time : null, ageMinutes: mtfR.value.length ? Math.round((clockNow - mtfR.value[mtfR.value.length - 1].time) / 60000) : null, count: mtfR.value.length },
+        '4H': { candleAt: htfR.value.length ? htfR.value[htfR.value.length - 1].time : null, ageMinutes: htfR.value.length ? Math.round((clockNow - htfR.value[htfR.value.length - 1].time) / 60000) : null, count: htfR.value.length },
+        'Daily': { candleAt: dayR.value.length ? dayR.value[dayR.value.length - 1].time : null, ageMinutes: dayR.value.length ? Math.round((clockNow - dayR.value[dayR.value.length - 1].time) / 60000) : null, count: dayR.value.length },
+        'Weekly': { candleAt: wkR.value.length ? wkR.value[wkR.value.length - 1].time : null, ageMinutes: wkR.value.length ? Math.round((clockNow - wkR.value[wkR.value.length - 1].time) / 60000) : null, count: wkR.value.length }
+      },
       entry: plan.entry, sl: plan.sl, tp: plan.tp,
       metaScore: plan.metaScore || 0,
       metaTrained: !!(state.learningState.metaModel && state.learningState.metaModel.length),
